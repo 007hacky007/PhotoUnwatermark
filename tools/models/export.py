@@ -173,6 +173,18 @@ def fold_constants(src, dst):
     opts.optimized_model_filepath = str(dst)
     ort.InferenceSession(str(fixed), opts, providers=["CPUExecutionProvider"])
     fixed.unlink()
+    strip_unused_opsets(dst)
+
+
+def strip_unused_opsets(path):
+    """Drop opset_import entries no node uses (ORT adds com.microsoft.nchwc and similar)."""
+    model = onnx.load(str(path))
+    used = {n.domain for n in model.graph.node} | {""}
+    kept = [o for o in model.opset_import if o.domain in used or o.domain == "ai.onnx"]
+    del model.opset_import[:]
+    model.opset_import.extend(kept)
+    onnx.checker.check_model(model, full_check=True)
+    onnx.save(model, str(path))
 
 
 def export_lama(build):

@@ -8,8 +8,8 @@ next to the models.
 
 - What: six UNet++ (efficientnet-b4) watermark segmenters, one per mark style (`centered_text`,
   `line_pattern`, `logo`, `overlay_text`, `repeated_text`, `tiny_corner`), merged into one graph
-  that returns the pixel max of their sigmoid outputs. Weights converted to fp16 when parity allows
-  (see the manifest's `dtype`); otherwise unchanged.
+  that returns the pixel max of their sigmoid outputs. Shipped with fp16 weights; the small
+  convolutions are kept fp32 (see the manifest's `dtype` and `note`).
 - Upstream: https://huggingface.co/christophernavas/watermark-remover
   (files `segmenter_<specialty>.pth`, revision `509fb6833823f4e9c519f8e4f87a9053567c779c`),
   by DevynLabs.
@@ -20,8 +20,9 @@ next to the models.
 
 - What: LaMa, "Resolution-robust Large Mask Inpainting with Fourier Convolutions" (WACV 2022),
   Samsung Research. ONNX export (fixed 512x512, opset 17) by Carve
-  (https://huggingface.co/Carve/LaMa-ONNX), taken from the byte-for-byte mirror below. Weights
-  converted to fp16 when parity allows (see the manifest's `dtype`); otherwise unchanged.
+  (https://huggingface.co/Carve/LaMa-ONNX), taken from the byte-for-byte mirror below. Shipped
+  with fp16 weights, BatchNormalization kept fp32, batch fixed to 1 and constants folded (see the
+  manifest's `dtype` and `note`).
 - Upstream: https://github.com/advimman/lama; file `lama_fp32.onnx` from
   https://huggingface.co/ravetools/watermark-remover
   (revision `0bb7e443da9abf0813dcb0458d9fe5d20cb7445d`,

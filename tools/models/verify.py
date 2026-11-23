@@ -141,9 +141,20 @@ def check_face(build):
     return []
 
 
+PRECISION_NOTES = {
+    ("segmenter.onnx", "fp16"): "fp16 weights, small convolutions kept fp32",
+    ("segmenter.onnx", "fp32"): "fp32 weights, unchanged precision",
+    ("lama.onnx", "fp16"): ("fp16 weights, BatchNormalization kept fp32, batch fixed to 1, "
+                            "constant-folded"),
+    ("lama.onnx", "fp32"): "fp32 weights, batch fixed to 1, constant-folded",
+    ("face.onnx", "fp32"): "unchanged upstream file",
+}
+
+
 def manifest_entry(path, dtype):
     return {"name": path.name, "sha256": export.sha256_file(path),
-            "bytes": path.stat().st_size, "dtype": dtype, **export.MODEL_INFO[path.name]}
+            "bytes": path.stat().st_size, "dtype": dtype,
+            "note": PRECISION_NOTES[(path.name, dtype)], **export.MODEL_INFO[path.name]}
 
 
 def main():
