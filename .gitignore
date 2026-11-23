@@ -1,0 +1,14 @@
+# local-only data: never commit real photos or anything derived from them
+/local/
+*.local.toml
+.env
+
+# tooling
+.superpowers/
+.venv/
+__pycache__/
+node_modules/
+target/
+dist/
+/models/
+.DS_Store
