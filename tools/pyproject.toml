@@ -1,0 +1,17 @@
+[project]
+name = "puw-tools"
+version = "0.1.0"
+description = "PhotoUnwatermark developer tooling (not a package)"
+requires-python = ">=3.12,<3.13"
+dependencies = [
+    "numpy",
+    "pillow",
+    "scikit-image",
+    "pytest",
+]
+
+[tool.uv]
+package = false
+
+[tool.pytest.ini_options]
+testpaths = ["synth"]
