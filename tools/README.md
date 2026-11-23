@@ -16,3 +16,18 @@ Masks are 255 where the watermark is. `bbox` in the manifest is `[x, y, w, h]` o
 Tests:
 
     uv run --project tools pytest tools/synth -q
+
+## Models
+
+Builds the engine's ONNX models into `models/` (gitignored, never committed), checks parity and
+writes `models/manifest.json` (dtype, sha256, bytes, licence, source per file):
+
+    uv run --project tools python tools/models/export.py [--out <dir>]
+    uv run --project tools python tools/models/verify.py [--out <dir>] [--styles <styles set>]
+    uv run --project tools pytest tools/models -q
+
+`export.py` downloads the upstream weights (Hugging Face cache, OpenCV Zoo) and writes fp32 and
+fp16 candidates to `models/build/`. `verify.py` compares them on the synthetic `styles` set,
+copies the chosen dtype per model to `models/` and exits non-zero on any failure. The tests check
+the built directory (`PUW_MODELS_DIR` to point elsewhere), so they need the two steps above first.
+Licences: [models/LICENSES.md](models/LICENSES.md).

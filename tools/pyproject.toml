@@ -8,6 +8,12 @@ dependencies = [
     "pillow",
     "scikit-image",
     "pytest",
+    "torch>=2.15.0",
+    "segmentation-models-pytorch>=0.6.0",
+    "onnx>=1.23.2",
+    "onnxruntime>=1.32.0",
+    "onnxconverter-common>=1.16.0",
+    "huggingface-hub>=2.4.0",
 ]
 
 [tool.uv]
