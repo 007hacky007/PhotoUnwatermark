@@ -1,93 +1,236 @@
-//! The engine's workflow as the app uses it: the automatic first guess for a whole set, the
-//! photo shown first in the editor, and removing a confirmed area from one photo.
+//! The engine's workflow as the app uses it: the batch layers of a set, the automatic first
+//! guess per photo, the photos to pick the editor's first photo from, and removing a confirmed
+//! area from one photo.
+//!
+//! A set is never decoded at once. [`build_set_layers`] reads the photos one at a time (a
+//! bounded sample of each size group), [`guess_photo`] works on one loaded photo, and
+//! [`representative_sample`] bounds how many photos are guessed before the editor opens:
+//!
+//! ```no_run
+//! # use std::path::PathBuf;
+//! # use puw_core::{Engine, GuessOptions, Progress, load};
+//! # use puw_core::pipeline::{build_set_layers, guess_photo, pick_representative,
+//! #     representative_sample};
+//! # fn demo(engine: &Engine, paths: &[PathBuf]) -> puw_core::Result<()> {
+//! let layers = build_set_layers(paths, &Progress::none())?;
+//! let sample = representative_sample(paths.len());
+//! let mut guesses = Vec::new();
+//! for &i in &sample {
+//!     let photo = load(&paths[i])?;
+//!     guesses.push(guess_photo(engine, &photo, &layers, &GuessOptions::default())?);
+//! }
+//! let first = sample[pick_representative(&guesses)];
+//! # let _ = first;
+//! # Ok(())
+//! # }
+//! ```
 
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::Ordering;
 
-use image::RgbImage;
-
-use crate::Result;
-use crate::batch::{BATCH_HIGH, BATCH_LOW, batch_lines, median_gradient};
+use crate::batch::{BATCH_HIGH, BATCH_LOW, PackedLumas, batch_lines, median_gradient_packed};
 use crate::detect::{Guess, GuessOptions, guess_single};
 use crate::engine::Engine;
 use crate::faces::{Face, detect_faces_near, drop_eye_components, guard};
-use crate::image_io::{LoadedPhoto, save_result};
+use crate::image_io::{LoadedPhoto, load, save_result, upright_size};
 use crate::inpaint::{Progress, inpaint};
-use crate::mask::{self, Mask};
+use crate::mask::{self, Mask, is_empty};
+use crate::{Error, Result};
 
 /// Photos of one size needed before the batch layer is computed for them.
 pub const MIN_BATCH_PHOTOS: usize = 3;
+/// Most photos of one size group that go into its batch layer.
+pub const BATCH_SAMPLE_CAP: usize = 24;
+/// Memory for the photos of one batch layer, which are held as 2-byte luma while the median
+/// is taken: the sample is cut to fit (16 photos at 36 MP), but never below
+/// [`MIN_BATCH_PHOTOS`]. [`build_set_layers`] peaks at about this plus 0.4 GB at 36 MP
+/// (measured 1.53 GB for 40 and for 200 photos of 7360x4912).
+pub const BATCH_LUMA_BUDGET: u64 = 1_200_000_000;
+/// Most photos [`representative_sample`] picks.
+pub const REPRESENTATIVE_CAP: usize = 6;
 
-/// Automatic first guess for every photo of a set, in input order.
+/// The batch layers of a set: for each upright photo size whose group got one, the mask of
+/// the mark stamped at the same place on every photo.
+#[derive(Debug, Clone, Default)]
+pub struct SetLayers {
+    layers: BTreeMap<(u32, u32), Mask>,
+}
+
+impl SetLayers {
+    /// No layers (a set too small or too mixed for one).
+    pub fn none() -> Self {
+        Self::default()
+    }
+
+    /// The batch layer for photos of upright size `w` x `h`, if their group has one.
+    pub fn get(&self, w: u32, h: u32) -> Option<&Mask> {
+        self.layers.get(&(w, h))
+    }
+
+    /// Sizes that have a layer, with the layer, smallest size first.
+    pub fn iter(&self) -> impl Iterator<Item = ((u32, u32), &Mask)> {
+        self.layers.iter().map(|(&size, m)| (size, m))
+    }
+
+    /// True when no size group has a layer.
+    pub fn is_empty(&self) -> bool {
+        self.layers.is_empty()
+    }
+}
+
+/// `cap` evenly spaced indexes into `0..n` (the middle of each of `cap` equal parts), or all
+/// of them when `n <= cap`. Ascending and distinct.
+fn evenly_spaced(n: usize, cap: usize) -> Vec<usize> {
+    if n <= cap {
+        return (0..n).collect();
+    }
+    (0..cap).map(|k| (2 * k + 1) * n / (2 * cap)).collect()
+}
+
+/// Indexes of the photos (of a set of `n`) to run [`guess_photo`] on before the editor opens:
+/// at most [`REPRESENTATIVE_CAP`], evenly spaced, ascending. [`pick_representative`] over their
+/// guesses gives a position in this list.
+pub fn representative_sample(n: usize) -> Vec<usize> {
+    evenly_spaced(n, REPRESENTATIVE_CAP)
+}
+
+/// Photos of one `w` x `h` group that go into its batch layer: as many as
+/// [`BATCH_LUMA_BUDGET`] holds at 2 bytes per pixel, within [`MIN_BATCH_PHOTOS`] ..=
+/// [`BATCH_SAMPLE_CAP`].
+fn batch_sample_len(w: u32, h: u32) -> usize {
+    let per_photo = (2 * u64::from(w) * u64::from(h)).max(1);
+    (BATCH_LUMA_BUDGET / per_photo).clamp(MIN_BATCH_PHOTOS as u64, BATCH_SAMPLE_CAP as u64) as usize
+}
+
+/// Progress in work units, reported as a fraction.
+struct Units<'a> {
+    progress: &'a Progress<'a>,
+    done: usize,
+    total: usize,
+}
+
+impl Units<'_> {
+    fn check(&self) -> Result<()> {
+        if self.progress.cancel.load(Ordering::Relaxed) {
+            return Err(Error::Cancelled);
+        }
+        Ok(())
+    }
+
+    fn add(&mut self, n: usize) {
+        self.done += n;
+        (self.progress.on_fraction)((self.done as f32 / self.total.max(1) as f32).min(1.0));
+    }
+}
+
+/// Work units of reading one photo's header, of decoding one sampled photo, and of its share of
+/// the median.
+const HEADER_UNITS: usize = 1;
+const DECODE_UNITS: usize = 8;
+const MEDIAN_UNITS: usize = 4;
+
+/// Batch layers of the photos at `paths`, one per upright size group of at least
+/// [`MIN_BATCH_PHOTOS`] photos.
 ///
-/// Per photo: [`guess_single`], then the face guard, the union with the batch layer of the
-/// photo's group and growth by [`mask::grow_for`] with `opts.grow_frac`. The guard runs before
-/// growth ([`drop_eye_components`]) and after it ([`guard`]), so growth never fills an eye. Photos are grouped by their upright size, and only
-/// a group of at least [`MIN_BATCH_PHOTOS`] gets a batch layer ([`median_gradient`] and
-/// [`batch_lines`] with [`BATCH_LOW`] / [`BATCH_HIGH`]); a group whose batch layer fails or
-/// finds nothing simply has none, so mixed sizes never fail the set.
+/// Photos are read one at a time: first every photo's header for its upright size, then, per
+/// group, an evenly spaced sample (see [`BATCH_SAMPLE_CAP`] and [`BATCH_LUMA_BUDGET`]) is
+/// decoded and kept as luma for [`crate::batch::median_gradient`]'s median, followed by
+/// [`batch_lines`] with [`BATCH_LOW`] / [`BATCH_HIGH`]. Peak memory is bounded by the sample
+/// (see [`BATCH_LUMA_BUDGET`]), whatever the size of the set.
+///
+/// A photo that cannot be read is left out (logged); a group with fewer than
+/// [`MIN_BATCH_PHOTOS`] readable photos in its sample, or whose layer finds nothing, has no
+/// layer, so a mixed or damaged set never fails here. `progress` gets fractions from 0.0 to
+/// 1.0, and its cancel flag is checked before each photo and each median; when set, this
+/// returns [`Error::Cancelled`].
+pub fn build_set_layers(paths: &[PathBuf], progress: &Progress) -> Result<SetLayers> {
+    let mut units = Units {
+        progress,
+        done: 0,
+        total: paths.len() * HEADER_UNITS,
+    };
+    (progress.on_fraction)(0.0);
+    let mut groups: BTreeMap<(u32, u32), Vec<usize>> = BTreeMap::new();
+    for (i, path) in paths.iter().enumerate() {
+        units.check()?;
+        match upright_size(path) {
+            Ok(size) => groups.entry(size).or_default().push(i),
+            Err(e) => tracing::warn!("batch layer: photo {} skipped: {e}", i + 1),
+        }
+    }
+    let samples: Vec<((u32, u32), Vec<usize>)> = groups
+        .into_iter()
+        .filter(|(_, members)| members.len() >= MIN_BATCH_PHOTOS)
+        .map(|((w, h), members)| {
+            let pick = evenly_spaced(members.len(), batch_sample_len(w, h));
+            ((w, h), pick.into_iter().map(|k| members[k]).collect())
+        })
+        .collect();
+    units.total += samples
+        .iter()
+        .map(|(_, s)| s.len() * (DECODE_UNITS + MEDIAN_UNITS))
+        .sum::<usize>();
+    units.add(paths.len() * HEADER_UNITS);
+
+    let mut layers = BTreeMap::new();
+    for ((w, h), sample) in samples {
+        let mut lumas = PackedLumas::new(w, h, sample.len());
+        for &i in &sample {
+            units.check()?;
+            match load(&paths[i]) {
+                Ok(photo) => {
+                    if lumas.push(&photo.rgb).is_err() {
+                        tracing::warn!("batch layer: photo {} changed size, skipped", i + 1);
+                    }
+                }
+                Err(e) => tracing::warn!("batch layer: photo {} skipped: {e}", i + 1),
+            }
+            units.add(DECODE_UNITS);
+        }
+        units.check()?;
+        if lumas.len() >= MIN_BATCH_PHOTOS {
+            let mag = median_gradient_packed(&lumas);
+            drop(lumas);
+            match mag {
+                Ok(mag) => {
+                    if let Some(layer) = batch_lines(&mag, BATCH_LOW, BATCH_HIGH) {
+                        layers.insert((w, h), layer);
+                    }
+                }
+                Err(e) => tracing::warn!("batch layer skipped for the {w}x{h} photos: {e}"),
+            }
+        }
+        units.add(sample.len() * MEDIAN_UNITS);
+    }
+    (progress.on_fraction)(1.0);
+    Ok(SetLayers { layers })
+}
+
+/// Automatic first guess for one photo.
+///
+/// [`guess_single`], then the face guard ([`detect_faces_near`]), the union with the batch
+/// layer of the photo's size from `layers` (if any) and growth by [`mask::grow_for`] with
+/// `opts.grow_frac`. The guard runs before growth ([`drop_eye_components`]) and after it
+/// ([`guard`]), so growth never fills an eye, and the batch layer is the only thing it keeps
+/// in an eye.
 ///
 /// `confidence` is the one from [`guess_single`] when its guess survives the face guard, 1.0
 /// when only the batch layer contributed, and 0.0 when the mask is empty.
-pub fn auto_guess_set(
+pub fn guess_photo(
     engine: &Engine,
-    photos: &[LoadedPhoto],
-    opts: &GuessOptions,
-) -> Result<Vec<Guess>> {
-    let (layers, layer_of) = batch_layers(photos);
-    photos
-        .iter()
-        .zip(layer_of)
-        .map(|(p, l)| guess_one(engine, &p.rgb, l.map(|i| &layers[i]), opts))
-        .collect()
-}
-
-/// Batch layers of the same-size groups, and for each photo the index of its group's layer.
-fn batch_layers(photos: &[LoadedPhoto]) -> (Vec<Mask>, Vec<Option<usize>>) {
-    let mut groups: BTreeMap<(u32, u32), Vec<usize>> = BTreeMap::new();
-    for (i, p) in photos.iter().enumerate() {
-        groups.entry(p.rgb.dimensions()).or_default().push(i);
-    }
-    let mut layers = Vec::new();
-    let mut layer_of = vec![None; photos.len()];
-    for ((w, h), members) in groups {
-        if members.len() < MIN_BATCH_PHOTOS {
-            continue;
-        }
-        let images: Vec<&RgbImage> = members.iter().map(|&i| &photos[i].rgb).collect();
-        let layer = match median_gradient(&images) {
-            Ok(mag) => batch_lines(&mag, BATCH_LOW, BATCH_HIGH),
-            Err(e) => {
-                tracing::warn!("batch layer skipped for the {w}x{h} photos: {e}");
-                None
-            }
-        };
-        if let Some(layer) = layer {
-            for &i in &members {
-                layer_of[i] = Some(layers.len());
-            }
-            layers.push(layer);
-        }
-    }
-    (layers, layer_of)
-}
-
-fn is_empty(m: &Mask) -> bool {
-    m.as_raw().iter().all(|&v| v == 0)
-}
-
-fn guess_one(
-    engine: &Engine,
-    img: &RgbImage,
-    layer: Option<&Mask>,
+    photo: &LoadedPhoto,
+    layers: &SetLayers,
     opts: &GuessOptions,
 ) -> Result<Guess> {
+    let img = &photo.rgb;
+    let (w, h) = img.dimensions();
+    let layer = layers.get(w, h);
     let single = guess_single(engine, img, opts)?;
     let near = match layer {
         Some(l) => mask::union(&single.mask, l),
         None => single.mask.clone(),
     };
-    let (w, h) = img.dimensions();
     let grow = mask::grow_for(w, h, opts.grow_frac);
     // The guard only clears pixels, so an empty mask needs no face detection.
     let faces = if is_empty(&near) {
@@ -95,6 +238,7 @@ fn guess_one(
     } else {
         detect_faces_near(engine, img, &near, grow)?
     };
+    drop(near);
     Ok(finish(single, &faces, layer, grow))
 }
 
@@ -127,7 +271,7 @@ fn finish(single: Guess, faces: &[Face], layer: Option<&Mask>, grow: u32) -> Gue
 }
 
 /// Index of the photo to show first in the editor: the highest confidence among guesses with a
-/// non-empty mask. Equal confidences go to the earlier photo; with no non-empty guess (or no
+/// non-empty mask (for guesses of a [`representative_sample`], a position in that sample). Equal confidences go to the earlier photo; with no non-empty guess (or no
 /// guesses at all) the answer is 0.
 pub fn pick_representative(guesses: &[Guess]) -> usize {
     let mut best: Option<(usize, f32)> = None;
@@ -203,6 +347,32 @@ mod tests {
             })
             .map(|(x, y, _)| (x, y))
             .collect()
+    }
+
+    #[test]
+    fn evenly_spaced_is_bounded_and_spread() {
+        assert_eq!(evenly_spaced(0, 6), Vec::<usize>::new());
+        assert_eq!(evenly_spaced(4, 6), [0, 1, 2, 3]);
+        assert_eq!(evenly_spaced(12, 6), [1, 3, 5, 7, 9, 11]);
+        for n in 7..300 {
+            let v = evenly_spaced(n, 6);
+            assert_eq!(v.len(), 6, "n {n}");
+            assert!(v.windows(2).all(|p| p[0] < p[1]), "n {n}: {v:?}");
+            assert!(*v.last().unwrap() < n);
+            // Spread over the whole set: within one step of either end.
+            assert!(v[0] <= n / 6 && n - 1 - v[5] <= n / 6, "n {n}: {v:?}");
+        }
+        assert_eq!(representative_sample(200).len(), REPRESENTATIVE_CAP);
+    }
+
+    #[test]
+    fn batch_sample_fits_the_budget() {
+        // 36 MP: 16 photos of 2 bytes per pixel, 1.16 GB.
+        assert_eq!(batch_sample_len(7360, 4912), 16);
+        const { assert!(16 * 2 * 7360 * 4912 <= BATCH_LUMA_BUDGET) };
+        assert_eq!(batch_sample_len(6000, 4000), BATCH_SAMPLE_CAP);
+        assert_eq!(batch_sample_len(30000, 20000), MIN_BATCH_PHOTOS);
+        assert_eq!(batch_sample_len(0, 0), BATCH_SAMPLE_CAP);
     }
 
     #[test]

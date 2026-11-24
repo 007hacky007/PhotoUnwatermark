@@ -4,16 +4,17 @@ use std::collections::BTreeSet;
 use std::fs;
 use std::hash::{DefaultHasher, Hasher};
 use std::path::{Path, PathBuf};
-use std::sync::OnceLock;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Mutex, OnceLock};
 
 use image::{GrayImage, RgbImage, imageops};
 use puw_core::batch::{BATCH_HIGH, BATCH_LOW, batch_lines, median_gradient};
 use puw_core::detect::{GuessOptions, guess_single};
 use puw_core::faces::{detect_faces_near, drop_eye_components, guard};
-use puw_core::mask::{self, Mask};
+use puw_core::mask::{self, Mask, is_empty};
 use puw_core::{
-    Engine, LoadedPhoto, ModelPaths, Progress, auto_guess_set, load, output_dir_for,
-    pick_representative, remove_one,
+    Engine, Error, LoadedPhoto, ModelPaths, Progress, build_set_layers, guess_photo, load,
+    output_dir_for, pick_representative, remove_one, representative_sample,
 };
 
 fn engine() -> Option<&'static Engine> {
@@ -36,10 +37,6 @@ fn open_rgb(p: &Path) -> RgbImage {
 
 fn open_mask(p: &Path) -> Mask {
     image::open(p).expect("open mask").to_luma8()
-}
-
-fn is_empty(m: &Mask) -> bool {
-    m.as_raw().iter().all(|&v| v == 0)
 }
 
 /// Minimal little-endian EXIF block holding only an Orientation tag.
@@ -132,32 +129,78 @@ fn names_in(dir: &Path) -> BTreeSet<String> {
         .collect()
 }
 
-#[test]
-fn auto_guess_set_groups_by_size() {
-    let Some(engine) = engine() else { return };
+/// Fractions reported through a [`Progress`], and the cancel flag it checks.
+struct Recorder {
+    seen: Mutex<Vec<f32>>,
+    cancel: AtomicBool,
+}
+
+impl Recorder {
+    fn new(cancelled: bool) -> Self {
+        Recorder {
+            seen: Mutex::new(Vec::new()),
+            cancel: AtomicBool::new(cancelled),
+        }
+    }
+
+    fn fractions(&self) -> Vec<f32> {
+        self.seen.lock().unwrap().clone()
+    }
+}
+
+fn assert_progress(v: &[f32]) {
+    assert_eq!(v.first(), Some(&0.0), "{v:?}");
+    assert_eq!(v.last(), Some(&1.0), "{v:?}");
+    assert!(v.windows(2).all(|p| p[0] <= p[1]), "{v:?}");
+}
+
+/// Intersection over union of the set pixels.
+fn iou(a: &Mask, b: &Mask) -> f64 {
+    let (mut inter, mut uni) = (0u64, 0u64);
+    for (p, q) in a.pixels().zip(b.pixels()) {
+        let (x, y) = (p.0[0] != 0, q.0[0] != 0);
+        inter += (x && y) as u64;
+        uni += (x || y) as u64;
+    }
+    inter as f64 / uni.max(1) as f64
+}
+
+/// Six photos in three upright sizes: three of the fixed set (one batch layer), the same mark
+/// in two smaller photos (too few for a layer) and one of a third size.
+fn mixed_set(dir: &Path) -> Vec<PathBuf> {
     let synth = common::synth_dir();
-    let dir = tempfile::tempdir().expect("tempdir");
-    // Three photos of one size: the fixed mark is in the batch layer.
     for i in 0..3 {
         let src = synth.join("fixed/marked").join(format!("0{i}.png"));
-        fs::copy(&src, dir.path().join(format!("a{i}.png"))).expect("copy");
+        fs::copy(&src, dir.join(format!("a{i}.png"))).expect("copy");
     }
-    // The same mark in two photos of another size: too few for the batch layer.
     for i in 3..5 {
         let src = open_rgb(&synth.join("fixed/marked").join(format!("0{i}.png")));
         let small = imageops::resize(&src, 1200, 800, imageops::FilterType::Triangle);
-        small
-            .save(dir.path().join(format!("b{i}.png")))
-            .expect("save");
+        small.save(dir.join(format!("b{i}.png"))).expect("save");
     }
-    // One photo of a third size.
-    fs::copy(synth.join("random/marked/02.png"), dir.path().join("c.png")).expect("copy");
-
-    let mut paths: Vec<PathBuf> = fs::read_dir(dir.path())
+    fs::copy(synth.join("random/marked/02.png"), dir.join("c.png")).expect("copy");
+    let mut paths: Vec<PathBuf> = fs::read_dir(dir)
         .expect("read dir")
         .map(|e| e.expect("entry").path())
         .collect();
     paths.sort();
+    paths
+}
+
+#[test]
+fn set_layers_and_guesses_group_by_size() {
+    let Some(engine) = engine() else { return };
+    let dir = tempfile::tempdir().expect("tempdir");
+    let paths = mixed_set(dir.path());
+    let rec = Recorder::new(false);
+    let report = |f: f32| rec.seen.lock().unwrap().push(f);
+    let progress = Progress {
+        on_fraction: &report,
+        cancel: &rec.cancel,
+    };
+    let layers = build_set_layers(&paths, &progress).expect("mixed sizes are fine");
+    assert_progress(&rec.fractions());
+
     let photos: Vec<LoadedPhoto> = paths.iter().map(|p| load(p).expect("load")).collect();
     let sizes: Vec<(u32, u32)> = photos.iter().map(|p| p.rgb.dimensions()).collect();
     assert_eq!(
@@ -171,18 +214,25 @@ fn auto_guess_set_groups_by_size() {
             (1024, 682)
         ]
     );
-
-    let opts = GuessOptions::default();
-    let guesses = auto_guess_set(engine, &photos, &opts).expect("mixed sizes are fine");
-    assert_eq!(guesses.len(), photos.len());
-
+    // One layer, for the group of three; it matches the full-precision batch layer.
+    assert_eq!(layers.iter().count(), 1);
+    assert!(layers.get(1200, 800).is_none() && layers.get(1024, 682).is_none());
+    let layer = layers
+        .get(1536, 1024)
+        .expect("fixed mark in the batch layer");
     let group: Vec<&RgbImage> = photos[..3].iter().map(|p| &p.rgb).collect();
     let mag = median_gradient(&group).expect("median");
-    let layer = batch_lines(&mag, BATCH_LOW, BATCH_HIGH).expect("fixed mark in the batch layer");
+    let exact = batch_lines(&mag, BATCH_LOW, BATCH_HIGH).expect("exact layer");
+    let agree = iou(layer, &exact);
+    eprintln!("batch layer vs full precision: IoU {agree:.5}");
+    assert!(agree > 0.995, "IoU {agree}");
 
-    for (i, (photo, got)) in photos.iter().zip(&guesses).enumerate() {
+    let opts = GuessOptions::default();
+    let mut guesses = Vec::new();
+    for (i, photo) in photos.iter().enumerate() {
         let (w, h) = photo.rgb.dimensions();
-        let keep = (i < 3).then_some(&layer);
+        let got = guess_photo(engine, photo, &layers, &opts).expect("guess");
+        let keep = (i < 3).then_some(layer);
         // The documented recipe, step by step.
         let single = guess_single(engine, &photo.rgb, &opts).expect("guess");
         let grow = mask::grow_for(w, h, opts.grow_frac);
@@ -216,12 +266,17 @@ fn auto_guess_set_groups_by_size() {
             assert_eq!(missing, 0, "photo {i}: batch layer not in the guess");
         }
         eprintln!(
-            "photo {i} {w}x{h}: coverage {:.4} conf {:.3}",
+            "photo {i} {w}x{h}: coverage {:.4} conf {:.3}, {} faces",
             mask::coverage(&got.mask),
-            got.confidence
+            got.confidence,
+            faces.len()
         );
+        guesses.push(got);
     }
 
+    // Six photos fit the representative sample whole.
+    let sample = representative_sample(photos.len());
+    assert_eq!(sample, [0, 1, 2, 3, 4, 5]);
     let rep = pick_representative(&guesses);
     assert!(!is_empty(&guesses[rep].mask));
     let best = guesses
@@ -230,6 +285,65 @@ fn auto_guess_set_groups_by_size() {
         .map(|g| g.confidence)
         .fold(f32::MIN, f32::max);
     assert_eq!(guesses[rep].confidence, best);
+}
+
+#[test]
+fn set_layers_skip_unreadable_photos_and_cancel() {
+    let synth = common::synth_dir();
+    let dir = tempfile::tempdir().expect("tempdir");
+    let mut paths = Vec::new();
+    for i in 0..4 {
+        let p = dir.path().join(format!("f{i}.png"));
+        fs::copy(synth.join("fixed/marked").join(format!("0{i}.png")), &p).expect("copy");
+        paths.push(p);
+    }
+    let garbage = dir.path().join("broken.jpg");
+    fs::write(&garbage, b"not a photo").expect("write");
+    paths.insert(2, garbage);
+    paths.push(dir.path().join("missing.png"));
+
+    let rec = Recorder::new(false);
+    let report = |f: f32| rec.seen.lock().unwrap().push(f);
+    let progress = Progress {
+        on_fraction: &report,
+        cancel: &rec.cancel,
+    };
+    let layers = build_set_layers(&paths, &progress).expect("bad photos are skipped");
+    assert_progress(&rec.fractions());
+    assert!(layers.get(1536, 1024).is_some());
+    assert!(
+        build_set_layers(&[], &Progress::none())
+            .expect("empty")
+            .is_empty()
+    );
+
+    // Cancelled before it starts.
+    let rec = Recorder::new(true);
+    let report = |f: f32| rec.seen.lock().unwrap().push(f);
+    let progress = Progress {
+        on_fraction: &report,
+        cancel: &rec.cancel,
+    };
+    let r = build_set_layers(&paths, &progress);
+    assert!(matches!(r, Err(Error::Cancelled)), "{r:?}");
+    assert_eq!(rec.fractions(), [0.0]);
+
+    // Cancelled while decoding.
+    let rec = Recorder::new(false);
+    let report = |f: f32| {
+        rec.seen.lock().unwrap().push(f);
+        if f > 0.3 {
+            rec.cancel.store(true, Ordering::Relaxed);
+        }
+    };
+    let progress = Progress {
+        on_fraction: &report,
+        cancel: &rec.cancel,
+    };
+    let r = build_set_layers(&paths, &progress);
+    assert!(matches!(r, Err(Error::Cancelled)), "{r:?}");
+    let seen = rec.fractions();
+    assert!(seen.iter().all(|&f| f < 1.0), "{seen:?}");
 }
 
 #[test]

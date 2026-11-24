@@ -19,5 +19,8 @@ pub use image_io::{LoadedPhoto, load, output_dir_for};
 pub use inpaint::{Progress, WORK_LONG_SIDE};
 pub use library::{Library, SavedWatermark};
 pub use mask::Mask;
-pub use pipeline::{auto_guess_set, pick_representative, remove_one};
+pub use pipeline::{
+    SetLayers, build_set_layers, guess_photo, pick_representative, remove_one,
+    representative_sample,
+};
 pub use template::{MatchResult, MatchStatus, WatermarkTemplate, build_template, find};

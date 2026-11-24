@@ -13,13 +13,14 @@ use std::time::Instant;
 
 use clap::{Args, Parser, Subcommand};
 use image::RgbImage;
-use puw_core::batch::{BATCH_HIGH, BATCH_LOW, batch_lines, median_gradient};
 use puw_core::detect::predict_prob;
+use puw_core::image_io::upright_size;
 use puw_core::mask;
+use puw_core::pipeline::MIN_BATCH_PHOTOS;
 use puw_core::template::{FOUND, UNSURE};
 use puw_core::{
-    Engine, GuessOptions, LoadedPhoto, Mask, MatchStatus, ModelPaths, Progress, WORK_LONG_SIDE,
-    auto_guess_set, build_template, find, load, remove_one,
+    Engine, Guess, GuessOptions, LoadedPhoto, Mask, MatchStatus, ModelPaths, Progress, SetLayers,
+    WORK_LONG_SIDE, build_set_layers, build_template, find, guess_photo, load, remove_one,
 };
 
 type BoxResult<T> = Result<T, Box<dyn std::error::Error>>;
@@ -68,6 +69,12 @@ enum Cmd {
         #[arg(long)]
         work_side: Option<u32>,
     },
+    /// Batch layers only (`build_set_layers`): time and coverage per size group. A `--set`
+    /// folder without marked/ is read as a plain photo folder.
+    Layers {
+        #[command(flatten)]
+        source: Source,
+    },
     /// Template-matching scores: a confirmed mark as template, searched in the other photos.
     MatchSweep {
         #[command(flatten)]
@@ -114,6 +121,14 @@ fn run_cli(cli: Cli) -> BoxResult<()> {
         Cmd::Bench { source, work_side } => match source.set {
             Some(dir) => bench_set(&engine()?, &dir, work_side.or(Some(WORK_LONG_SIDE))),
             None => bench_real(&engine()?),
+        },
+        Cmd::Layers { source } => match source.set {
+            Some(dir) => {
+                let marked = dir.join("marked");
+                let dir = if marked.is_dir() { marked } else { dir };
+                layers_report(&[photo_files(&dir)?], false)
+            }
+            None => layers_report(&real_sets()?, true),
         },
         Cmd::MatchSweep {
             source,
@@ -195,6 +210,7 @@ fn name_of(p: &Path) -> String {
 
 /// A synthetic set: marked photos with their clean versions and ground-truth masks.
 struct SynthSet {
+    files: Vec<PathBuf>,
     names: Vec<String>,
     photos: Vec<LoadedPhoto>,
     clean: Vec<RgbImage>,
@@ -207,6 +223,7 @@ fn load_synth(dir: &Path) -> BoxResult<SynthSet> {
         return Err(format!("no photos in {}", dir.join("marked").display()).into());
     }
     let mut set = SynthSet {
+        files: Vec::new(),
         names: Vec::new(),
         photos: Vec::new(),
         clean: Vec::new(),
@@ -227,6 +244,7 @@ fn load_synth(dir: &Path) -> BoxResult<SynthSet> {
             return Err(format!("{}: clean or mask size differs", f.display()).into());
         }
         set.names.push(name_of(&f));
+        set.files.push(f.clone());
         set.photos.push(photo);
         set.clean.push(clean);
         set.gt.push(gt);
@@ -380,7 +398,8 @@ fn bench_set(engine: &Engine, dir: &Path, work_side: Option<u32>) -> BoxResult<(
     let n = set.photos.len();
     let opts = GuessOptions::default();
     let t = Instant::now();
-    let guesses = auto_guess_set(engine, &set.photos, &opts)?;
+    let layers = build_set_layers(&set.files, &Progress::none())?;
+    let guesses = guess_all(engine, &set.photos, &layers, &opts)?;
     let guess_each = t.elapsed().as_secs_f64() / n as f64;
     println!(
         "auto guess: {n} photos in {:.1} s ({guess_each:.1} s per photo)",
@@ -437,37 +456,94 @@ fn bench_set(engine: &Engine, dir: &Path, work_side: Option<u32>) -> BoxResult<(
     Ok(())
 }
 
-/// Batch layer of each same-size group of at least 3 photos: (size, members, layer, seconds).
-type Group = ((u32, u32), Vec<usize>, Option<Mask>, f64);
+/// [`guess_photo`] for every photo, in order.
+fn guess_all(
+    engine: &Engine,
+    photos: &[LoadedPhoto],
+    layers: &SetLayers,
+    opts: &GuessOptions,
+) -> BoxResult<Vec<Guess>> {
+    Ok(photos
+        .iter()
+        .map(|p| guess_photo(engine, p, layers, opts))
+        .collect::<puw_core::Result<_>>()?)
+}
 
-fn batch_groups(photos: &[LoadedPhoto]) -> Vec<Group> {
+/// A same-size group of at least [`MIN_BATCH_PHOTOS`] photos: (size, members, layer).
+type Group = ((u32, u32), Vec<usize>, Option<Mask>);
+
+/// The groups of `sizes` (upright size per photo) with their layer from `layers`.
+fn batch_groups(sizes: &[(u32, u32)], layers: &SetLayers) -> Vec<Group> {
     let mut groups: BTreeMap<(u32, u32), Vec<usize>> = BTreeMap::new();
-    for (i, p) in photos.iter().enumerate() {
-        groups.entry(p.rgb.dimensions()).or_default().push(i);
+    for (i, &size) in sizes.iter().enumerate() {
+        groups.entry(size).or_default().push(i);
     }
     groups
         .into_iter()
-        .filter(|(_, m)| m.len() >= 3)
-        .map(|(size, members)| {
-            let t = Instant::now();
-            let imgs: Vec<&RgbImage> = members.iter().map(|&i| &photos[i].rgb).collect();
-            let layer = median_gradient(&imgs)
-                .ok()
-                .and_then(|mag| batch_lines(&mag, BATCH_LOW, BATCH_HIGH));
-            (size, members, layer, t.elapsed().as_secs_f64())
-        })
+        .filter(|(_, m)| m.len() >= MIN_BATCH_PHOTOS)
+        .map(|((w, h), members)| ((w, h), members, layers.get(w, h).cloned()))
         .collect()
 }
 
 /// Per-photo layer from [`batch_groups`].
 fn layer_per_photo(n: usize, groups: &[Group]) -> Vec<Option<&Mask>> {
     let mut v = vec![None; n];
-    for (_, members, layer, _) in groups {
+    for (_, members, layer) in groups {
         for &i in members {
             v[i] = layer.as_ref();
         }
     }
     v
+}
+
+fn print_groups(groups: &[Group]) {
+    for ((w, h), members, layer) in groups {
+        match layer {
+            Some(l) => println!(
+                "  batch layer {w}x{h} ({} photos): coverage {:.2} %, {} components",
+                members.len(),
+                100.0 * mask::coverage(l),
+                mask::components(l).len()
+            ),
+            None => println!("  batch layer {w}x{h} ({} photos): none", members.len()),
+        }
+    }
+}
+
+/// `layers`: build_set_layers on each set, aggregate numbers only when `real`.
+fn layers_report(sets: &[Vec<PathBuf>], real: bool) -> BoxResult<()> {
+    for (k, files) in sets.iter().enumerate() {
+        let k = k + 1;
+        let sizes: Vec<(u32, u32)> = files
+            .iter()
+            .enumerate()
+            .map(|(i, f)| {
+                upright_size(f).map_err(|e| {
+                    if real {
+                        format!("set {k} photo {}: {e}", i + 1)
+                    } else {
+                        format!("{}: {e}", f.display())
+                    }
+                })
+            })
+            .collect::<Result<_, _>>()?;
+        let t = Instant::now();
+        let layers = build_set_layers(files, &Progress::none())?;
+        println!(
+            "== set {k}: {} photos, build_set_layers {:.1} s",
+            files.len(),
+            t.elapsed().as_secs_f64()
+        );
+        let mut counts: BTreeMap<(u32, u32), usize> = BTreeMap::new();
+        for &s in &sizes {
+            *counts.entry(s).or_default() += 1;
+        }
+        for ((w, h), c) in &counts {
+            println!("  upright size {w}x{h}: {c} photos");
+        }
+        print_groups(&batch_groups(&sizes, &layers));
+    }
+    Ok(())
 }
 
 /// One row of the per-scale table: a scale or a vote over scales.
@@ -501,26 +577,17 @@ fn bench_real(engine: &Engine) -> BoxResult<()> {
             println!("  upright size {w}x{h}: {c} photos");
         }
 
-        let groups = batch_groups(&photos);
-        for ((w, h), members, layer, secs) in &groups {
-            match layer {
-                Some(l) => println!(
-                    "  batch layer {w}x{h} ({} photos): coverage {:.2} %, {} components, {secs:.1} s",
-                    members.len(),
-                    100.0 * mask::coverage(l),
-                    mask::components(l).len()
-                ),
-                None => println!(
-                    "  batch layer {w}x{h} ({} photos): none, {secs:.1} s",
-                    members.len()
-                ),
-            }
-        }
+        let t = Instant::now();
+        let set_layers = build_set_layers(files, &Progress::none())?;
+        println!("  build_set_layers: {:.1} s", t.elapsed().as_secs_f64());
+        let sizes: Vec<(u32, u32)> = photos.iter().map(|p| p.rgb.dimensions()).collect();
+        let groups = batch_groups(&sizes, &set_layers);
+        print_groups(&groups);
         let layers = layer_per_photo(n, &groups);
         scale_table(engine, &photos, &layers, &opts)?;
 
         let t = Instant::now();
-        let guesses = auto_guess_set(engine, &photos, &opts)?;
+        let guesses = guess_all(engine, &photos, &set_layers, &opts)?;
         let guess_each = t.elapsed().as_secs_f64() / n as f64;
         let cov: Vec<f64> = guesses
             .iter()
@@ -529,7 +596,7 @@ fn bench_real(engine: &Engine) -> BoxResult<()> {
         let conf: Vec<f64> = guesses.iter().map(|g| f64::from(g.confidence)).collect();
         let empty = guesses.iter().filter(|g| count_set(&g.mask) == 0).count();
         let batch_only = guesses.iter().filter(|g| g.confidence == 1.0).count();
-        println!("  auto_guess_set: {guess_each:.1} s per photo");
+        println!("  guess_photo: {guess_each:.1} s per photo");
         println!("    coverage %: {}", summary(&cov, 2));
         println!("    confidence: {}", summary(&conf, 3));
         println!("    empty guesses {empty}, batch layer only {batch_only}");
@@ -770,7 +837,9 @@ fn sweep_real(synthetic: Vec<(String, RgbImage)>, all_refs: bool) -> BoxResult<(
         .collect::<BoxResult<_>>()?;
     let mut any = false;
     for (k, set) in photos.iter().enumerate() {
-        for ((w, h), members, layer, _) in batch_groups(set) {
+        let set_layers = build_set_layers(&sets[k], &Progress::none())?;
+        let sizes: Vec<(u32, u32)> = set.iter().map(|p| p.rgb.dimensions()).collect();
+        for ((w, h), members, layer) in batch_groups(&sizes, &set_layers) {
             let Some(layer) = layer else { continue };
             any = true;
             let refs: Vec<usize> = if all_refs {
