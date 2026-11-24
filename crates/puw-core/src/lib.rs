@@ -5,6 +5,7 @@ mod error;
 pub mod faces;
 pub mod image_io;
 pub mod inpaint;
+pub mod library;
 pub mod mask;
 pub mod ncc;
 pub mod template;
