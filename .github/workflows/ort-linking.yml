@@ -40,6 +40,10 @@ jobs:
         run: |
           Get-ChildItem "$env:LOCALAPPDATA\ort.pyke.io" -Recurse -File -ErrorAction SilentlyContinue | Select-Object Length, FullName | Format-Table -AutoSize | Out-String -Width 400
           Get-ChildItem target\release -File | Select-Object Length, Name | Format-Table -AutoSize
+          # The engine's placement probe relies on this session config key being compiled in.
+          $lib = Get-ChildItem "$env:LOCALAPPDATA\ort.pyke.io" -Recurse -Filter onnxruntime.lib | Select-Object -First 1
+          findstr /m /c:"ep.dml.disable_graph_fusion" $lib.FullName; "findstr exit code $LASTEXITCODE (0 = key present)"
+          $global:LASTEXITCODE = 0
       - name: System DirectML
         run: |
           Get-Item C:\Windows\System32\DirectML.dll -ErrorAction SilentlyContinue | ForEach-Object { $_.VersionInfo | Format-List FileVersion, ProductVersion, FileName }
