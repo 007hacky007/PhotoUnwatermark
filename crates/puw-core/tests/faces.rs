@@ -7,7 +7,7 @@ use std::sync::OnceLock;
 use image::Luma;
 use imageproc::rect::Rect;
 use puw_core::engine::{Engine, ModelPaths};
-use puw_core::faces::{Face, detect_faces, drop_eye_components, guard};
+use puw_core::faces::{Face, detect_faces, detect_faces_near, drop_eye_components, guard};
 use puw_core::mask::Mask;
 
 fn engine() -> Option<&'static Engine> {
@@ -196,4 +196,65 @@ fn detect_faces_on_astronaut() {
         "right eye is left of left eye in x"
     );
     assert!(f.score >= 0.7);
+}
+
+#[test]
+fn small_face_in_large_frame_found_near_the_guess() {
+    let Some(engine) = engine() else { return };
+    let src = astronaut();
+    let big = detect_faces(engine, &src).expect("detect");
+    assert_eq!(big.len(), 1);
+    // The astronaut shrunk so the face is about 80 px wide, in a 6000x4000 frame.
+    let k = 80.0 / big[0].width;
+    let side = (src.width() as f32 * k).round() as u32;
+    let small = image::imageops::resize(&src, side, side, image::imageops::FilterType::Lanczos3);
+    let mut frame = image::RgbImage::from_fn(6000, 4000, |x, y| {
+        image::Rgb([
+            (90 + x / 100) as u8,
+            (100 + y / 80) as u8,
+            (110 + (x + y) % 7) as u8,
+        ])
+    });
+    let (ox, oy) = (4000u32, 2500u32);
+    image::imageops::replace(&mut frame, &small, ox as i64, oy as i64);
+    let fb = &big[0].bbox;
+    let face_box = (
+        ox as f32 + fb.left() as f32 * k,
+        oy as f32 + fb.top() as f32 * k,
+        ox as f32 + (fb.left() as f32 + fb.width() as f32) * k,
+        oy as f32 + (fb.top() as f32 + fb.height() as f32) * k,
+    );
+    let inside = |f: &Face| {
+        f.eyes
+            .iter()
+            .all(|&(x, y)| x > face_box.0 && x < face_box.2 && y > face_box.1 && y < face_box.3)
+    };
+
+    // One full-frame pass misses it: the face is under 9 px wide at the model's input.
+    let full = detect_faces(engine, &frame).expect("detect");
+    eprintln!("full frame: {full:?}");
+    assert!(!full.iter().any(inside), "full frame already finds it");
+
+    // A guessed component just right of the face.
+    let mut near = Mask::new(6000, 4000);
+    let gx = face_box.2.round() as u32 + 10;
+    let gy = ((face_box.1 + face_box.3) / 2.0).round() as u32;
+    for y in gy..gy + 10 {
+        for x in gx..gx + 40 {
+            near.put_pixel(x, y, Luma([255]));
+        }
+    }
+    let found = detect_faces_near(engine, &frame, &near, 24).expect("detect near");
+    eprintln!("near the guess: {found:?}");
+    let hits: Vec<&Face> = found.iter().filter(|f| inside(f)).collect();
+    assert_eq!(hits.len(), 1, "{found:?}");
+    assert!(
+        (hits[0].width - 80.0).abs() < 25.0,
+        "width {}",
+        hits[0].width
+    );
+
+    // No guess, no crop passes: the same as the full frame.
+    let none = detect_faces_near(engine, &frame, &Mask::new(6000, 4000), 24).expect("detect");
+    assert_eq!(none, full);
 }

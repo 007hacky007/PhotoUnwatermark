@@ -10,7 +10,7 @@ use crate::Result;
 use crate::batch::{BATCH_HIGH, BATCH_LOW, batch_lines, median_gradient};
 use crate::detect::{Guess, GuessOptions, guess_single};
 use crate::engine::Engine;
-use crate::faces::{Face, detect_faces, drop_eye_components, guard};
+use crate::faces::{Face, detect_faces_near, drop_eye_components, guard};
 use crate::image_io::{LoadedPhoto, save_result};
 use crate::inpaint::{Progress, inpaint};
 use crate::mask::{self, Mask};
@@ -87,19 +87,15 @@ fn guess_one(
         Some(l) => mask::union(&single.mask, l),
         None => single.mask.clone(),
     };
+    let (w, h) = img.dimensions();
+    let grow = mask::grow_for(w, h, opts.grow_frac);
     // The guard only clears pixels, so an empty mask needs no face detection.
     let faces = if is_empty(&near) {
         Vec::new()
     } else {
-        detect_faces(engine, img)?
+        detect_faces_near(engine, img, &near, grow)?
     };
-    let (w, h) = img.dimensions();
-    Ok(finish(
-        single,
-        &faces,
-        layer,
-        mask::grow_for(w, h, opts.grow_frac),
-    ))
+    Ok(finish(single, &faces, layer, grow))
 }
 
 /// Face guard, batch layer and growth applied to the detector's guess, in this order:

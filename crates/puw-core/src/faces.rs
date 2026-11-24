@@ -11,10 +11,18 @@ use imageproc::rect::Rect;
 
 use crate::engine::Engine;
 use crate::mask::Mask;
+use crate::tiles::tile_starts;
 use crate::{Error, Result};
 
 /// Side of the YuNet input square.
 const SIDE: u32 = 640;
+/// Photo pixels per side of a crop pass, resized 2:1 into the model input.
+const CROP: u32 = 2 * SIDE;
+/// Step between crop passes: neighbours overlap by 384 px, so a face up to that size lies
+/// wholly inside one of them.
+const CROP_STRIDE: u32 = CROP - 384;
+/// Cell side of the occupancy grid that picks the crop passes.
+const CELL: u32 = 32;
 const STRIDES: [u32; 3] = [8, 16, 32];
 /// Minimum detection score (sqrt of class and objectness).
 const MIN_SCORE: f32 = 0.7;
@@ -83,6 +91,83 @@ pub fn detect_faces(engine: &Engine, img: &RgbImage) -> Result<Vec<Face>> {
     }
     let cands = full_frame(engine, img)?;
     Ok(to_faces(nms(cands), w, h))
+}
+
+/// [`detect_faces`] plus passes over crops near `near`, merged by NMS.
+///
+/// One full-frame pass misses faces narrower than about 2-2.5 % of the long side (120-150 px
+/// in a 6000 px group photo), yet their eyes are big enough to be damaged. So the photo is
+/// also covered with 1280 px crops (neighbours overlapping by 384 px), each run at half
+/// resolution, and a crop is run when `near` has a pixel within `grow` plus the eye radius of
+/// a 384 px face of it. With an empty `near`, or a long side of at most 1280 px (the full frame
+/// is then at half resolution or better), this is the full-frame pass alone. `near` must have
+/// the photo's size.
+pub fn detect_faces_near(
+    engine: &Engine,
+    img: &RgbImage,
+    near: &Mask,
+    grow: u32,
+) -> Result<Vec<Face>> {
+    let (w, h) = img.dimensions();
+    if near.dimensions() != (w, h) {
+        return Err(Error::SizeMismatch);
+    }
+    if w == 0 || h == 0 {
+        return Ok(Vec::new());
+    }
+    let mut cands = full_frame(engine, img)?;
+    let margin = grow + (EYE_RADIUS * (CROP - CROP_STRIDE) as f32).ceil() as u32;
+    let scale = SIDE as f32 / CROP as f32;
+    for (x0, y0, cw, ch) in crop_windows(near, margin) {
+        let crop = imageops::crop_imm(img, x0, y0, cw, ch).to_image();
+        let nw = ((cw as f32 * scale).round() as u32).clamp(1, SIDE);
+        let nh = ((ch as f32 * scale).round() as u32).clamp(1, SIDE);
+        let small = imageops::resize(&crop, nw, nh, FilterType::Triangle);
+        let found = run_square(engine, &small)?;
+        cands.extend(
+            found
+                .iter()
+                .map(|c| c.to_photo(scale, x0 as f32, y0 as f32)),
+        );
+    }
+    Ok(to_faces(nms(cands), w, h))
+}
+
+/// Crop passes (x, y, width, height) that have a pixel of `near` within `margin`; none when
+/// the long side is at most [`CROP`].
+fn crop_windows(near: &Mask, margin: u32) -> Vec<(u32, u32, u32, u32)> {
+    let (w, h) = near.dimensions();
+    if w.max(h) <= CROP {
+        return Vec::new();
+    }
+    let (gw, gh) = (w.div_ceil(CELL) as usize, h.div_ceil(CELL) as usize);
+    let mut occupied = vec![false; gw * gh];
+    for (y, row) in near.as_raw().chunks_exact(w as usize).enumerate() {
+        let g = (y / CELL as usize) * gw;
+        for (x, &v) in row.iter().enumerate() {
+            if v != 0 {
+                occupied[g + x / CELL as usize] = true;
+            }
+        }
+    }
+    if !occupied.contains(&true) {
+        return Vec::new();
+    }
+    let (cw, ch) = (CROP.min(w), CROP.min(h));
+    let mut out = Vec::new();
+    for y0 in tile_starts(h, CROP, CROP_STRIDE) {
+        for x0 in tile_starts(w, CROP, CROP_STRIDE) {
+            let gx0 = (x0.saturating_sub(margin) / CELL) as usize;
+            let gy0 = (y0.saturating_sub(margin) / CELL) as usize;
+            let gx1 = (((x0 + cw).saturating_add(margin).min(w) - 1) / CELL) as usize;
+            let gy1 = (((y0 + ch).saturating_add(margin).min(h) - 1) / CELL) as usize;
+            let hit = (gy0..=gy1).any(|gy| occupied[gy * gw + gx0..=gy * gw + gx1].contains(&true));
+            if hit {
+                out.push((x0, y0, cw, ch));
+            }
+        }
+    }
+    out
 }
 
 /// Candidates of one pass over the whole photo, letterboxed into the model input.
@@ -379,6 +464,24 @@ mod tests {
             near(c[0].eyes[0].0, 154.0) && near(c[0].eyes[0].1, 8.0),
             "{c:?}"
         );
+    }
+
+    #[test]
+    fn crop_windows_follow_the_guess() {
+        let mut near = Mask::new(4000, 3000);
+        assert!(crop_windows(&near, 50).is_empty());
+        near.put_pixel(100, 50, Luma([255]));
+        // Only the top-left crop holds the pixel; with a margin reaching past x = 896 (but not
+        // y = 896) the next one to the right is run too.
+        assert_eq!(crop_windows(&near, 50), [(0, 0, 1280, 1280)]);
+        assert_eq!(
+            crop_windows(&near, 820),
+            [(0, 0, 1280, 1280), (896, 0, 1280, 1280)]
+        );
+        // Small photos get no crops.
+        let mut small = Mask::new(1280, 900);
+        small.put_pixel(5, 5, Luma([255]));
+        assert!(crop_windows(&small, 50).is_empty());
     }
 
     #[test]

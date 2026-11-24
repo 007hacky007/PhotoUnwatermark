@@ -9,7 +9,7 @@ use std::sync::OnceLock;
 use image::{GrayImage, RgbImage, imageops};
 use puw_core::batch::{BATCH_HIGH, BATCH_LOW, batch_lines, median_gradient};
 use puw_core::detect::{GuessOptions, guess_single};
-use puw_core::faces::{detect_faces, drop_eye_components, guard};
+use puw_core::faces::{detect_faces_near, drop_eye_components, guard};
 use puw_core::mask::{self, Mask};
 use puw_core::{
     Engine, LoadedPhoto, ModelPaths, Progress, auto_guess_set, load, output_dir_for,
@@ -185,13 +185,18 @@ fn auto_guess_set_groups_by_size() {
         let keep = (i < 3).then_some(&layer);
         // The documented recipe, step by step.
         let single = guess_single(engine, &photo.rgb, &opts).expect("guess");
-        let faces = detect_faces(engine, &photo.rgb).expect("faces");
+        let grow = mask::grow_for(w, h, opts.grow_frac);
+        let near = match keep {
+            Some(l) => mask::union(&single.mask, l),
+            None => single.mask.clone(),
+        };
+        let faces = detect_faces_near(engine, &photo.rgb, &near, grow).expect("faces");
         let kept = drop_eye_components(&single.mask, &faces, keep);
         let combined = match keep {
             Some(l) => mask::union(&kept, l),
             None => kept.clone(),
         };
-        let grown = mask::dilate(&combined, mask::grow_for(w, h, opts.grow_frac));
+        let grown = mask::dilate(&combined, grow);
         let want = guard(&grown, &faces, keep);
         assert!(got.mask == want, "photo {i}: mask differs from the recipe");
         let want_conf = if is_empty(&want) {
