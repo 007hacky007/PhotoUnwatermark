@@ -331,7 +331,8 @@ fn attach_metadata(
 ///
 /// A hard link never replaces an existing file (`AlreadyExists` moves on to the next
 /// suffix) and the final name only ever appears with complete content. The partial is
-/// removed afterwards. Filesystems that refuse hard links use [`copy_no_clobber`].
+/// removed afterwards; failing to remove it does not fail the publish. Filesystems that
+/// refuse hard links use [`copy_no_clobber`].
 fn publish_no_clobber(
     partial: &Path,
     dir: &Path,
@@ -348,13 +349,13 @@ fn publish_no_clobber(
         let target = dir.join(name(n));
         match fs::hard_link(partial, &target) {
             Ok(()) => {
-                fs::remove_file(partial)?;
+                remove_partial(partial);
                 return Ok(target);
             }
             Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => continue,
             Err(_) => match copy_no_clobber(partial, &target) {
                 Ok(()) => {
-                    fs::remove_file(partial)?;
+                    remove_partial(partial);
                     return Ok(target);
                 }
                 Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => continue,
@@ -363,6 +364,14 @@ fn publish_no_clobber(
         }
     }
     unreachable!("unbounded range")
+}
+
+/// Removes the partial after the result was published. A failure only leaves a hidden file
+/// behind, so it is logged and does not fail the save.
+fn remove_partial(partial: &Path) {
+    if let Err(e) = fs::remove_file(partial) {
+        tracing::warn!("could not remove a partial file after saving: {e}");
+    }
 }
 
 /// Last resort for filesystems without hard links: `create_new` + copy + fsync.
