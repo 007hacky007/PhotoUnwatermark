@@ -1,8 +1,9 @@
 //! Face guard: keeps the automatic watermark guess away from eyes.
 //!
 //! In a fully automatic run the guess sometimes marks an eye, and inpainting then replaces it
-//! with a dark blob. [`detect_faces`] finds faces with YuNet, and [`guard`] clears guessed
-//! pixels around each eye unless a more reliable layer (`keep`) supports them.
+//! with a dark blob. [`detect_faces`] finds faces with YuNet. [`drop_eye_components`] removes
+//! guessed components that reach an eye, and [`guard`] clears what is left in the eye circles
+//! (after growth), each unless a more reliable layer (`keep`) supports them.
 
 use image::imageops::{self, FilterType};
 use image::{GrayImage, Luma, RgbImage};
@@ -222,6 +223,80 @@ fn eye_circles(faces: &[Face]) -> Vec<(f32, f32, f32)> {
         }
     }
     v
+}
+
+/// Removes every 8-connected component of `mask` that reaches into an eye circle (radius
+/// 0.12 x [`Face::width`]), unless `keep` supports it: `keep` is set (non-zero) on one of the
+/// component's pixels inside an eye circle. The whole component goes, not only its pixels in
+/// the circle, so later growth cannot bring it back into the eye. `keep` is ignored where it
+/// does not cover; faces with a non-finite eye or width are skipped.
+pub fn drop_eye_components(mask: &Mask, faces: &[Face], keep: Option<&Mask>) -> Mask {
+    let circles = eye_circles(faces);
+    let mut out: GrayImage = mask.clone();
+    let (w, h) = mask.dimensions();
+    if circles.is_empty() || w == 0 || h == 0 {
+        return out;
+    }
+    let in_circle = |x: u32, y: u32| {
+        circles.iter().any(|&(ex, ey, r)| {
+            let (dx, dy) = (x as f32 - ex, y as f32 - ey);
+            dx * dx + dy * dy <= r * r
+        })
+    };
+    let kept = |x: u32, y: u32| {
+        keep.is_some_and(|k| x < k.width() && y < k.height() && k.get_pixel(x, y).0[0] != 0)
+    };
+    let set = |x: u32, y: u32| mask.get_pixel(x, y).0[0] != 0;
+    let mut seen = vec![false; w as usize * h as usize];
+    let idx = |x: u32, y: u32| y as usize * w as usize + x as usize;
+    for &(ex, ey, r) in &circles {
+        let x0 = ((ex - r).floor().max(0.0)) as u32;
+        let y0 = ((ey - r).floor().max(0.0)) as u32;
+        let x1 = (((ex + r).ceil() + 1.0).min(w as f32)).max(0.0) as u32;
+        let y1 = (((ey + r).ceil() + 1.0).min(h as f32)).max(0.0) as u32;
+        for y in y0..y1 {
+            for x in x0..x1 {
+                if !set(x, y) || seen[idx(x, y)] || !in_circle(x, y) {
+                    continue;
+                }
+                // Flood-fill the component that reaches the eye.
+                seen[idx(x, y)] = true;
+                let mut stack = vec![(x, y)];
+                let mut pixels = Vec::new();
+                let mut supported = false;
+                while let Some((cx, cy)) = stack.pop() {
+                    pixels.push((cx, cy));
+                    supported |= !supported && in_circle(cx, cy) && kept(cx, cy);
+                    for (dx, dy) in [
+                        (-1, -1),
+                        (0, -1),
+                        (1, -1),
+                        (-1, 0),
+                        (1, 0),
+                        (-1, 1),
+                        (0, 1),
+                        (1, 1),
+                    ] {
+                        let (nx, ny) = (cx as i64 + dx, cy as i64 + dy);
+                        if nx < 0 || ny < 0 || nx >= w as i64 || ny >= h as i64 {
+                            continue;
+                        }
+                        let (nx, ny) = (nx as u32, ny as u32);
+                        if set(nx, ny) && !seen[idx(nx, ny)] {
+                            seen[idx(nx, ny)] = true;
+                            stack.push((nx, ny));
+                        }
+                    }
+                }
+                if !supported {
+                    for (px, py) in pixels {
+                        out.put_pixel(px, py, Luma([0]));
+                    }
+                }
+            }
+        }
+    }
+    out
 }
 
 /// Clears mask pixels in a circle of radius 0.12 x [`Face::width`] around each eye, except

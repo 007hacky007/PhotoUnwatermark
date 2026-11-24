@@ -10,7 +10,7 @@ use crate::Result;
 use crate::batch::{BATCH_HIGH, BATCH_LOW, batch_lines, median_gradient};
 use crate::detect::{Guess, GuessOptions, guess_single};
 use crate::engine::Engine;
-use crate::faces::{detect_faces, guard};
+use crate::faces::{Face, detect_faces, drop_eye_components, guard};
 use crate::image_io::{LoadedPhoto, save_result};
 use crate::inpaint::{Progress, inpaint};
 use crate::mask::{self, Mask};
@@ -20,9 +20,9 @@ pub const MIN_BATCH_PHOTOS: usize = 3;
 
 /// Automatic first guess for every photo of a set, in input order.
 ///
-/// Per photo: [`guess_single`], then the face guard ([`guard`]) with the batch layer of the
-/// photo's group as `keep`, then the union with that batch layer, then growth by
-/// [`mask::grow_for`] with `opts.grow_frac`. Photos are grouped by their upright size, and only
+/// Per photo: [`guess_single`], then the face guard, the union with the batch layer of the
+/// photo's group and growth by [`mask::grow_for`] with `opts.grow_frac`. The guard runs before
+/// growth ([`drop_eye_components`]) and after it ([`guard`]), so growth never fills an eye. Photos are grouped by their upright size, and only
 /// a group of at least [`MIN_BATCH_PHOTOS`] gets a batch layer ([`median_gradient`] and
 /// [`batch_lines`] with [`BATCH_LOW`] / [`BATCH_HIGH`]); a group whose batch layer fails or
 /// finds nothing simply has none, so mixed sizes never fail the set.
@@ -83,28 +83,51 @@ fn guess_one(
     opts: &GuessOptions,
 ) -> Result<Guess> {
     let single = guess_single(engine, img, opts)?;
-    // The guard only clears pixels, so an empty guess needs no face detection.
-    let guarded = if is_empty(&single.mask) {
-        single.mask
-    } else {
-        let faces = detect_faces(engine, img)?;
-        guard(&single.mask, &faces, layer)
+    let near = match layer {
+        Some(l) => mask::union(&single.mask, l),
+        None => single.mask.clone(),
     };
-    let from_single = !is_empty(&guarded);
-    let combined = match layer {
-        Some(l) => mask::union(&guarded, l),
-        None => guarded,
-    };
-    let confidence = if from_single {
-        single.confidence
-    } else if !is_empty(&combined) {
-        1.0
+    // The guard only clears pixels, so an empty mask needs no face detection.
+    let faces = if is_empty(&near) {
+        Vec::new()
     } else {
-        0.0
+        detect_faces(engine, img)?
     };
     let (w, h) = img.dimensions();
-    let mask = mask::dilate(&combined, mask::grow_for(w, h, opts.grow_frac));
-    Ok(Guess { mask, confidence })
+    Ok(finish(
+        single,
+        &faces,
+        layer,
+        mask::grow_for(w, h, opts.grow_frac),
+    ))
+}
+
+/// Face guard, batch layer and growth applied to the detector's guess, in this order:
+/// 1. guessed components reaching an eye are dropped unless the batch layer supports them
+///    ([`drop_eye_components`]);
+/// 2. the batch layer is added;
+/// 3. the mask grows by `grow`;
+/// 4. the eye circles are cleared again except the batch layer's own pixels ([`guard`]), so
+///    growth never fills an eye.
+///
+/// `confidence` is the detector's when its guess survives step 1, 1.0 when only the batch
+/// layer contributed, and 0.0 when the mask is empty.
+fn finish(single: Guess, faces: &[Face], layer: Option<&Mask>, grow: u32) -> Guess {
+    let kept = drop_eye_components(&single.mask, faces, layer);
+    let from_single = !is_empty(&kept);
+    let combined = match layer {
+        Some(l) => mask::union(&kept, l),
+        None => kept,
+    };
+    let mask = guard(&mask::dilate(&combined, grow), faces, layer);
+    let confidence = if is_empty(&mask) {
+        0.0
+    } else if from_single {
+        single.confidence
+    } else {
+        1.0
+    };
+    Guess { mask, confidence }
 }
 
 /// Index of the photo to show first in the editor: the highest confidence among guesses with a
@@ -139,4 +162,144 @@ pub fn remove_one(
 ) -> Result<PathBuf> {
     let filled = inpaint(engine, &photo.rgb, mask, work_long_side, progress)?;
     save_result(photo, &filled, out_dir)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use image::Luma;
+    use imageproc::rect::Rect;
+
+    /// A 100 px wide face with its right eye at `eye` (radius 12) and the left one 40 px right.
+    fn face_at(eye: (f32, f32)) -> Face {
+        Face {
+            bbox: Rect::at(eye.0 as i32 - 30, eye.1 as i32 - 40).of_size(100, 120),
+            width: 100.0,
+            eyes: [eye, (eye.0 + 40.0, eye.1)],
+            score: 0.9,
+        }
+    }
+
+    fn dist(x: u32, y: u32, c: (f32, f32)) -> f32 {
+        (x as f32 - c.0).hypot(y as f32 - c.1)
+    }
+
+    /// Sets the pixels whose distance from `c` is in `r0..=r1`.
+    fn ring(m: &mut Mask, c: (f32, f32), r0: f32, r1: f32) {
+        let (w, h) = m.dimensions();
+        for y in 0..h {
+            for x in 0..w {
+                if (r0..=r1).contains(&dist(x, y, c)) {
+                    m.put_pixel(x, y, Luma([255]));
+                }
+            }
+        }
+    }
+
+    /// Set pixels within the eye circles of `faces`.
+    fn in_eyes(m: &Mask, faces: &[Face]) -> Vec<(u32, u32)> {
+        m.enumerate_pixels()
+            .filter(|(x, y, p)| {
+                p.0[0] != 0
+                    && faces
+                        .iter()
+                        .any(|f| f.eyes.iter().any(|&e| dist(*x, *y, e) <= 0.12 * f.width))
+            })
+            .map(|(x, y, _)| (x, y))
+            .collect()
+    }
+
+    #[test]
+    fn growth_never_refills_eye_circles() {
+        let (a, b) = ((60.0, 60.0), (300.0, 300.0));
+        let faces = [face_at(a), face_at(b)];
+        let mut m = Mask::new(400, 400);
+        // Just outside eye a's circle: kept, then grown towards the eye.
+        ring(&mut m, a, 13.0, 18.0);
+        // Over eye b: touches the circle, so the whole blob goes.
+        ring(&mut m, b, 0.0, 20.0);
+        // Far from any face.
+        ring(&mut m, (200.0, 380.0), 0.0, 5.0);
+        let g = finish(
+            Guess {
+                mask: m,
+                confidence: 0.8,
+            },
+            &faces,
+            None,
+            24,
+        );
+        assert_eq!(in_eyes(&g.mask, &faces), [], "eye circles filled");
+        assert_eq!(g.mask.get_pixel(60 + 15, 60).0[0], 255, "ring kept");
+        assert_eq!(
+            g.mask.get_pixel(300 + 16, 300).0[0],
+            0,
+            "blob at eye b kept"
+        );
+        assert_eq!(g.mask.get_pixel(200, 380).0[0], 255, "far component lost");
+        assert_eq!(g.confidence, 0.8);
+    }
+
+    #[test]
+    fn batch_layer_keeps_components_at_the_eye() {
+        let b = (300.0, 300.0);
+        let faces = [face_at(b)];
+        let mut m = Mask::new(400, 400);
+        ring(&mut m, b, 0.0, 20.0);
+        // The batch layer: a horizontal line through eye b.
+        let mut layer = Mask::new(400, 400);
+        for x in 250..350 {
+            layer.put_pixel(x, 300, Luma([255]));
+        }
+        let g = finish(
+            Guess {
+                mask: m,
+                confidence: 0.8,
+            },
+            &faces,
+            Some(&layer),
+            24,
+        );
+        assert_eq!(
+            g.mask.get_pixel(300 + 16, 300 + 5).0[0],
+            255,
+            "supported blob dropped"
+        );
+        // Inside the circles only the batch layer's own pixels remain.
+        let inside = in_eyes(&g.mask, &faces);
+        assert!(!inside.is_empty());
+        assert!(inside.iter().all(|&(_, y)| y == 300), "{inside:?}");
+        assert_eq!(g.confidence, 0.8);
+    }
+
+    #[test]
+    fn only_the_batch_layer_gives_confidence_one() {
+        let b = (300.0, 300.0);
+        let mut m = Mask::new(400, 400);
+        ring(&mut m, b, 0.0, 20.0);
+        let mut layer = Mask::new(400, 400);
+        layer.put_pixel(100, 100, Luma([255]));
+        let g = finish(
+            Guess {
+                mask: m.clone(),
+                confidence: 0.8,
+            },
+            &[face_at(b)],
+            Some(&layer),
+            7,
+        );
+        assert_eq!(g.confidence, 1.0);
+        assert_eq!(g.mask.get_pixel(300, 300 + 16).0[0], 0);
+        let empty = finish(
+            Guess {
+                mask: m,
+                confidence: 0.8,
+            },
+            &[face_at(b)],
+            None,
+            7,
+        );
+        assert_eq!(empty.confidence, 0.0);
+        assert!(is_empty(&empty.mask));
+    }
 }

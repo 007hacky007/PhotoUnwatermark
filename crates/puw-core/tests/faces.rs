@@ -7,7 +7,7 @@ use std::sync::OnceLock;
 use image::Luma;
 use imageproc::rect::Rect;
 use puw_core::engine::{Engine, ModelPaths};
-use puw_core::faces::{Face, detect_faces, guard};
+use puw_core::faces::{Face, detect_faces, drop_eye_components, guard};
 use puw_core::mask::Mask;
 
 fn engine() -> Option<&'static Engine> {
@@ -109,6 +109,44 @@ fn guard_ignores_non_finite_faces() {
     };
     let out = guard(&full(200, 200), &[bad_eyes, bad_width], None);
     assert!(out.pixels().all(|p| p.0[0] == 255));
+}
+
+#[test]
+fn components_reaching_an_eye_are_dropped_whole() {
+    let mut m = Mask::new(200, 200);
+    // A bar from the right eye (70, 80) to x = 160, and a separate square far away.
+    for y in 78..83 {
+        for x in 70..160 {
+            m.put_pixel(x, y, Luma([255]));
+        }
+    }
+    for y in 170..180 {
+        for x in 10..20 {
+            m.put_pixel(x, y, Luma([255]));
+        }
+    }
+    let out = drop_eye_components(&m, &[face()], None);
+    assert_eq!(
+        out.get_pixel(150, 80).0[0],
+        0,
+        "bar outside the circle kept"
+    );
+    assert_eq!(
+        out.get_pixel(15, 175).0[0],
+        255,
+        "unrelated component dropped"
+    );
+
+    // A keep pixel on the bar inside the circle supports the whole bar.
+    let mut keep = Mask::new(200, 200);
+    keep.put_pixel(75, 80, Luma([255]));
+    let out = drop_eye_components(&m, &[face()], Some(&keep));
+    assert_eq!(out, m);
+    // Keep pixels outside the circles do not.
+    let mut far = Mask::new(200, 200);
+    far.put_pixel(150, 80, Luma([255]));
+    let out = drop_eye_components(&m, &[face()], Some(&far));
+    assert_eq!(out.get_pixel(150, 80).0[0], 0);
 }
 
 /// scikit-image's astronaut photo as a PNG in a temp folder.
