@@ -23,7 +23,8 @@ pub const EDGE_RADIUS: u32 = 2;
 
 /// Progress and cancellation hooks for [`inpaint`].
 pub struct Progress<'a> {
-    /// Called with the finished fraction (0..1) before the first tile and after each tile.
+    /// Called with the finished fraction (0..1) before the first tile and after each tile; the
+    /// last call is always 1.0 (a single 1.0 when there is nothing to fill).
     pub on_fraction: &'a (dyn Fn(f32) + Sync),
     /// Checked before each tile; when set, [`inpaint`] returns [`Error::Cancelled`].
     pub cancel: &'a AtomicBool,
@@ -88,6 +89,10 @@ fn fill_tiles(
 ) -> Result<()> {
     let (w, h) = img.dimensions();
     let steps = plan(todo, w, h);
+    if steps.is_empty() {
+        (progress.on_fraction)(1.0);
+        return Ok(());
+    }
     let total = steps.len().max(1) as f32;
     (progress.on_fraction)(0.0);
     let t = TILE as usize;
@@ -147,7 +152,7 @@ fn inpaint_at_size(
     };
     let mut todo = vec![false; (pw * ph) as usize];
     for (x, y, p) in mask.enumerate_pixels() {
-        todo[(y * pw + x) as usize] = p.0[0] > 127;
+        todo[(y * pw + x) as usize] = p.0[0] != 0;
     }
     fill_tiles(engine, &mut work, &mut todo, progress)?;
     if (pw, ph) == (w, h) {
@@ -157,9 +162,9 @@ fn inpaint_at_size(
     }
 }
 
-/// Gaussian-blurred mask as alpha in 0..1 over the whole image, truncated at
-/// [`EDGE_RADIUS`]. Only the mask's bounding box grown by the radius is
-/// computed; everything else is exactly zero.
+/// Alpha in 0..1 over the whole image: 1 on every mask pixel, and the Gaussian-blurred mask
+/// (truncated at [`EDGE_RADIUS`]) around it. Only the mask's bounding box grown by the radius
+/// is computed; everything else is exactly zero.
 fn soft_alpha(mask: &Mask) -> Option<(u32, u32, u32, u32, Vec<f32>)> {
     let bb = mask::bbox(mask)?;
     let r = EDGE_RADIUS as i64;
@@ -203,7 +208,12 @@ fn soft_alpha(mask: &Mask) -> Option<(u32, u32, u32, u32, Vec<f32>)> {
                     acc += k * tmp[sy as usize * bw + x];
                 }
             }
-            out[y * bw + x] = acc.min(1.0);
+            let (mx, my) = ((x0 + x as i64) as u32, (y0 + y as i64) as u32);
+            out[y * bw + x] = if mask.get_pixel(mx, my).0[0] != 0 {
+                1.0
+            } else {
+                acc.min(1.0)
+            };
         }
     }
     Some((x0 as u32, y0 as u32, bw as u32, bh as u32, out))
@@ -211,13 +221,15 @@ fn soft_alpha(mask: &Mask) -> Option<(u32, u32, u32, u32, Vec<f32>)> {
 
 /// Remove the masked area of `img` with LaMa.
 ///
-/// `mask` marks the hole with values above 127 and must match the size of
+/// `mask` marks the hole with any non-zero value and must match the size of
 /// `img`. Photos whose long side exceeds `work_long_side` are inpainted at
-/// that size and the result is scaled back up. The fill is composited over
-/// the original with the mask blurred by a Gaussian (sigma 1.5, truncated at
-/// [`EDGE_RADIUS`]) as alpha, so pixels further than that from the mask are
-/// returned unchanged. An empty mask returns the input without running the
-/// model.
+/// that size and the result is scaled back up; the mask is shrunk with
+/// [`mask::resize_any`] and grown by one working pixel, so a hole thinner
+/// than a working pixel is still filled. The fill replaces every mask pixel and is blended into the
+/// original around it with the mask blurred by a Gaussian (sigma 1.5,
+/// truncated at [`EDGE_RADIUS`]), so pixels further than that from the mask
+/// are returned unchanged. An empty mask returns the input without running
+/// the model. Progress always ends with 1.0.
 pub fn inpaint(
     engine: &Engine,
     img: &RgbImage,
@@ -230,6 +242,7 @@ pub fn inpaint(
     }
     let (w, h) = img.dimensions();
     let Some((ax, ay, aw, ah, alpha)) = soft_alpha(mask) else {
+        (progress.on_fraction)(1.0);
         return Ok(img.clone());
     };
 
@@ -240,7 +253,9 @@ pub fn inpaint(
             let sw = ((w as f64 * scale).round() as u32).max(1);
             let sh = ((h as f64 * scale).round() as u32).max(1);
             let small = imageops::resize(img, sw, sh, imageops::FilterType::Lanczos3);
-            let small_mask = mask::resize(mask, sw, sh);
+            // Any mask pixel under a working pixel makes it a hole, plus one working pixel
+            // around: resampling spreads the mark into the neighbours of the hole.
+            let small_mask = mask::dilate(&mask::resize_any(mask, sw, sh), 1);
             let done = inpaint_at_size(engine, &small, &small_mask, &progress)?;
             imageops::resize(&done, w, h, imageops::FilterType::Lanczos3)
         }

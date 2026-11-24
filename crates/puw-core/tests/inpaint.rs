@@ -239,3 +239,90 @@ fn styles_quality() {
     eprintln!("mean psnr {mean:.2} dB");
     assert!(mean >= 22.0, "mean psnr {mean}");
 }
+
+/// Fractions reported by one [`inpaint`] run.
+fn inpaint_fractions(
+    engine: &Engine,
+    img: &RgbImage,
+    m: &Mask,
+    work_long_side: Option<u32>,
+) -> (RgbImage, Vec<f32>) {
+    let seen = Mutex::new(Vec::new());
+    let cancel = AtomicBool::new(false);
+    let report = |f: f32| seen.lock().unwrap().push(f);
+    let out = inpaint(
+        engine,
+        img,
+        m,
+        work_long_side,
+        Progress {
+            on_fraction: &report,
+            cancel: &cancel,
+        },
+    )
+    .expect("inpaint");
+    (out, seen.into_inner().unwrap())
+}
+
+/// Mean absolute difference of `a` and `b` over the non-zero pixels of `region`.
+fn mean_diff_over(a: &RgbImage, b: &RgbImage, region: &Mask) -> f64 {
+    let (mut sum, mut n) = (0f64, 0u64);
+    for (x, y, p) in region.enumerate_pixels() {
+        if p.0[0] != 0 {
+            let (pa, pb) = (a.get_pixel(x, y).0, b.get_pixel(x, y).0);
+            for c in 0..3 {
+                sum += pa[c].abs_diff(pb[c]) as f64;
+            }
+            n += 3;
+        }
+    }
+    sum / n.max(1) as f64
+}
+
+#[test]
+fn thin_stroke_above_work_side_is_filled() {
+    let Some(engine) = engine() else { return };
+    let clean = photo(2000, 1000);
+    // A 1 px white stroke; the photo is inpainted at a quarter of its size.
+    let mut marked = clean.clone();
+    let mut m = GrayImage::new(2000, 1000);
+    for x in 600..1400 {
+        marked.put_pixel(x, 500, image::Rgb([255, 255, 255]));
+        m.put_pixel(x, 500, Luma([255]));
+    }
+    let (out, fractions) = inpaint_fractions(engine, &marked, &m, Some(500));
+    let before = mean_diff_over(&marked, &clean, &m);
+    let after = mean_diff_over(&out, &clean, &m);
+    eprintln!("1 px stroke: mean diff before {before:.1}, after {after:.1}, {fractions:?}");
+    assert!(fractions.len() >= 2, "no tile ran: {fractions:?}");
+    assert_eq!(fractions.last(), Some(&1.0));
+    assert!(after < 15.0, "stroke not filled: mean diff {after:.1}");
+}
+
+#[test]
+fn antialiased_mask_value_is_hole() {
+    let Some(engine) = engine() else { return };
+    let clean = photo(700, 600);
+    let mut marked = clean.clone();
+    let mut m = GrayImage::new(700, 600);
+    for y in 250..330 {
+        for x in 300..420 {
+            marked.put_pixel(x, y, image::Rgb([255, 255, 255]));
+            m.put_pixel(x, y, Luma([64]));
+        }
+    }
+    let (out, fractions) = inpaint_fractions(engine, &marked, &m, None);
+    let after = mean_diff_over(&out, &clean, &m);
+    eprintln!("mask value 64: mean diff after {after:.1}, {fractions:?}");
+    assert!(fractions.len() >= 2, "no tile ran: {fractions:?}");
+    assert!(after < 30.0, "hole not filled: mean diff {after:.1}");
+}
+
+#[test]
+fn progress_ends_at_one_for_empty_mask() {
+    let Some(engine) = engine() else { return };
+    let img = photo(300, 200);
+    let (out, fractions) = inpaint_fractions(engine, &img, &GrayImage::new(300, 200), None);
+    assert_eq!(out, img);
+    assert_eq!(fractions, [1.0]);
+}

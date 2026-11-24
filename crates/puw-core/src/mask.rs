@@ -1,11 +1,11 @@
-//! Binary mask helpers. A [`Mask`] is a grayscale image where 255 marks the
-//! watermark area to remove and 0 is background.
+//! Binary mask helpers. A [`Mask`] is a grayscale image where any non-zero value marks the
+//! watermark area to remove and 0 is background. Helpers that build masks write 255.
 
 use image::{GrayImage, Luma, imageops};
 use imageproc::rect::Rect;
 use imageproc::region_labelling::{Connectivity, connected_components};
 
-/// Grayscale mask, 255 = watermark area.
+/// Grayscale mask, non-zero = watermark area (helpers write 255).
 pub type Mask = GrayImage;
 
 /// One 8-connected region of a mask.
@@ -103,6 +103,54 @@ pub fn resize(m: &Mask, w: u32, h: u32) -> Mask {
         *p = Luma([if p.0[0] > 127 { 255 } else { 0 }]);
     }
     out
+}
+
+/// Resize where a target pixel is set (255) when any non-zero source pixel overlaps it, so thin
+/// or faint parts of a mask never vanish when it is made smaller.
+pub fn resize_any(m: &Mask, w: u32, h: u32) -> Mask {
+    let (sw, sh) = m.dimensions();
+    let mut out = GrayImage::new(w, h);
+    if w == 0 || h == 0 || sw == 0 || sh == 0 {
+        return out;
+    }
+    // Target pixels [t0, t1] overlapped by source pixel `s` of `n`, mapped onto `t` pixels.
+    let span = |s: u32, n: u32, t: u32| -> (usize, usize) {
+        let (s, n, t) = (u64::from(s), u64::from(n), u64::from(t));
+        let t0 = s * t / n;
+        let t1 = ((s + 1) * t).div_ceil(n) - 1;
+        (t0 as usize, t1 as usize)
+    };
+    let cols: Vec<(usize, usize)> = (0..sw).map(|x| span(x, sw, w)).collect();
+    let (wu, swu) = (w as usize, sw as usize);
+    let mut row = vec![false; wu];
+    let src = m.as_raw();
+    let dst: &mut [u8] = &mut out;
+    for sy in 0..sh {
+        let line = &src[sy as usize * swu..(sy as usize + 1) * swu];
+        if line.iter().all(|&v| v == 0) {
+            continue;
+        }
+        row.fill(false);
+        for (&v, &(t0, t1)) in line.iter().zip(&cols) {
+            if v != 0 {
+                row[t0..=t1].fill(true);
+            }
+        }
+        let (ty0, ty1) = span(sy, sh, h);
+        for ty in ty0..=ty1 {
+            for (d, &r) in dst[ty * wu..(ty + 1) * wu].iter_mut().zip(&row) {
+                if r {
+                    *d = 255;
+                }
+            }
+        }
+    }
+    out
+}
+
+/// True when no pixel is set.
+pub fn is_empty(m: &Mask) -> bool {
+    m.as_raw().iter().all(|&v| v == 0)
 }
 
 /// Fraction (0..1) of pixels that are non-zero. 0.0 for an empty mask.
@@ -329,6 +377,32 @@ mod tests {
         assert!(small.pixels().all(|p| p.0[0] == 0 || p.0[0] == 255));
         assert_eq!(small.get_pixel(0, 2).0[0], 255);
         assert_eq!(small.get_pixel(3, 2).0[0], 0);
+    }
+
+    #[test]
+    fn resize_any_keeps_thin_and_faint_pixels() {
+        // A 1 px line at a quarter of the size, and a faint (value 1) pixel.
+        let mut m = blank(400, 200);
+        for x in 100..300 {
+            m.put_pixel(x, 101, Luma([255]));
+        }
+        m.put_pixel(7, 7, Luma([1]));
+        let s = resize_any(&m, 100, 50);
+        assert_eq!(s.dimensions(), (100, 50));
+        assert!(s.pixels().all(|p| p.0[0] == 0 || p.0[0] == 255));
+        for x in 25..75 {
+            assert_eq!(s.get_pixel(x, 25).0[0], 255, "({x},25)");
+        }
+        assert_eq!(s.get_pixel(1, 1).0[0], 255);
+        // Nothing else is set: the line's row only, and the faint pixel.
+        assert_eq!(coverage(&s), 51.0 / 5000.0);
+        // A source pixel straddling two target pixels sets both.
+        let mut odd = blank(3, 1);
+        odd.put_pixel(1, 0, Luma([255]));
+        assert_eq!(resize_any(&odd, 2, 1).as_raw(), &[255, 255]);
+        assert_eq!(resize_any(&blank(0, 0), 0, 0).dimensions(), (0, 0));
+        assert!(is_empty(&resize_any(&blank(10, 10), 3, 3)));
+        assert!(!is_empty(&odd));
     }
 
     #[test]
