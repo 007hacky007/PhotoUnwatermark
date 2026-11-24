@@ -47,6 +47,9 @@ const REFINE_STEPS: [f32; 2] = [0.01, 0.0025];
 const REFINE_SPAN: [i32; 2] = [5, 4];
 /// The fixed fast path looks this far around the same relative position.
 const FAST_PX: i32 = 2;
+/// Independently searched pieces whose scale differs from the median by more than this leave
+/// the result `Unsure` at most.
+const MAX_SCALE_SPREAD: f32 = 0.1;
 /// Mask components below this fraction of the mask's pixels are dropped.
 const MIN_PIECE_FRAC: f64 = 0.001;
 /// Components whose bounding boxes are closer than this fraction of the long side merge.
@@ -209,7 +212,9 @@ pub fn build_template(img: &RgbImage, mask: &Mask) -> WatermarkTemplate {
 ///    `scale0 * {0.7 .. 1.4}` (see `SCALES`), the best peaks refined at long side 1536 within
 ///    +-8 px and +-5 % scale. Each piece is then re-scored on its own at that placement.
 /// 3. When the best so far scores below [`UNSURE`] and there are several pieces, each piece is
-///    searched on its own the same way.
+///    searched on its own the same way, largest first, and may not overlap the placement of an
+///    earlier piece. If the pieces' scales differ by more than 10 % from their median, the
+///    result is `Unsure` at most.
 ///
 /// With several pieces every score is the minimum over the pieces, the fast path included, so
 /// one matching piece cannot carry a misplaced one into a wrong `Found`. The best-scoring
@@ -242,21 +247,16 @@ pub fn find(t: &WatermarkTemplate, img: &RgbImage) -> MatchResult {
     let mut best = fast_path(t, &pieces, &singles, &target);
     if best.as_ref().is_none_or(|b| b.score < FOUND) {
         let group = if pieces.len() == 1 {
-            search(&target, &singles[0]).map(|p| Outcome::from_places(vec![(0, p)]))
+            search(&target, &singles[0], &[]).map(|p| Outcome::from_places(vec![(0, p)]))
         } else {
             let all: Vec<usize> = (0..pieces.len()).collect();
             let group = Tmpl::new(&pieces, &all);
-            search(&target, &group)
+            search(&target, &group, &[])
                 .map(|p| check_pieces(&target, &singles, group.place_pieces(&pieces, &p)))
         };
         keep_better(&mut best, group);
         if pieces.len() >= 2 && best.as_ref().is_none_or(|b| b.score < UNSURE) {
-            let each: Option<Vec<_>> = singles
-                .iter()
-                .enumerate()
-                .map(|(i, tm)| search(&target, tm).map(|p| (i, p)))
-                .collect();
-            keep_better(&mut best, each.map(Outcome::from_places));
+            keep_better(&mut best, Some(search_each(&target, &singles)));
         }
     }
 
@@ -264,7 +264,7 @@ pub fn find(t: &WatermarkTemplate, img: &RgbImage) -> MatchResult {
         return not_found(0.0);
     };
     let confidence = best.score.clamp(0.0, 1.0);
-    let status = if confidence >= FOUND {
+    let status = if confidence >= FOUND && !best.unsure_at_most {
         MatchStatus::Found
     } else if confidence >= UNSURE {
         MatchStatus::Unsure
@@ -517,6 +517,8 @@ struct Placement {
 struct Outcome {
     score: f32,
     places: Vec<(usize, Placement)>,
+    /// The pieces' geometry is inconsistent: the result may be `Unsure` but never `Found`.
+    unsure_at_most: bool,
 }
 
 impl Outcome {
@@ -525,8 +527,28 @@ impl Outcome {
             .iter()
             .map(|(_, p)| p.score)
             .fold(f32::INFINITY, f32::min);
-        Self { score, places }
+        Self {
+            score,
+            places,
+            unsure_at_most: false,
+        }
     }
+}
+
+/// Bounding box `[x, y, w, h]` of `tm` placed at `p`, in the target's reference space.
+fn placed_rect(tm: &Tmpl, p: &Placement) -> [f32; 4] {
+    let k = p.k;
+    [
+        p.x as f32 * k,
+        p.y as f32 * k,
+        tm.w as f32 * k,
+        tm.h as f32 * k,
+    ]
+}
+
+/// Whether two `[x, y, w, h]` rects share any area.
+fn overlaps(a: &[f32; 4], b: &[f32; 4]) -> bool {
+    a[0] < b[0] + b[2] && b[0] < a[0] + a[2] && a[1] < b[1] + b[3] && b[1] < a[1] + a[3]
 }
 
 /// The photo being searched, in reference space.
@@ -592,8 +614,16 @@ impl Target {
         out
     }
 
-    /// Best placement of `tm` at scale `k` with its top-left within `r` px of `(x, y)`.
-    fn score_window(&self, tm: &Tmpl, k: f32, x: i32, y: i32, r: i32) -> Option<Placement> {
+    /// Best placement of `tm` at scale `k` with its top-left within `r` px of `(x, y)` whose
+    /// bounding box does not overlap any `claimed` rect (reference space).
+    fn score_window(
+        &self,
+        tm: &Tmpl,
+        k: f32,
+        (x, y): (i32, i32),
+        r: i32,
+        claimed: &[[f32; 4]],
+    ) -> Option<Placement> {
         let (kw, kh) = self.k_dims(k);
         let (x0, y0) = ((x - r).max(0), (y - r).max(0));
         let x1 = (x + tm.w as i32 + r).min(kw);
@@ -605,13 +635,19 @@ impl Target {
         let reg = self.region_edges(k, x0, y0, rw, rh);
         let map = masked_ncc(&reg, rw, rh, &tm.edges, &tm.weights, tm.w, tm.h);
         let ow = rw - tm.w + 1;
-        let (i, &score) = map.iter().enumerate().max_by(|a, b| a.1.total_cmp(b.1))?;
-        Some(Placement {
-            k,
-            x: x0 + (i % ow) as i32,
-            y: y0 + (i / ow) as i32,
-            score,
-        })
+        map.iter()
+            .enumerate()
+            .map(|(i, &score)| Placement {
+                k,
+                x: x0 + (i % ow) as i32,
+                y: y0 + (i / ow) as i32,
+                score,
+            })
+            .filter(|p| {
+                let r = placed_rect(tm, p);
+                !claimed.iter().any(|c| overlaps(&r, c))
+            })
+            .max_by(|a, b| a.score.total_cmp(&b.score))
     }
 }
 
@@ -635,7 +671,7 @@ fn fast_path(
         .map(|(i, (p, tm))| {
             let (x, y) = (tx + p.ox - gx0, ty + p.oy - gy0);
             target
-                .score_window(tm, 1.0, x, y, FAST_PX)
+                .score_window(tm, 1.0, (x, y), FAST_PX, &[])
                 .map(|pl| (i, pl))
         })
         .collect::<Option<Vec<_>>>()?;
@@ -649,7 +685,7 @@ fn check_pieces(target: &Target, singles: &[Tmpl], places: Vec<(usize, Placement
         .into_iter()
         .map(|(i, p)| {
             let q = target
-                .score_window(&singles[i], p.k, p.x, p.y, FINE_PX)
+                .score_window(&singles[i], p.k, (p.x, p.y), FINE_PX, &[])
                 .unwrap_or(Placement {
                     score: f32::NEG_INFINITY,
                     ..p
@@ -668,8 +704,43 @@ fn keep_better(best: &mut Option<Outcome>, o: Option<Outcome>) {
     }
 }
 
-/// Steps 2/3: coarse search over scales, then refinement of the best few peaks.
-fn search(target: &Target, tm: &Tmpl) -> Option<Placement> {
+/// Step 3: each piece on its own, largest first. A piece may not overlap the placement of an
+/// earlier one, so identical or similar pieces cannot all land on one instance of the mark.
+/// Pieces whose scales differ by more than 10 % from their median leave the result `Unsure`
+/// at most.
+fn search_each(target: &Target, singles: &[Tmpl]) -> Outcome {
+    let mut order: Vec<usize> = (0..singles.len()).collect();
+    order.sort_by_key(|&i| std::cmp::Reverse(singles[i].w * singles[i].h));
+    let mut claimed: Vec<[f32; 4]> = Vec::new();
+    let mut places = Vec::new();
+    for i in order {
+        match search(target, &singles[i], &claimed) {
+            Some(p) => {
+                claimed.push(placed_rect(&singles[i], &p));
+                places.push((i, p));
+            }
+            None => {
+                return Outcome {
+                    score: f32::NEG_INFINITY,
+                    places,
+                    unsure_at_most: true,
+                };
+            }
+        }
+    }
+    let mut ks: Vec<f32> = places.iter().map(|(_, p)| p.k).collect();
+    ks.sort_by(f32::total_cmp);
+    let median = ks[ks.len() / 2];
+    let mut o = Outcome::from_places(places);
+    o.unsure_at_most = ks
+        .iter()
+        .any(|k| (k / median - 1.0).abs() > MAX_SCALE_SPREAD);
+    o
+}
+
+/// Steps 2/3: coarse search over scales, then refinement of the best few peaks. Placements
+/// overlapping a `claimed` rect (reference space) are skipped.
+fn search(target: &Target, tm: &Tmpl, claimed: &[[f32; 4]]) -> Option<Placement> {
     // (score, k, template centre x, y in k-space)
     let mut cands: Vec<(f32, f32, f32, f32)> = Vec::new();
     for k in SCALES {
@@ -684,6 +755,20 @@ fn search(target: &Target, tm: &Tmpl) -> Option<Placement> {
         let (kw, kh) = target.k_dims(k);
         let (sx, sy) = (kw as f32 / cw as f32, kh as f32 / ch as f32);
         let (rx, ry) = ((tm.cw / 2) as i32, (tm.ch / 2) as i32);
+        if !claimed.is_empty() {
+            for (i, v) in map.iter_mut().enumerate() {
+                let p = Placement {
+                    k,
+                    x: ((i % ow) as f32 * sx).round() as i32,
+                    y: ((i / ow) as f32 * sy).round() as i32,
+                    score: 0.0,
+                };
+                let r = placed_rect(tm, &p);
+                if claimed.iter().any(|c| overlaps(&r, c)) {
+                    *v = f32::NEG_INFINITY;
+                }
+            }
+        }
         for _ in 0..PEAKS_PER_SCALE {
             let Some((i, &score)) = map.iter().enumerate().max_by(|a, b| a.1.total_cmp(b.1)) else {
                 break;
@@ -714,20 +799,20 @@ fn search(target: &Target, tm: &Tmpl) -> Option<Placement> {
         .filter_map(|(_, k, cx, cy)| {
             let x = (cx - tm.w as f32 / 2.0).round() as i32;
             let y = (cy - tm.h as f32 / 2.0).round() as i32;
-            target.score_window(tm, k, x, y, REFINE_PX)
+            target.score_window(tm, k, (x, y), REFINE_PX, claimed)
         })
         .collect();
     checked.sort_by(|a, b| b.score.total_cmp(&a.score));
     checked.truncate(CANDIDATES);
     checked
         .into_iter()
-        .map(|p| refine(target, tm, p))
+        .map(|p| refine(target, tm, p, claimed))
         .max_by(|a, b| a.score.total_cmp(&b.score))
 }
 
 /// Refine a placement over position and scale: +-8 px over +-5 % in 1 % steps, then +-2 px over
 /// +-1 % in 0.25 % steps. Scale steps keep the template centre fixed.
-fn refine(target: &Target, tm: &Tmpl, start: Placement) -> Placement {
+fn refine(target: &Target, tm: &Tmpl, start: Placement, claimed: &[[f32; 4]]) -> Placement {
     let (half_w, half_h) = (tm.w as f32 / 2.0, tm.h as f32 / 2.0);
     let mut best = start;
     let mut r = REFINE_PX;
@@ -737,7 +822,7 @@ fn refine(target: &Target, tm: &Tmpl, start: Placement) -> Placement {
             let k2 = k0 * (1.0 + step * j as f32);
             let x = (cx0 * k0 / k2 - half_w).round() as i32;
             let y = (cy0 * k0 / k2 - half_h).round() as i32;
-            if let Some(p) = target.score_window(tm, k2, x, y, r)
+            if let Some(p) = target.score_window(tm, k2, (x, y), r, claimed)
                 && p.score > best.score
             {
                 best = p;

@@ -113,7 +113,7 @@ fn fixed_set_all_found() {
 /// changes it by 6.9, every other synthetic mark by 16 or more.
 const MIN_VISIBLE: f32 = 10.0;
 
-/// Mean luma change (ITU-R 601) the mark makes under its GT mask, marked minus clean.
+/// Mean absolute luma change (ITU-R 601) the mark makes under its GT mask.
 fn visibility(set: &Path, name: &str) -> f32 {
     let (m, c, g) = (
         rgb(set, "marked", name),
@@ -125,7 +125,7 @@ fn visibility(set: &Path, name: &str) -> f32 {
     let (mut sum, mut n) = (0f32, 0f32);
     for ((a, b), q) in m.pixels().zip(c.pixels()).zip(g.pixels()) {
         if q.0[0] != 0 {
-            sum += luma(a) - luma(b);
+            sum += (luma(a) - luma(b)).abs();
             n += 1.0;
         }
     }
@@ -175,9 +175,14 @@ fn random_set() {
 fn negatives_never_found() {
     let fixed = common::synth_dir().join("fixed");
     let random = common::synth_dir().join("random");
+    // Single-piece templates from the sets, the two-piece and the twin template (multi-piece
+    // paths), and the stamped text template.
     let templates = [
         build_template(&rgb(&fixed, "marked", "00"), &gt(&fixed, "00")),
         build_template(&rgb(&random, "marked", "00"), &gt(&random, "00")),
+        two_piece_template(&fixed).0,
+        twin_template(&fixed),
+        text_template(&fixed),
     ];
     let set = common::synth_dir().join("negative");
     let names = names(&set);
@@ -353,6 +358,82 @@ fn multi_piece_moved_apart() {
     }
 }
 
+/// Template from `fixed/clean/00` with the fixed set's text stamped twice, 60 px apart (two
+/// identical pieces).
+fn twin_template(fixed: &Path) -> WatermarkTemplate {
+    let text = crop_text(fixed);
+    let mut ref_img = rgb(fixed, "clean", "00");
+    let a = stamp(&mut ref_img, &text, 200, 150, 0.3);
+    let b = stamp(&mut ref_img, &text, 200 + text.width() + 60, 150, 0.3);
+    build_template(&ref_img, &puw_core::mask::union(&a, &b))
+}
+
+/// Positions of the two text copies for `twin_case`, moved independently of each other.
+const TWINS: [((u32, u32), (u32, u32)); 4] = [
+    ((100, 100), (900, 800)),
+    ((1000, 200), (300, 600)),
+    ((700, 850), (200, 300)),
+    ((50, 900), (1000, 100)),
+];
+
+/// `fixed/clean/<i+1>` with the text stamped twice at `TWINS[i]`; the GT is the union.
+fn twin_case(fixed: &Path, i: usize) -> (RgbImage, Mask) {
+    let text = crop_text(fixed);
+    let mut img = rgb(fixed, "clean", &format!("{:02}", i + 1));
+    let ((ax, ay), (bx, by)) = TWINS[i];
+    let a = stamp(&mut img, &text, ax, ay, 0.3);
+    let b = stamp(&mut img, &text, bx, by, 0.3);
+    (img, puw_core::mask::union(&a, &b))
+}
+
+/// Two identical pieces moved independently: the per-piece search must not put both on the
+/// same instance and call that `Found`.
+#[test]
+fn twin_pieces_never_wrong_found() {
+    let fixed = common::synth_dir().join("fixed");
+    let t = twin_template(&fixed);
+    assert_eq!(t.pieces.len(), 2);
+    for i in 0..TWINS.len() {
+        let (img, truth) = twin_case(&fixed, i);
+        let (r, secs) = timed_find(&t, &img);
+        let v = iou(&r.mask, &truth);
+        eprintln!(
+            "twins {i}: {:?} conf {:.3} iou {v:.3} {secs:.2}s",
+            r.status, r.confidence
+        );
+        if r.status == MatchStatus::Found {
+            assert!(v >= 0.6, "{i}: wrong Found, iou {v}");
+        }
+    }
+}
+
+/// The two pieces found independently but at clearly different scales (logo x1.35, text x1):
+/// the geometry is inconsistent, so the photo may not be `Found`.
+#[test]
+fn multi_piece_inconsistent_scale_not_found() {
+    let fixed = common::synth_dir().join("fixed");
+    let (t, layer) = two_piece_template(&fixed);
+    let logo = image::imageops::crop_imm(&layer, 0, 0, 81, 81).to_image();
+    let big_logo = puw_core::mask::resize(&logo, 109, 109);
+    for (i, ((lx, ly), (tx, ty))) in APART.into_iter().enumerate() {
+        let mut img = rgb(&fixed, "clean", &format!("{:02}", i + 1));
+        stamp(
+            &mut img,
+            &big_logo,
+            lx.min(1536 - 110),
+            ly.min(1024 - 110),
+            0.3,
+        );
+        stamp(&mut img, &crop_text(&fixed), tx, ty, 0.3);
+        let r = find(&t, &img);
+        eprintln!(
+            "inconsistent scale {i}: {:?} conf {:.3}",
+            r.status, r.confidence
+        );
+        assert_ne!(r.status, MatchStatus::Found, "{i}: conf {}", r.confidence);
+    }
+}
+
 /// Scale and position of the mark for `scaled_case`: the midpoints of the coarse scale grid
 /// (the worst case for the coarse search).
 const SCALED: [(f32, u32, u32); 9] = [
@@ -451,6 +532,11 @@ fn score_sweep() {
         let c = run(&text, &scaled_case(&fixed, i).0).confidence;
         pos.push((format!("scaled x{scale}"), c));
     }
+    let twin = twin_template(&fixed);
+    for i in 0..TWINS.len() {
+        let c = run(&twin, &twin_case(&fixed, i).0).confidence;
+        pos.push((format!("twins {i}"), c));
+    }
     for i in 0..TOGETHER.len() {
         let c = run(&two, &together_case(&fixed, &layer, i).0).confidence;
         pos.push((format!("two-piece together {i}"), c));
@@ -465,6 +551,7 @@ fn score_sweep() {
         ("random", &t_random),
         ("two-piece", &two),
         ("text", &text),
+        ("twin", &twin),
     ] {
         let mut photos: Vec<(String, RgbImage)> = Vec::new();
         for n in names(&negative) {
