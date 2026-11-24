@@ -260,6 +260,9 @@ fn save_is_atomic_and_unique() {
         .filter(|n| n.contains("partial"))
         .collect();
     assert!(leftovers.is_empty(), "{leftovers:?}");
+    for f in [&first, &second] {
+        assert!(fs::metadata(f).unwrap().len() > 0, "empty output {f:?}");
+    }
     assert_eq!(hash(&src), before);
 
     // Missing out_dir is created.

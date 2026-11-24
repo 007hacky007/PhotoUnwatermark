@@ -327,11 +327,17 @@ fn attach_metadata(
     Ok(out)
 }
 
-/// Atomically claim the first free name `stem.ext`, `stem (2).ext`, ... in `dir`.
+/// Publish the finished `partial` as the first free name `stem.ext`, `stem (2).ext`, ...
 ///
-/// The claim is an empty file created with `create_new`, so a file that appears at any
-/// moment is never replaced; the caller later renames its finished data over the claim.
-fn claim_unique(dir: &Path, stem: &str, ext: &str) -> std::io::Result<PathBuf> {
+/// A hard link never replaces an existing file (`AlreadyExists` moves on to the next
+/// suffix) and the final name only ever appears with complete content. The partial is
+/// removed afterwards. Filesystems that refuse hard links use [`copy_no_clobber`].
+fn publish_no_clobber(
+    partial: &Path,
+    dir: &Path,
+    stem: &str,
+    ext: &str,
+) -> std::io::Result<PathBuf> {
     let name = |n: u32| match (n, ext.is_empty()) {
         (1, true) => stem.to_string(),
         (1, false) => format!("{stem}.{ext}"),
@@ -339,25 +345,49 @@ fn claim_unique(dir: &Path, stem: &str, ext: &str) -> std::io::Result<PathBuf> {
         (n, false) => format!("{stem} ({n}).{ext}"),
     };
     for n in 1.. {
-        let path = dir.join(name(n));
-        match fs::OpenOptions::new()
-            .write(true)
-            .create_new(true)
-            .open(&path)
-        {
-            Ok(_) => return Ok(path),
+        let target = dir.join(name(n));
+        match fs::hard_link(partial, &target) {
+            Ok(()) => {
+                fs::remove_file(partial)?;
+                return Ok(target);
+            }
             Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => continue,
-            Err(e) => return Err(e),
+            Err(_) => match copy_no_clobber(partial, &target) {
+                Ok(()) => {
+                    fs::remove_file(partial)?;
+                    return Ok(target);
+                }
+                Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => continue,
+                Err(e) => return Err(e),
+            },
         }
     }
     unreachable!("unbounded range")
 }
 
+/// Last resort for filesystems without hard links: `create_new` + copy + fsync.
+/// NOT atomic: the target exists with partial content while it is being written, and
+/// is removed again if the copy fails.
+fn copy_no_clobber(from: &Path, to: &Path) -> std::io::Result<()> {
+    let mut dst = fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(to)?;
+    let copied = File::open(from)
+        .and_then(|mut src| std::io::copy(&mut src, &mut dst))
+        .and_then(|_| dst.sync_all());
+    if copied.is_err() {
+        drop(dst);
+        let _ = fs::remove_file(to);
+    }
+    copied
+}
+
 /// Write `rgb` (upright, same size as the source) into `out_dir`.
 ///
 /// Keeps the source stem and format; never touches the source file or an existing
-/// file in `out_dir`. Writes a hidden `.partial` file in `out_dir`, fsyncs it, claims
-/// a unique final name without clobbering, then renames the partial onto it.
+/// file in `out_dir`. Writes a hidden `.partial` file in `out_dir`, fsyncs it, then
+/// publishes it under a unique final name that never replaces an existing file.
 ///
 /// Known limitation: for TIFF the ICC profile is carried but the EXIF sub-IFD is not
 /// (the saved TIFF has no Orientation tag, as its pixels are upright).
@@ -402,35 +432,51 @@ pub fn save_result(src: &LoadedPhoto, rgb: &RgbImage, out_dir: &Path) -> Result<
         let _ = fs::remove_file(&partial);
         return Err(e.into());
     }
-    let target = match claim_unique(out_dir, &stem, &ext) {
-        Ok(t) => t,
-        Err(e) => {
+    publish_no_clobber(&partial, out_dir, &stem, &ext)
+        .inspect_err(|_| {
             let _ = fs::remove_file(&partial);
-            return Err(e.into());
-        }
-    };
-    if let Err(e) = fs::rename(&partial, &target) {
-        let _ = fs::remove_file(&partial);
-        let _ = fs::remove_file(&target);
-        return Err(e.into());
-    }
-    Ok(target)
+        })
+        .map_err(Into::into)
 }
 
 #[cfg(test)]
 mod tests {
-    use super::claim_unique;
+    use super::{copy_no_clobber, publish_no_clobber};
+    use std::fs;
 
     #[test]
-    fn claim_never_reuses_existing_or_claimed_names() {
+    fn publish_never_replaces_and_picks_next_suffix() {
         let dir = tempfile::tempdir().unwrap();
-        std::fs::write(dir.path().join("a.jpg"), b"keep").unwrap();
-        let p2 = claim_unique(dir.path(), "a", "jpg").unwrap();
-        let p3 = claim_unique(dir.path(), "a", "jpg").unwrap();
-        assert_eq!(p2.file_name().unwrap(), "a (2).jpg");
-        assert_eq!(p3.file_name().unwrap(), "a (3).jpg");
-        assert_eq!(std::fs::read(dir.path().join("a.jpg")).unwrap(), b"keep");
-        let none = claim_unique(dir.path(), "b", "").unwrap();
-        assert_eq!(none.file_name().unwrap(), "b");
+        fs::write(dir.path().join("a.jpg"), b"keep").unwrap();
+        let mut seen = Vec::new();
+        for body in [&b"one"[..], b"two"] {
+            let partial = dir.path().join(".a.partial");
+            fs::write(&partial, body).unwrap();
+            let p = publish_no_clobber(&partial, dir.path(), "a", "jpg").unwrap();
+            assert!(!partial.exists());
+            assert_eq!(fs::read(&p).unwrap(), body);
+            seen.push(p.file_name().unwrap().to_string_lossy().into_owned());
+        }
+        assert_eq!(seen, ["a (2).jpg", "a (3).jpg"]);
+        assert_eq!(fs::read(dir.path().join("a.jpg")).unwrap(), b"keep");
+
+        let partial = dir.path().join(".b.partial");
+        fs::write(&partial, b"x").unwrap();
+        let p = publish_no_clobber(&partial, dir.path(), "b", "").unwrap();
+        assert_eq!(p.file_name().unwrap(), "b");
+    }
+
+    #[test]
+    fn copy_fallback_refuses_existing_target() {
+        let dir = tempfile::tempdir().unwrap();
+        let (from, to) = (dir.path().join("f"), dir.path().join("t"));
+        fs::write(&from, b"new").unwrap();
+        fs::write(&to, b"old").unwrap();
+        let e = copy_no_clobber(&from, &to).unwrap_err();
+        assert_eq!(e.kind(), std::io::ErrorKind::AlreadyExists);
+        assert_eq!(fs::read(&to).unwrap(), b"old");
+        fs::remove_file(&to).unwrap();
+        copy_no_clobber(&from, &to).unwrap();
+        assert_eq!(fs::read(&to).unwrap(), b"new");
     }
 }
