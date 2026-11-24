@@ -1,3 +1,4 @@
+pub mod detect;
 pub mod engine;
 mod error;
 pub mod image_io;
