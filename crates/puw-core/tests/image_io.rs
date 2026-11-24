@@ -353,16 +353,17 @@ fn tiff_with_tags(img: &RgbImage, orientation: u16, icc: &[u8]) -> Vec<u8> {
     use tiff::encoder::{TiffEncoder, colortype};
     use tiff::tags::Tag;
     let mut out = std::io::Cursor::new(Vec::new());
-    let mut enc = TiffEncoder::new(&mut out).unwrap();
-    let mut im = enc
-        .new_image::<colortype::RGB8>(img.width(), img.height())
-        .unwrap();
-    im.encoder()
-        .write_tag(Tag::Orientation, orientation)
-        .unwrap();
-    im.encoder().write_tag(Tag::IccProfile, icc).unwrap();
-    im.write_data(img.as_raw()).unwrap();
-    drop(enc);
+    {
+        let mut enc = TiffEncoder::new(&mut out).unwrap();
+        let mut im = enc
+            .new_image::<colortype::RGB8>(img.width(), img.height())
+            .unwrap();
+        im.encoder()
+            .write_tag(Tag::Orientation, orientation)
+            .unwrap();
+        im.encoder().write_tag(Tag::IccProfile, icc).unwrap();
+        im.write_data(img.as_raw()).unwrap();
+    }
     out.into_inner()
 }
 
