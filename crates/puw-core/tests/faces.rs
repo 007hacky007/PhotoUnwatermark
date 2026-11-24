@@ -27,6 +27,7 @@ fn engine() -> Option<&'static Engine> {
 fn face() -> Face {
     Face {
         bbox: Rect::at(40, 40).of_size(100, 120),
+        width: 100.0,
         eyes: [(70.0, 80.0), (110.0, 80.0)],
         score: 0.9,
     }
@@ -72,12 +73,42 @@ fn guard_respects_keep() {
 fn guard_handles_eyes_near_the_border() {
     let f = Face {
         bbox: Rect::at(0, 0).of_size(50, 50),
+        width: 50.0,
         eyes: [(-3.0, 2.0), (400.0, 400.0)],
         score: 0.8,
     };
     let out = guard(&full(20, 20), &[f], None);
     assert_eq!(out.get_pixel(0, 2).0[0], 0);
     assert_eq!(out.get_pixel(19, 19).0[0], 255);
+}
+
+#[test]
+fn guard_radius_uses_full_face_width() {
+    // A face cut by the left edge: its box is clamped to 50 px, the face is 100 px wide.
+    let f = Face {
+        bbox: Rect::at(0, 40).of_size(50, 120),
+        width: 100.0,
+        eyes: [(10.0, 80.0), (45.0, 80.0)],
+        score: 0.9,
+    };
+    let out = guard(&full(200, 200), &[f], None);
+    // Radius 0.12 x 100 = 12 px, not 0.12 x 50 = 6 px.
+    assert_eq!(out.get_pixel(45 + 10, 80).0[0], 0);
+    assert_eq!(out.get_pixel(45 + 14, 80).0[0], 255);
+}
+
+#[test]
+fn guard_ignores_non_finite_faces() {
+    let bad_eyes = Face {
+        eyes: [(f32::NAN, 80.0), (110.0, f32::INFINITY)],
+        ..face()
+    };
+    let bad_width = Face {
+        width: f32::NAN,
+        ..face()
+    };
+    let out = guard(&full(200, 200), &[bad_eyes, bad_width], None);
+    assert!(out.pixels().all(|p| p.0[0] == 255));
 }
 
 /// scikit-image's astronaut photo as a PNG in a temp folder.
