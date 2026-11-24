@@ -44,8 +44,8 @@ pub const MIN_BATCH_PHOTOS: usize = 3;
 pub const BATCH_SAMPLE_CAP: usize = 24;
 /// Memory for the photos of one batch layer, which are held as 2-byte luma while the median
 /// is taken: the sample is cut to fit (16 photos at 36 MP). A size whose
-/// [`MIN_BATCH_PHOTOS`] photos would not fit gets no batch layer. [`build_set_layers`] peaks at about this plus 0.4 GB at 36 MP
-/// (measured 1.53 GB for 40 and for 200 photos of 7360x4912).
+/// [`MIN_BATCH_PHOTOS`] photos would not fit gets no batch layer. [`build_set_layers`] peaks at
+/// about this plus 0.4 GB at 36 MP (measured 1.53 GB for 40 and for 200 photos of 7360x4912).
 pub const BATCH_LUMA_BUDGET: u64 = 1_200_000_000;
 /// Most photos [`representative_sample`] picks.
 pub const REPRESENTATIVE_CAP: usize = 6;
@@ -99,7 +99,13 @@ pub fn representative_sample(n: usize) -> Vec<usize> {
 /// [`BATCH_LUMA_BUDGET`] holds at 2 bytes per pixel, at most [`BATCH_SAMPLE_CAP`]. 0 when not
 /// even [`MIN_BATCH_PHOTOS`] fit: such a group is skipped, never clamped up.
 fn batch_sample_len(w: u32, h: u32) -> usize {
-    let per_photo = (2 * u64::from(w) * u64::from(h)).max(1);
+    let Some(per_photo) = 2u64
+        .checked_mul(u64::from(w))
+        .and_then(|v| v.checked_mul(u64::from(h)))
+    else {
+        return 0;
+    };
+    let per_photo = per_photo.max(1);
     let n = (BATCH_LUMA_BUDGET / per_photo).min(BATCH_SAMPLE_CAP as u64) as usize;
     if n < MIN_BATCH_PHOTOS { 0 } else { n }
 }
@@ -186,6 +192,12 @@ pub fn build_set_layers(paths: &[PathBuf], progress: &Progress) -> Result<SetLay
     let mut layers = BTreeMap::new();
     for ((w, h), sample) in samples {
         let mut lumas = PackedLumas::new(w, h);
+        // The sample was cut to fit BATCH_LUMA_BUDGET, so this is bounded by it.
+        if let Err(e) = lumas.reserve_photos(sample.len()) {
+            tracing::warn!("batch layer skipped for the {w}x{h} photos: {e}");
+            units.add(sample.len() * (DECODE_UNITS + MEDIAN_UNITS));
+            continue;
+        }
         for &i in &sample {
             units.check()?;
             match load(&paths[i]) {
@@ -384,6 +396,9 @@ mod tests {
         // Three photos would not fit the budget: skipped, not clamped up.
         assert_eq!(batch_sample_len(30000, 20000), 0);
         assert_eq!(batch_sample_len(65535, 65535), 0);
+        // 2 * w * h wraps in u64 here; must skip, not "fit".
+        assert_eq!(batch_sample_len(3_037_000_500, 3_037_000_500), 0);
+        assert_eq!(batch_sample_len(u32::MAX, u32::MAX), 0);
         assert_eq!(batch_sample_len(0, 0), BATCH_SAMPLE_CAP);
     }
 
@@ -437,8 +452,24 @@ mod tests {
             on_fraction: &|_| {},
             cancel: &std::sync::atomic::AtomicBool::new(false),
         };
+        crate::batch::MAX_RESERVED.with(|m| m.set(0));
         let layers = build_set_layers(&paths, &progress).expect("ok");
         assert!(layers.get(60000, 60000).is_none());
+        // A skipped group reserves nothing.
+        assert_eq!(crate::batch::MAX_RESERVED.with(|m| m.get()), 0);
+
+        // A real group reserves its sample once, within the budget.
+        let real: Vec<PathBuf> = (0..3)
+            .map(|i| {
+                let p = dir.path().join(format!("r{i}.png"));
+                image::RgbImage::new(16, 8).save(&p).expect("save");
+                p
+            })
+            .collect();
+        build_set_layers(&real, &progress).expect("ok");
+        let reserved = crate::batch::MAX_RESERVED.with(|m| m.get());
+        assert_eq!(reserved, 3 * 16 * 8);
+        assert!(2 * reserved as u64 <= BATCH_LUMA_BUDGET);
     }
 
     #[test]

@@ -18,6 +18,12 @@ const ROI_PAD: u32 = 60;
 /// Result is discarded when it covers more than this fraction of the image.
 const MAX_COVERAGE: f32 = 0.10;
 
+#[cfg(test)]
+thread_local! {
+    /// Largest number of luma values [`PackedLumas::reserve_photos`] reserved on this thread.
+    pub(crate) static MAX_RESERVED: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
 type MagImage = ImageBuffer<Luma<f32>, Vec<f32>>;
 
 /// Per-pixel magnitude of the median (over images) Sobel gradient.
@@ -52,8 +58,8 @@ pub(crate) struct PackedLumas {
 }
 
 impl PackedLumas {
-    /// An empty set of `w` x `h` photos. Nothing is reserved up front (the size may come from a
-    /// forged header): memory is claimed one decoded photo at a time, in [`Self::push`].
+    /// An empty set of `w` x `h` photos. Nothing is reserved here (the size may come from a
+    /// forged header); see [`Self::reserve_photos`].
     pub(crate) fn new(w: u32, h: u32) -> Self {
         PackedLumas {
             w,
@@ -62,13 +68,27 @@ impl PackedLumas {
         }
     }
 
+    /// Reserves room for `n` photos, once, with checked arithmetic; the caller has already
+    /// checked that `n` photos fit the memory budget. [`Error::Image`] on overflow or when the
+    /// allocation fails.
+    pub(crate) fn reserve_photos(&mut self, n: usize) -> Result<()> {
+        let total = (self.w as usize)
+            .checked_mul(self.h as usize)
+            .and_then(|px| px.checked_mul(n))
+            .ok_or_else(|| Error::Image("batch layer too large".into()))?;
+        self.data
+            .try_reserve_exact(total)
+            .map_err(|_| Error::Image("batch layer: out of memory".into()))?;
+        #[cfg(test)]
+        MAX_RESERVED.with(|m| m.set(m.get().max(total)));
+        Ok(())
+    }
+
     /// Adds the luma of `img`; [`Error::SizeMismatch`] unless it is `w` x `h`.
     pub(crate) fn push(&mut self, img: &RgbImage) -> Result<()> {
         if img.dimensions() != (self.w, self.h) {
             return Err(Error::SizeMismatch);
         }
-        // `img` is already decoded, so its size is real; reserve exactly one photo's worth.
-        self.data.reserve_exact(img.as_raw().len() / 3);
         self.data
             .extend(img.as_raw().as_chunks::<3>().0.iter().map(|p| {
                 let l1000 = p[0] as u32 * 299 + p[1] as u32 * 587 + p[2] as u32 * 114;
