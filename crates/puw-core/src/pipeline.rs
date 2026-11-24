@@ -43,8 +43,8 @@ pub const MIN_BATCH_PHOTOS: usize = 3;
 /// Most photos of one size group that go into its batch layer.
 pub const BATCH_SAMPLE_CAP: usize = 24;
 /// Memory for the photos of one batch layer, which are held as 2-byte luma while the median
-/// is taken: the sample is cut to fit (16 photos at 36 MP), but never below
-/// [`MIN_BATCH_PHOTOS`]. [`build_set_layers`] peaks at about this plus 0.4 GB at 36 MP
+/// is taken: the sample is cut to fit (16 photos at 36 MP). A size whose
+/// [`MIN_BATCH_PHOTOS`] photos would not fit gets no batch layer. [`build_set_layers`] peaks at about this plus 0.4 GB at 36 MP
 /// (measured 1.53 GB for 40 and for 200 photos of 7360x4912).
 pub const BATCH_LUMA_BUDGET: u64 = 1_200_000_000;
 /// Most photos [`representative_sample`] picks.
@@ -96,11 +96,12 @@ pub fn representative_sample(n: usize) -> Vec<usize> {
 }
 
 /// Photos of one `w` x `h` group that go into its batch layer: as many as
-/// [`BATCH_LUMA_BUDGET`] holds at 2 bytes per pixel, within [`MIN_BATCH_PHOTOS`] ..=
-/// [`BATCH_SAMPLE_CAP`].
+/// [`BATCH_LUMA_BUDGET`] holds at 2 bytes per pixel, at most [`BATCH_SAMPLE_CAP`]. 0 when not
+/// even [`MIN_BATCH_PHOTOS`] fit: such a group is skipped, never clamped up.
 fn batch_sample_len(w: u32, h: u32) -> usize {
     let per_photo = (2 * u64::from(w) * u64::from(h)).max(1);
-    (BATCH_LUMA_BUDGET / per_photo).clamp(MIN_BATCH_PHOTOS as u64, BATCH_SAMPLE_CAP as u64) as usize
+    let n = (BATCH_LUMA_BUDGET / per_photo).min(BATCH_SAMPLE_CAP as u64) as usize;
+    if n < MIN_BATCH_PHOTOS { 0 } else { n }
 }
 
 /// Progress in work units, reported as a fraction.
@@ -139,6 +140,10 @@ const MEDIAN_UNITS: usize = 4;
 /// [`batch_lines`] with [`BATCH_LOW`] / [`BATCH_HIGH`]. Peak memory is bounded by the sample
 /// (see [`BATCH_LUMA_BUDGET`]), whatever the size of the set.
 ///
+/// A group whose size is so large that [`MIN_BATCH_PHOTOS`] photos exceed [`BATCH_LUMA_BUDGET`]
+/// (sizes come from file headers, which may lie) has no layer either (logged). Memory is
+/// claimed only as photos decode.
+///
 /// A photo that cannot be read is left out (logged); a group with fewer than
 /// [`MIN_BATCH_PHOTOS`] readable photos in its sample, or whose layer finds nothing, has no
 /// layer, so a mixed or damaged set never fails here. `progress` gets fractions from 0.0 to
@@ -162,9 +167,14 @@ pub fn build_set_layers(paths: &[PathBuf], progress: &Progress) -> Result<SetLay
     let samples: Vec<((u32, u32), Vec<usize>)> = groups
         .into_iter()
         .filter(|(_, members)| members.len() >= MIN_BATCH_PHOTOS)
-        .map(|((w, h), members)| {
-            let pick = evenly_spaced(members.len(), batch_sample_len(w, h));
-            ((w, h), pick.into_iter().map(|k| members[k]).collect())
+        .filter_map(|((w, h), members)| {
+            let n = batch_sample_len(w, h);
+            if n == 0 {
+                tracing::warn!("batch layer skipped for the {w}x{h} photos: too large");
+                return None;
+            }
+            let pick = evenly_spaced(members.len(), n);
+            Some(((w, h), pick.into_iter().map(|k| members[k]).collect()))
         })
         .collect();
     units.total += samples
@@ -175,7 +185,7 @@ pub fn build_set_layers(paths: &[PathBuf], progress: &Progress) -> Result<SetLay
 
     let mut layers = BTreeMap::new();
     for ((w, h), sample) in samples {
-        let mut lumas = PackedLumas::new(w, h, sample.len());
+        let mut lumas = PackedLumas::new(w, h);
         for &i in &sample {
             units.check()?;
             match load(&paths[i]) {
@@ -371,8 +381,64 @@ mod tests {
         assert_eq!(batch_sample_len(7360, 4912), 16);
         const { assert!(16 * 2 * 7360 * 4912 <= BATCH_LUMA_BUDGET) };
         assert_eq!(batch_sample_len(6000, 4000), BATCH_SAMPLE_CAP);
-        assert_eq!(batch_sample_len(30000, 20000), MIN_BATCH_PHOTOS);
+        // Three photos would not fit the budget: skipped, not clamped up.
+        assert_eq!(batch_sample_len(30000, 20000), 0);
+        assert_eq!(batch_sample_len(65535, 65535), 0);
         assert_eq!(batch_sample_len(0, 0), BATCH_SAMPLE_CAP);
+    }
+
+    /// A PNG whose header claims `w` x `h` and that holds no pixel data.
+    fn forged_png(w: u32, h: u32) -> Vec<u8> {
+        fn crc(data: &[u8]) -> u32 {
+            let mut c = !0u32;
+            for &b in data {
+                c ^= u32::from(b);
+                for _ in 0..8 {
+                    c = if c & 1 != 0 {
+                        0xEDB8_8320 ^ (c >> 1)
+                    } else {
+                        c >> 1
+                    };
+                }
+            }
+            !c
+        }
+        let mut ihdr = b"IHDR".to_vec();
+        ihdr.extend(w.to_be_bytes());
+        ihdr.extend(h.to_be_bytes());
+        ihdr.extend([8, 2, 0, 0, 0]);
+        let mut out = b"\x89PNG\r\n\x1a\n".to_vec();
+        out.extend(13u32.to_be_bytes());
+        out.extend(&ihdr);
+        out.extend(crc(&ihdr).to_be_bytes());
+        // One IDAT with junk instead of pixel data, so the header reads but nothing decodes.
+        let idat = b"IDAT\0\0\0\0";
+        out.extend(4u32.to_be_bytes());
+        out.extend(idat);
+        out.extend(crc(idat).to_be_bytes());
+        out.extend(0u32.to_be_bytes());
+        out.extend(b"IEND");
+        out.extend(crc(b"IEND").to_be_bytes());
+        out
+    }
+
+    #[test]
+    fn forged_headers_get_no_layer_and_no_allocation() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let paths: Vec<PathBuf> = (0..3)
+            .map(|i| {
+                let p = dir.path().join(format!("f{i}.png"));
+                std::fs::write(&p, forged_png(60000, 60000)).expect("write");
+                p
+            })
+            .collect();
+        assert_eq!(upright_size(&paths[0]).expect("header"), (60000, 60000));
+        let progress = Progress {
+            on_fraction: &|_| {},
+            cancel: &std::sync::atomic::AtomicBool::new(false),
+        };
+        let layers = build_set_layers(&paths, &progress).expect("ok");
+        assert!(layers.get(60000, 60000).is_none());
     }
 
     #[test]

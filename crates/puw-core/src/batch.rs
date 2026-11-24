@@ -52,12 +52,13 @@ pub(crate) struct PackedLumas {
 }
 
 impl PackedLumas {
-    /// Room for `n` photos of `w` x `h`; only the photos pushed use memory.
-    pub(crate) fn new(w: u32, h: u32, n: usize) -> Self {
+    /// An empty set of `w` x `h` photos. Nothing is reserved up front (the size may come from a
+    /// forged header): memory is claimed one decoded photo at a time, in [`Self::push`].
+    pub(crate) fn new(w: u32, h: u32) -> Self {
         PackedLumas {
             w,
             h,
-            data: Vec::with_capacity(w as usize * h as usize * n),
+            data: Vec::new(),
         }
     }
 
@@ -66,6 +67,8 @@ impl PackedLumas {
         if img.dimensions() != (self.w, self.h) {
             return Err(Error::SizeMismatch);
         }
+        // `img` is already decoded, so its size is real; reserve exactly one photo's worth.
+        self.data.reserve_exact(img.as_raw().len() / 3);
         self.data
             .extend(img.as_raw().as_chunks::<3>().0.iter().map(|p| {
                 let l1000 = p[0] as u32 * 299 + p[1] as u32 * 587 + p[2] as u32 * 114;
@@ -77,7 +80,7 @@ impl PackedLumas {
 
     /// Number of photos held.
     pub(crate) fn len(&self) -> usize {
-        let px = self.w as usize * self.h as usize;
+        let px = (self.w as usize).saturating_mul(self.h as usize);
         self.data.len().checked_div(px).unwrap_or(0)
     }
 }
@@ -88,7 +91,8 @@ pub(crate) fn median_gradient_packed(lumas: &PackedLumas) -> Result<MagImage> {
     if n == 0 {
         return Err(Error::Image("no images for the batch layer".into()));
     }
-    let (wu, px) = (lumas.w as usize, lumas.w as usize * lumas.h as usize);
+    let wu = lumas.w as usize;
+    let px = wu * lumas.h as usize;
     Ok(median_core(n, lumas.w, lumas.h, |k, y, dst| {
         let row = &lumas.data[k * px + y * wu..k * px + (y + 1) * wu];
         for (d, &v) in dst.iter_mut().zip(row) {
@@ -418,7 +422,7 @@ mod tests {
         let imgs: Vec<RgbImage> = (0..5).map(|k| noise(37, 29, k + 1)).collect();
         let refs: Vec<&RgbImage> = imgs.iter().collect();
         let exact = median_gradient(&refs).expect("median");
-        let mut packed = PackedLumas::new(37, 29, imgs.len());
+        let mut packed = PackedLumas::new(37, 29);
         for img in &imgs {
             packed.push(img).expect("same size");
         }
@@ -432,7 +436,7 @@ mod tests {
             .fold(0f32, f32::max);
         // Each Sobel derivative is off by at most 8 x 1/512, the magnitude by at most sqrt(2)x.
         assert!(max <= 0.023, "max abs diff {max}");
-        let mut white = PackedLumas::new(1, 1, 1);
+        let mut white = PackedLumas::new(1, 1);
         white
             .push(&RgbImage::from_pixel(1, 1, image::Rgb([255, 255, 255])))
             .expect("push");
@@ -441,7 +445,14 @@ mod tests {
             packed.push(&noise(3, 3, 9)),
             Err(Error::SizeMismatch)
         ));
-        assert!(median_gradient_packed(&PackedLumas::new(4, 4, 3)).is_err());
+        assert!(median_gradient_packed(&PackedLumas::new(4, 4)).is_err());
+    }
+
+    #[test]
+    fn packed_lumas_reserves_nothing_for_a_claimed_size() {
+        let p = PackedLumas::new(65535, 65535);
+        assert_eq!(p.data.capacity(), 0);
+        assert_eq!(p.len(), 0);
     }
 
     #[test]
