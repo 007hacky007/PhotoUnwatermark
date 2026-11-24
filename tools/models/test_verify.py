@@ -11,6 +11,7 @@ import numpy as np
 import onnx
 import pytest
 
+import export
 import verify
 
 MODELS = Path(os.environ.get("PUW_MODELS_DIR",
@@ -40,7 +41,7 @@ FLOAT = onnx.TensorProto.FLOAT
 
 
 def test_manifest_hashes_match_files(manifest):
-    assert manifest["version"] == "models-v1"
+    assert manifest["version"] == export.MODELS_VERSION
     assert {f["name"] for f in manifest["files"]} == EXPECTED
     for entry in manifest["files"]:
         data = (MODELS / entry["name"]).read_bytes()
@@ -50,9 +51,8 @@ def test_manifest_hashes_match_files(manifest):
         assert entry["licence"] and entry["source"]
 
 
-def test_face_model_is_fp32(manifest):
-    face = next(f for f in manifest["files"] if f["name"] == "face.onnx")
-    assert face["dtype"] == "fp32"
+def test_shipped_dtypes_are_the_explicit_choice(manifest):
+    assert {f["name"]: f["dtype"] for f in manifest["files"]} == export.SHIPPED_DTYPE
 
 
 def test_segmenter_io_names(manifest):
@@ -63,10 +63,9 @@ def test_segmenter_io_names(manifest):
 
 def test_lama_io_names(manifest):
     inputs, outputs = io_signature(MODELS / "lama.onnx")
-    assert set(inputs) == {"image", "mask"}
-    assert inputs["image"][0] == FLOAT and inputs["image"][1][1:] == [3, 512, 512]
-    assert inputs["mask"][0] == FLOAT and inputs["mask"][1][1:] == [1, 512, 512]
-    assert set(outputs) == {"output"} and outputs["output"][0] == FLOAT
+    # Fixed shapes, batch 1: the engine requires fixed-size inputs.
+    assert inputs == {"image": (FLOAT, [1, 3, 512, 512]), "mask": (FLOAT, [1, 1, 512, 512])}
+    assert outputs == {"output": (FLOAT, [1, 3, 512, 512])}
 
 
 def test_iou_and_psnr():

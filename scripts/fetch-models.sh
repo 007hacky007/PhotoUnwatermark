@@ -1,8 +1,8 @@
 #!/usr/bin/env bash
-# Download the models-v1 release files into $PUW_MODELS_DIR and verify their sha256.
+# Download the models-v2 release files into $PUW_MODELS_DIR and verify their sha256.
 set -euo pipefail
 
-BASE="https://github.com/007hacky007/PhotoUnwatermark/releases/download/models-v1"
+BASE="https://github.com/007hacky007/PhotoUnwatermark/releases/download/models-v2"
 : "${PUW_MODELS_DIR:?set PUW_MODELS_DIR to the destination folder}"
 
 if command -v sha256sum >/dev/null 2>&1; then

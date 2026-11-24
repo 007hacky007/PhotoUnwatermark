@@ -1,8 +1,8 @@
-# Download the models-v1 release files into $env:PUW_MODELS_DIR and verify their sha256.
+# Download the models-v2 release files into $env:PUW_MODELS_DIR and verify their sha256.
 $ErrorActionPreference = 'Stop'
 $ProgressPreference = 'SilentlyContinue'
 
-$base = 'https://github.com/007hacky007/PhotoUnwatermark/releases/download/models-v1'
+$base = 'https://github.com/007hacky007/PhotoUnwatermark/releases/download/models-v2'
 $dir = $env:PUW_MODELS_DIR
 if (-not $dir) { throw 'set PUW_MODELS_DIR to the destination folder' }
 

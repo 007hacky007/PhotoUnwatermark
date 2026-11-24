@@ -3,11 +3,13 @@
 Writes into <out>/build/:
   segmenter.fp32.onnx  six UNet++ specialists merged by pixel max
   segmenter.fp16.onnx  same, fp16 except the small convs
-  lama.fp32.onnx       LaMa (big-lama) inpainter, upstream file unchanged
-  lama.fp16.onnx       same with batch fixed to 1 and constants folded, fp16 except BatchNorm
+  lama.upstream.onnx   LaMa (big-lama) inpainter, upstream file unchanged (parity reference)
+  lama.fp32.onnx       same with batch fixed to 1 and constants folded
+  lama.fp16.onnx       same as lama.fp32.onnx, fp16 except BatchNorm
   face.onnx            YuNet face detector, unchanged
 Graph inputs and outputs stay float32 in every file.
-verify.py then checks parity, picks the dtype per model and writes <out>/manifest.json.
+verify.py then checks parity, copies the SHIPPED_DTYPE file of each model and writes
+<out>/manifest.json.
 """
 import argparse
 import hashlib
@@ -40,6 +42,19 @@ LAMA_SHA256 = "1faef5301d78db7dda502fe59966957ec4b79dd64e16f03ed96913c7a4eb68d6"
 FACE_URL = ("https://media.githubusercontent.com/media/opencv/opencv_zoo/main/models/"
             "face_detection_yunet/face_detection_yunet_2023mar.onnx")
 FACE_SHA256 = "8f2383e4dd3cfbb4553ea8718107fc0423210dc964f9f4280604804ed2552fa4"
+
+# Release tag of the shipped files; also written into the manifest.
+MODELS_VERSION = "models-v2"
+
+# Shipped precision per model, an explicit choice (verify.py still checks parity of every
+# candidate and fails if the shipped one does not pass). Chosen by CPU time per 512x512 tile
+# with ONNX Runtime 1.31 (ort 2.0.0-rc.15) on Apple silicon, models-v1 -> models-v2:
+#   segmenter  fp16 2.4-2.6 s, fp32 0.17 s  -> fp32 (the fp16 graph is about 15x slower)
+#   lama       fp16 2.35 s, fp32 2.0 s (median of 7 after warm-up) -> fp32 (15 % faster)
+#   face       upstream fp32 file
+# fp32 also gives the closest match to PyTorch / upstream. Rule for a re-measure: ship the
+# faster dtype; within 10 %, ship fp16.
+SHIPPED_DTYPE = {"segmenter.onnx": "fp32", "lama.onnx": "fp32", "face.onnx": "fp32"}
 
 # Per shipped file: licence and source, copied into the manifest by verify.py.
 MODEL_INFO = {
@@ -191,15 +206,14 @@ def export_lama(build):
     from huggingface_hub import hf_hub_download
     path = hf_hub_download(LAMA_REPO, LAMA_FILE, revision=LAMA_REVISION)
     check_sha256(path, LAMA_SHA256)
-    fp32 = build / "lama.fp32.onnx"
-    shutil.copyfile(path, fp32)
-    folded = build / "lama.folded.onnx"
-    fold_constants(fp32, folded)
+    upstream = build / "lama.upstream.onnx"
+    shutil.copyfile(path, upstream)
+    folded = build / "lama.fp32.onnx"
+    fold_constants(upstream, folded)
     # With BatchNormalization in fp16 the PSNR inside the hole drops to 21-32 dB on the
     # styles set (59-78 dB with it in fp32), so it stays fp32.
     to_fp16(onnx.load(str(folded)), build / "lama.fp16.onnx",
             op_block_list=["BatchNormalization"])
-    folded.unlink()
 
 
 def export_face(build):

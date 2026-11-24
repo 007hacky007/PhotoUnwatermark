@@ -1,12 +1,15 @@
 """Check parity of the exported models and write <models>/manifest.json.
 
-On the synthetic `styles` set (tools/synth/make_sets.py), resized to 512x512:
-  segmenter  ONNX vs PyTorch, per image: max abs prob diff < 0.02 and IoU(prob > 0.5) > 0.99.
-             fp16 ships if it passes, else fp32 (which must pass).
-  lama       fp16 vs fp32, per image: PSNR inside the hole > 40 dB, else fp32 ships.
-  face       shipped fp32 unchanged.
-The chosen files are copied to <models>/ and listed with dtype, sha256, bytes, licence
-and source. Exits non-zero on any failure (and then writes no manifest).
+On the synthetic `styles` set (tools/synth/make_sets.py), resized to 512x512, every candidate
+is checked and reported:
+  segmenter  fp32 and fp16 ONNX vs PyTorch, per image: max abs prob diff < 0.02 and
+             IoU(prob > 0.5) > 0.99.
+  lama       fp32 (folded, batch 1) and fp16 vs the upstream ONNX file, per image: PSNR inside
+             the hole > 40 dB.
+  face       upstream fp32 file, hash checked.
+The dtype shipped per model is the explicit export.SHIPPED_DTYPE choice; verification fails if
+that candidate does not pass. The shipped files are copied to <models>/ and listed with dtype,
+sha256, bytes, licence and source. Exits non-zero on any failure (and then writes no manifest).
 """
 import argparse
 import json
@@ -74,7 +77,7 @@ def segmenter_input(rgb):
 
 
 def check_segmenter(build, items):
-    """Returns (dtype to ship, failures)."""
+    """{dtype: passed} for every segmenter candidate."""
     import torch
     model = export.load_segmenter()
     inputs = [(name, segmenter_input(rgb)) for name, rgb, _ in items]
@@ -98,37 +101,38 @@ def check_segmenter(build, items):
             print(f"segmenter {dtype} {name}: max|dprob| {diff:.5f}  IoU {score:.5f}  "
                   f"mask px {int((ref > 0.5).sum())}  {'ok' if passed else 'FAIL'}")
         results[dtype] = ok
-    if results["fp16"]:
-        return "fp16", []
-    if results["fp32"]:
-        print("segmenter: fp16 failed parity, shipping fp32")
-        return "fp32", []
-    return None, ["segmenter fp32 failed parity with PyTorch"]
+    return results
 
 
 def check_lama(build, items):
-    """Returns (dtype to ship, failures)."""
-    ref_sess = session(build / "lama.fp32.onnx")
-    try:
-        cand = session(build / "lama.fp16.onnx")
-    except Exception as e:
-        print(f"lama fp16: cannot load: {e}\nlama: shipping fp32")
-        return "fp32", []
-    ok = True
-    for name, rgb, hole in items:
-        feed = {"image": rgb.transpose(2, 0, 1)[None].copy(),
-                "mask": hole[None, None].astype(np.float32)}
-        ref = ref_sess.run(["output"], feed)[0][0]
-        out = cand.run(["output"], feed)[0][0]
-        score = psnr_in_hole(ref, out, hole)
-        passed = score > LAMA_MIN_PSNR
-        ok &= passed
-        print(f"lama fp16 {name}: PSNR in hole {score:.2f} dB  hole px {int(hole.sum())}  "
-              f"{'ok' if passed else 'FAIL'}")
-    if ok:
-        return "fp16", []
-    print("lama: fp16 below the PSNR threshold, shipping fp32")
-    return "fp32", []
+    """{dtype: passed} for every LaMa candidate, against the upstream file."""
+    ref_sess = session(build / "lama.upstream.onnx")
+    results = {}
+    for dtype in ("fp32", "fp16"):
+        try:
+            cand = session(build / f"lama.{dtype}.onnx")
+        except Exception as e:
+            print(f"lama {dtype}: cannot load: {e}")
+            results[dtype] = False
+            continue
+        ok = True
+        for name, rgb, hole in items:
+            feed = {"image": rgb.transpose(2, 0, 1)[None].copy(),
+                    "mask": hole[None, None].astype(np.float32)}
+            ref = ref_sess.run(["output"], feed)[0][0]
+            out = cand.run(["output"], feed)[0][0]
+            score = psnr_in_hole(ref, out, hole)
+            passed = score > LAMA_MIN_PSNR
+            ok &= passed
+            print(f"lama {dtype} {name}: PSNR in hole {score:.2f} dB  hole px {int(hole.sum())}  "
+                  f"{'ok' if passed else 'FAIL'}")
+        results[dtype] = ok
+    return results
+
+
+def shipped_failures(model, results):
+    dtype = export.SHIPPED_DTYPE[f"{model}.onnx"]
+    return [] if results.get(dtype) else [f"{model} {dtype} (shipped) failed parity"]
 
 
 def check_face(build):
@@ -172,23 +176,24 @@ def main():
     with tempfile.TemporaryDirectory() as tmp:
         styles = args.styles or generate_styles(Path(tmp))
         items = load_styles(styles)
-    seg_dtype, failures = check_segmenter(build, items)
-    lama_dtype, lama_failures = check_lama(build, items)
-    failures += lama_failures + check_face(build)
+    failures = (shipped_failures("segmenter", check_segmenter(build, items))
+                + shipped_failures("lama", check_lama(build, items))
+                + check_face(build))
+    if export.SHIPPED_DTYPE["face.onnx"] != "fp32":
+        failures.append("face is only available as the upstream fp32 file")
     if failures:
         for f in failures:
             print(f"FAILED: {f}")
         return 1
 
-    chosen = [(build / f"segmenter.{seg_dtype}.onnx", "segmenter.onnx", seg_dtype),
-              (build / f"lama.{lama_dtype}.onnx", "lama.onnx", lama_dtype),
-              (build / "face.onnx", "face.onnx", "fp32")]
     entries = []
-    for src, name, dtype in chosen:
+    for name, dtype in export.SHIPPED_DTYPE.items():
+        stem = name.removesuffix(".onnx")
+        src = build / ("face.onnx" if stem == "face" else f"{stem}.{dtype}.onnx")
         dst = args.out / name
         shutil.copyfile(src, dst)
         entries.append(manifest_entry(dst, dtype))
-    manifest_path.write_text(json.dumps({"version": "models-v1", "files": entries},
+    manifest_path.write_text(json.dumps({"version": export.MODELS_VERSION, "files": entries},
                                         indent=2) + "\n")
     total = sum(e["bytes"] for e in entries)
     for e in entries:

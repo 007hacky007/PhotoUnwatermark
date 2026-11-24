@@ -27,7 +27,10 @@ writes `models/manifest.json` (dtype, sha256, bytes, licence, source per file):
     uv run --project tools pytest tools/models -q
 
 `export.py` downloads the upstream weights (Hugging Face cache, OpenCV Zoo) and writes fp32 and
-fp16 candidates to `models/build/`. `verify.py` compares them on the synthetic `styles` set,
-copies the chosen dtype per model to `models/` and exits non-zero on any failure. The tests check
+fp16 candidates to `models/build/`. The shipped precision per model is the explicit
+`SHIPPED_DTYPE` in `export.py` (currently fp32 for all three, chosen by CPU speed; the reasons and
+numbers are next to it). `verify.py` checks every candidate on the synthetic `styles` set, copies
+the shipped dtype per model to `models/` and exits non-zero on any failure, including a shipped
+candidate that misses its parity threshold. The tests check
 the built directory (`PUW_MODELS_DIR` to point elsewhere), so they need the two steps above first.
 Licences: [models/LICENSES.md](models/LICENSES.md).
