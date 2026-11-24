@@ -6,3 +6,7 @@ license.workspace = true
 publish = false
 
 [dependencies]
+clap = { version = "4.6", features = ["derive"] }
+image = { version = "0.25", default-features = false, features = ["png"] }
+puw-core = { path = "../puw-core" }
+tempfile = "3"

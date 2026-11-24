@@ -19,10 +19,11 @@ use image::imageops::{self, FilterType};
 use image::{ExtendedColorType, GrayImage, ImageBuffer, ImageEncoder, ImageFormat, Luma, RgbImage};
 use serde::{Deserialize, Serialize};
 
-/// Minimum score for [`MatchStatus::Found`]. Tuned on the synthetic sets (the `score_sweep`
-/// test prints the distributions): visible marks score >= 0.51 at their true placement,
-/// photos without the mark <= 0.26. Task 14 revisits both thresholds on real photos.
-pub const FOUND: f32 = 0.45;
+/// Minimum score for [`MatchStatus::Found`]. Synthetic sets: visible marks score >= 0.515 at
+/// their true placement, photos without the mark <= 0.26. On a real set with a faint mark over a
+/// busy background, wrong placements reached 0.455, so the bar sits above that. See
+/// `docs/notes/thresholds.md`.
+pub const FOUND: f32 = 0.48;
 /// Minimum score for [`MatchStatus::Unsure`]; below it the result is [`MatchStatus::NotFound`].
 pub const UNSURE: f32 = 0.35;
 

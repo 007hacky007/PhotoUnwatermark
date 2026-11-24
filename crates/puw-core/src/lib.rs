@@ -8,7 +8,16 @@ pub mod inpaint;
 pub mod library;
 pub mod mask;
 pub mod ncc;
+pub mod pipeline;
 pub mod template;
 pub mod tiles;
 
+pub use detect::{Guess, GuessOptions};
+pub use engine::{Backend, CpuReason, DeviceReport, Engine, ModelPaths};
 pub use error::{Error, Result};
+pub use image_io::{LoadedPhoto, load, output_dir_for};
+pub use inpaint::{Progress, WORK_LONG_SIDE};
+pub use library::{Library, SavedWatermark};
+pub use mask::Mask;
+pub use pipeline::{auto_guess_set, pick_representative, remove_one};
+pub use template::{MatchResult, MatchStatus, WatermarkTemplate, build_template, find};
