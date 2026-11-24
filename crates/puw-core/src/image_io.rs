@@ -3,6 +3,7 @@
 use std::fs::{self, File};
 use std::io::{Cursor, Write};
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU32, Ordering};
 
 use image::codecs::jpeg::JpegEncoder;
 use image::{
@@ -50,26 +51,61 @@ fn image_err(e: impl std::fmt::Display) -> Error {
     Error::Image(e.to_string())
 }
 
-/// Metadata (EXIF, ICC) of the formats we carry through; `(None, None)` for others.
-fn read_metadata(bytes: &[u8], format: ImageFormat) -> (Option<Vec<u8>>, Option<Vec<u8>>) {
-    fn pick<T: ImageEXIF + ImageICC>(img: &T) -> (Option<Vec<u8>>, Option<Vec<u8>>) {
-        (
-            img.exif().map(|b| b.to_vec()),
-            img.icc_profile().map(|b| b.to_vec()),
-        )
+struct Metadata {
+    exif: Option<Vec<u8>>,
+    icc: Option<Vec<u8>>,
+    /// Orientation stored outside an EXIF blob (TIFF keeps it in its own IFD).
+    tiff_orientation: Option<Orientation>,
+}
+
+/// Metadata of the formats we carry through; empty for others.
+fn read_metadata(bytes: &[u8], format: ImageFormat) -> Metadata {
+    fn pick<T: ImageEXIF + ImageICC>(img: &T) -> Metadata {
+        Metadata {
+            exif: img.exif().map(|b| b.to_vec()),
+            icc: img.icc_profile().map(|b| b.to_vec()),
+            tiff_orientation: None,
+        }
     }
     let data = Bytes::copy_from_slice(bytes);
-    match format {
-        ImageFormat::Jpeg => img_parts::jpeg::Jpeg::from_bytes(data)
-            .map(|i| pick(&i))
-            .unwrap_or_default(),
-        ImageFormat::Png => img_parts::png::Png::from_bytes(data)
-            .map(|i| pick(&i))
-            .unwrap_or_default(),
-        ImageFormat::WebP => img_parts::webp::WebP::from_bytes(data)
-            .map(|i| pick(&i))
-            .unwrap_or_default(),
-        _ => (None, None),
+    let found = match format {
+        ImageFormat::Jpeg => img_parts::jpeg::Jpeg::from_bytes(data).map(|i| pick(&i)),
+        ImageFormat::Png => img_parts::png::Png::from_bytes(data).map(|i| pick(&i)),
+        ImageFormat::WebP => img_parts::webp::WebP::from_bytes(data).map(|i| pick(&i)),
+        ImageFormat::Tiff => return read_tiff_metadata(bytes),
+        _ => return Metadata::none(),
+    };
+    found.unwrap_or_else(|_| Metadata::none())
+}
+
+impl Metadata {
+    fn none() -> Self {
+        Metadata {
+            exif: None,
+            icc: None,
+            tiff_orientation: None,
+        }
+    }
+}
+
+fn read_tiff_metadata(bytes: &[u8]) -> Metadata {
+    let Ok(mut dec) = tiff::decoder::Decoder::new(Cursor::new(bytes)) else {
+        return Metadata::none();
+    };
+    let tiff_orientation = dec
+        .find_tag_unsigned::<u8>(tiff::tags::Tag::Orientation)
+        .ok()
+        .flatten()
+        .and_then(Orientation::from_exif);
+    let icc = dec
+        .find_tag(tiff::tags::Tag::IccProfile)
+        .ok()
+        .flatten()
+        .and_then(|v| v.into_u8_vec().ok());
+    Metadata {
+        exif: None,
+        icc,
+        tiff_orientation,
     }
 }
 
@@ -94,11 +130,14 @@ pub fn load(path: &Path) -> Result<LoadedPhoto> {
     }
     let format = image::guess_format(&bytes).map_err(image_err)?;
     let mut img = image::load_from_memory_with_format(&bytes, format).map_err(image_err)?;
-    let (exif, icc) = read_metadata(&bytes, format);
+    let Metadata {
+        exif,
+        icc,
+        tiff_orientation,
+    } = read_metadata(&bytes, format);
 
-    let orientation = exif
-        .as_deref()
-        .map(exif_orientation)
+    let orientation = tiff_orientation
+        .or_else(|| exif.as_deref().map(exif_orientation))
         .unwrap_or(Orientation::NoTransforms);
     let alpha_plane = img.color().has_alpha().then(|| extract_alpha(&img));
     img.apply_orientation(orientation);
@@ -166,7 +205,7 @@ fn normalise_orientation(exif: &mut [u8]) {
     }
 }
 
-fn encode(src: &LoadedPhoto, rgb: &RgbImage) -> Result<Vec<u8>> {
+fn encode(src: &LoadedPhoto, rgb: &RgbImage, icc: Option<&[u8]>) -> Result<Vec<u8>> {
     let (w, h) = rgb.dimensions();
     let mut out = Cursor::new(Vec::new());
     let alpha = match (&src.alpha, src.format) {
@@ -194,7 +233,8 @@ fn encode(src: &LoadedPhoto, rgb: &RgbImage) -> Result<Vec<u8>> {
                 .write_image(rgb.as_raw(), w, h, image::ExtendedColorType::Rgb8)
                 .map_err(image_err)?;
         }
-        ImageFormat::Png | ImageFormat::WebP | ImageFormat::Tiff => {
+        ImageFormat::Tiff => encode_tiff(&mut out, rgb, alpha, icc)?,
+        ImageFormat::Png | ImageFormat::WebP => {
             dynimg.write_to(&mut out, src.format).map_err(image_err)?;
         }
         other => {
@@ -204,6 +244,47 @@ fn encode(src: &LoadedPhoto, rgb: &RgbImage) -> Result<Vec<u8>> {
         }
     }
     Ok(out.into_inner())
+}
+
+fn encode_tiff(
+    out: &mut Cursor<Vec<u8>>,
+    rgb: &RgbImage,
+    alpha: Option<&GrayImage>,
+    icc: Option<&[u8]>,
+) -> Result<()> {
+    use tiff::encoder::{TiffEncoder, colortype};
+    use tiff::tags::Tag;
+    let (w, h) = rgb.dimensions();
+    let mut enc = TiffEncoder::new(out).map_err(image_err)?;
+    // No Orientation tag is written: the pixels are upright.
+    macro_rules! write {
+        ($ct:ty, $data:expr, $alpha:expr) => {{
+            let mut img = enc.new_image::<$ct>(w, h).map_err(image_err)?;
+            if let Some(icc) = icc {
+                img.encoder()
+                    .write_tag(Tag::IccProfile, icc)
+                    .map_err(image_err)?;
+            }
+            if $alpha {
+                // 2 = unassociated alpha
+                img.encoder()
+                    .write_tag(Tag::ExtraSamples, &[2u16][..])
+                    .map_err(image_err)?;
+            }
+            img.write_data($data).map_err(image_err)
+        }};
+    }
+    match alpha {
+        Some(a) => {
+            let data: Vec<u8> = rgb
+                .pixels()
+                .zip(a.pixels())
+                .flat_map(|(p, a)| [p.0[0], p.0[1], p.0[2], a.0[0]])
+                .collect();
+            write!(colortype::RGBA8, &data, true)
+        }
+        None => write!(colortype::RGB8, rgb.as_raw(), false),
+    }
 }
 
 fn attach_metadata(
@@ -246,30 +327,53 @@ fn attach_metadata(
     Ok(out)
 }
 
-fn unique_target(dir: &Path, stem: &str, ext: &str) -> PathBuf {
+/// Atomically claim the first free name `stem.ext`, `stem (2).ext`, ... in `dir`.
+///
+/// The claim is an empty file created with `create_new`, so a file that appears at any
+/// moment is never replaced; the caller later renames its finished data over the claim.
+fn claim_unique(dir: &Path, stem: &str, ext: &str) -> std::io::Result<PathBuf> {
     let name = |n: u32| match (n, ext.is_empty()) {
         (1, true) => stem.to_string(),
         (1, false) => format!("{stem}.{ext}"),
         (n, true) => format!("{stem} ({n})"),
         (n, false) => format!("{stem} ({n}).{ext}"),
     };
-    (1..)
-        .map(|n| dir.join(name(n)))
-        .find(|p| !p.exists())
-        .expect("unbounded range")
+    for n in 1.. {
+        let path = dir.join(name(n));
+        match fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&path)
+        {
+            Ok(_) => return Ok(path),
+            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => continue,
+            Err(e) => return Err(e),
+        }
+    }
+    unreachable!("unbounded range")
 }
 
-/// Write `rgb` (upright, same size as the source) next to the originals' output folder.
+/// Write `rgb` (upright, same size as the source) into `out_dir`.
 ///
-/// Keeps the source stem and format; never touches the source file. Writes a hidden
-/// `.partial` file in `out_dir`, fsyncs it, then renames it to a unique final name.
+/// Keeps the source stem and format; never touches the source file or an existing
+/// file in `out_dir`. Writes a hidden `.partial` file in `out_dir`, fsyncs it, claims
+/// a unique final name without clobbering, then renames the partial onto it.
+///
+/// Known limitation: for TIFF the ICC profile is carried but the EXIF sub-IFD is not
+/// (the saved TIFF has no Orientation tag, as its pixels are upright).
+/// The ICC profile is only attached when its colour space is RGB, because the output
+/// is always RGB (grayscale and CMYK sources are converted on load).
 pub fn save_result(src: &LoadedPhoto, rgb: &RgbImage, out_dir: &Path) -> Result<PathBuf> {
-    let encoded = encode(src, rgb)?;
+    let icc = src
+        .icc
+        .as_deref()
+        .filter(|i| i.get(16..20) == Some(b"RGB ".as_slice()));
+    let encoded = encode(src, rgb, icc)?;
     let exif = src.exif.clone().map(|mut e| {
         normalise_orientation(&mut e);
         e
     });
-    let bytes = attach_metadata(encoded, src.format, exif, src.icc.as_deref())?;
+    let bytes = attach_metadata(encoded, src.format, exif, icc)?;
 
     fs::create_dir_all(out_dir)?;
     let stem = src
@@ -283,21 +387,50 @@ pub fn save_result(src: &LoadedPhoto, rgb: &RgbImage, out_dir: &Path) -> Result<
         .map(|s| s.to_string_lossy().into_owned())
         .unwrap_or_default();
 
-    let target = unique_target(out_dir, &stem, &ext);
-    let file_name = target
-        .file_name()
-        .map(|n| n.to_string_lossy().into_owned())
-        .unwrap_or_default();
-    let partial = out_dir.join(format!(".{file_name}.partial"));
-    let write = || -> std::io::Result<()> {
+    static COUNTER: AtomicU32 = AtomicU32::new(0);
+    let partial = out_dir.join(format!(
+        ".{stem}.{}.{}.partial",
+        std::process::id(),
+        COUNTER.fetch_add(1, Ordering::Relaxed)
+    ));
+    let write_partial = || -> std::io::Result<()> {
         let mut f = File::create(&partial)?;
         f.write_all(&bytes)?;
-        f.sync_all()?;
-        fs::rename(&partial, &target)
+        f.sync_all()
     };
-    if let Err(e) = write() {
+    if let Err(e) = write_partial() {
         let _ = fs::remove_file(&partial);
         return Err(e.into());
     }
+    let target = match claim_unique(out_dir, &stem, &ext) {
+        Ok(t) => t,
+        Err(e) => {
+            let _ = fs::remove_file(&partial);
+            return Err(e.into());
+        }
+    };
+    if let Err(e) = fs::rename(&partial, &target) {
+        let _ = fs::remove_file(&partial);
+        let _ = fs::remove_file(&target);
+        return Err(e.into());
+    }
     Ok(target)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::claim_unique;
+
+    #[test]
+    fn claim_never_reuses_existing_or_claimed_names() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("a.jpg"), b"keep").unwrap();
+        let p2 = claim_unique(dir.path(), "a", "jpg").unwrap();
+        let p3 = claim_unique(dir.path(), "a", "jpg").unwrap();
+        assert_eq!(p2.file_name().unwrap(), "a (2).jpg");
+        assert_eq!(p3.file_name().unwrap(), "a (3).jpg");
+        assert_eq!(std::fs::read(dir.path().join("a.jpg")).unwrap(), b"keep");
+        let none = claim_unique(dir.path(), "b", "").unwrap();
+        assert_eq!(none.file_name().unwrap(), "b");
+    }
 }

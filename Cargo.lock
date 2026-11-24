@@ -551,6 +551,7 @@ dependencies = [
  "ort",
  "tempfile",
  "thiserror",
+ "tiff",
  "tracing",
 ]
 

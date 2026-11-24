@@ -136,7 +136,7 @@ fn orientation_roundtrip() {
 fn exif_and_icc_preserved() {
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("m.jpg");
-    let icc: Vec<u8> = (0..300u32).map(|i| (i * 7 % 251) as u8).collect();
+    let icc = fake_icc(b"RGB ");
     fs::write(
         &path,
         with_meta(
@@ -183,6 +183,10 @@ fn loads_unusual_formats() {
     fs::write(&cmyk_path, out).unwrap();
     let p = load(&cmyk_path).unwrap();
     assert_eq!(p.rgb.dimensions(), (16, 8));
+    // No ink must come out near-white (mind Adobe's inverted CMYK).
+    for px in p.rgb.pixels() {
+        assert!(px.0.iter().all(|&c| c > 235), "not white: {px:?}");
+    }
 
     // 16-bit PNG.
     let png_path = dir.path().join("deep.png");
@@ -284,7 +288,7 @@ fn webp_and_tiff_roundtrip_with_metadata() {
         .unwrap();
     let mut w = img_parts::webp::WebP::from_bytes(Bytes::from(buf.into_inner())).unwrap();
     w.set_exif(Some(Bytes::from(exif_blob(6))));
-    w.set_icc_profile(Some(Bytes::from_static(b"fake-icc-profile")));
+    w.set_icc_profile(Some(Bytes::from(fake_icc(b"RGB "))));
     let mut raw = Vec::new();
     w.encoder().write_to(&mut raw).unwrap();
     fs::write(&webp, raw).unwrap();
@@ -294,7 +298,7 @@ fn webp_and_tiff_roundtrip_with_metadata() {
     let out = save_result(&photo, &photo.rgb, &dir.path().join("out")).unwrap();
     let saved = load(&out).unwrap();
     assert_eq!(saved.format, ImageFormat::WebP);
-    assert_eq!(saved.icc.as_deref(), Some(&b"fake-icc-profile"[..]));
+    assert_eq!(saved.icc, Some(fake_icc(b"RGB ")));
     assert_eq!(orientation_of(saved.exif.as_ref().unwrap()), 1);
 
     let tiff = dir.path().join("t.tiff");
@@ -303,4 +307,104 @@ fn webp_and_tiff_roundtrip_with_metadata() {
     let out = save_result(&photo, &photo.rgb, &dir.path().join("out")).unwrap();
     assert_eq!(out.file_name().unwrap(), "t.tiff");
     assert_eq!(max_diff(&load(&out).unwrap().rgb, &img), 0);
+}
+
+/// A syntactically plausible ICC header with the given colour space.
+fn fake_icc(space: &[u8; 4]) -> Vec<u8> {
+    let mut v = vec![0u8; 128];
+    v[16..20].copy_from_slice(space);
+    v.extend_from_slice(b"profile-body");
+    v
+}
+
+#[test]
+fn icc_dropped_when_colour_model_changes() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("g.jpg");
+    let gray = GrayImage::from_fn(16, 16, |x, _| image::Luma([(x * 15) as u8]));
+    let mut raw = Vec::new();
+    image::ImageEncoder::write_image(
+        image::codecs::jpeg::JpegEncoder::new_with_quality(&mut raw, 95),
+        gray.as_raw(),
+        16,
+        16,
+        image::ExtendedColorType::L8,
+    )
+    .unwrap();
+    fs::write(&path, with_meta(raw, None, Some(fake_icc(b"GRAY")))).unwrap();
+    let photo = load(&path).unwrap();
+    assert!(photo.icc.is_some());
+    let out = save_result(&photo, &photo.rgb, &dir.path().join("out")).unwrap();
+    assert!(load(&out).unwrap().icc.is_none());
+
+    // An RGB profile on an RGB source is kept.
+    let rgb_path = dir.path().join("c.jpg");
+    fs::write(
+        &rgb_path,
+        with_meta(jpeg_bytes(&gradient(16, 16)), None, Some(fake_icc(b"RGB "))),
+    )
+    .unwrap();
+    let photo = load(&rgb_path).unwrap();
+    let out = save_result(&photo, &photo.rgb, &dir.path().join("out")).unwrap();
+    assert_eq!(load(&out).unwrap().icc, Some(fake_icc(b"RGB ")));
+}
+
+fn tiff_with_tags(img: &RgbImage, orientation: u16, icc: &[u8]) -> Vec<u8> {
+    use tiff::encoder::{TiffEncoder, colortype};
+    use tiff::tags::Tag;
+    let mut out = std::io::Cursor::new(Vec::new());
+    let mut enc = TiffEncoder::new(&mut out).unwrap();
+    let mut im = enc
+        .new_image::<colortype::RGB8>(img.width(), img.height())
+        .unwrap();
+    im.encoder()
+        .write_tag(Tag::Orientation, orientation)
+        .unwrap();
+    im.encoder().write_tag(Tag::IccProfile, icc).unwrap();
+    im.write_data(img.as_raw()).unwrap();
+    drop(enc);
+    out.into_inner()
+}
+
+#[test]
+fn tiff_orientation_and_icc() {
+    let dir = tempfile::tempdir().unwrap();
+    let upright = gradient(40, 24);
+    let stored = image::imageops::rotate270(&upright); // orientation 6
+    let icc = fake_icc(b"RGB ");
+    let path = dir.path().join("t.tif");
+    fs::write(&path, tiff_with_tags(&stored, 6, &icc)).unwrap();
+
+    let photo = load(&path).unwrap();
+    assert_eq!(photo.rgb.dimensions(), (40, 24));
+    assert_eq!(max_diff(&photo.rgb, &upright), 0);
+    assert_eq!(photo.icc.as_deref(), Some(icc.as_slice()));
+
+    let out = save_result(&photo, &photo.rgb, &dir.path().join("out")).unwrap();
+    let saved = load(&out).unwrap();
+    assert_eq!(saved.rgb.dimensions(), (40, 24));
+    assert_eq!(max_diff(&saved.rgb, &upright), 0);
+    assert_eq!(saved.icc.as_deref(), Some(icc.as_slice()));
+    let mut dec =
+        tiff::decoder::Decoder::new(std::io::Cursor::new(fs::read(&out).unwrap())).unwrap();
+    let o = dec
+        .find_tag_unsigned::<u16>(tiff::tags::Tag::Orientation)
+        .unwrap();
+    assert!(matches!(o, None | Some(1)), "{o:?}");
+}
+
+#[test]
+fn tiff_alpha_preserved() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("a.tiff");
+    RgbaImage::from_fn(9, 5, |x, y| Rgba([10, 20, 30, (x * 20 + y) as u8]))
+        .save_with_format(&path, ImageFormat::Tiff)
+        .unwrap();
+    let photo = load(&path).unwrap();
+    assert!(photo.alpha.is_some());
+    let out = save_result(&photo, &photo.rgb, &dir.path().join("out")).unwrap();
+    let saved = image::open(&out).unwrap().to_rgba8();
+    for (x, y, p) in saved.enumerate_pixels() {
+        assert_eq!(p.0, [10, 20, 30, (x * 20 + y) as u8]);
+    }
 }
