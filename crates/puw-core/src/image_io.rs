@@ -164,44 +164,174 @@ fn extract_alpha(img: &DynamicImage) -> GrayImage {
     })
 }
 
-/// Set the EXIF Orientation tag to 1 in place; leaves the blob alone if it has none.
-fn normalise_orientation(exif: &mut [u8]) {
+/// Byte-order-aware access to a TIFF structure (an EXIF blob). Out-of-range reads give `None`
+/// and out-of-range writes are skipped, so a malformed blob is left as it is.
+struct Tiff<'a> {
+    b: &'a mut Vec<u8>,
+    le: bool,
+}
+
+impl Tiff<'_> {
+    fn u16_at(&self, o: usize) -> Option<u16> {
+        let s: [u8; 2] = self.b.get(o..o.checked_add(2)?)?.try_into().ok()?;
+        Some(if self.le {
+            u16::from_le_bytes(s)
+        } else {
+            u16::from_be_bytes(s)
+        })
+    }
+
+    fn u32_at(&self, o: usize) -> Option<u32> {
+        let s: [u8; 4] = self.b.get(o..o.checked_add(4)?)?.try_into().ok()?;
+        Some(if self.le {
+            u32::from_le_bytes(s)
+        } else {
+            u32::from_be_bytes(s)
+        })
+    }
+
+    fn put(&mut self, o: usize, bytes: &[u8]) {
+        if let Some(slot) = o
+            .checked_add(bytes.len())
+            .and_then(|end| self.b.get_mut(o..end))
+        {
+            slot.copy_from_slice(bytes);
+        }
+    }
+
+    fn put_u16(&mut self, o: usize, v: u16) {
+        let b = if self.le {
+            v.to_le_bytes()
+        } else {
+            v.to_be_bytes()
+        };
+        self.put(o, &b);
+    }
+
+    fn put_u32(&mut self, o: usize, v: u32) {
+        let b = if self.le {
+            v.to_le_bytes()
+        } else {
+            v.to_be_bytes()
+        };
+        self.put(o, &b);
+    }
+
+    /// Entries of the IFD at `ifd` as (entry offset, tag); empty when it is out of range.
+    fn entries(&self, ifd: usize) -> Vec<(usize, u16)> {
+        let n = self.u16_at(ifd).unwrap_or(0) as usize;
+        (0..n)
+            .map(|i| ifd + 2 + 12 * i)
+            .map_while(|e| Some((e, self.u16_at(e)?)))
+            .collect()
+    }
+
+    /// Value of a one-count SHORT or LONG entry.
+    fn uint(&self, e: usize) -> Option<u32> {
+        if self.u32_at(e + 4)? != 1 {
+            return None;
+        }
+        match self.u16_at(e + 2)? {
+            3 => self.u16_at(e + 8).map(u32::from),
+            4 => self.u32_at(e + 8),
+            _ => None,
+        }
+    }
+
+    /// Makes entry `e` a one-count LONG holding `v`.
+    fn set_long(&mut self, e: usize, v: u32) {
+        self.put_u16(e + 2, 4);
+        self.put_u32(e + 4, 1);
+        self.put_u32(e + 8, v);
+    }
+}
+
+const TAG_ORIENTATION: u16 = 0x0112;
+const TAG_EXIF_IFD: u16 = 0x8769;
+const TAG_PIXEL_X: u16 = 0xA002;
+const TAG_PIXEL_Y: u16 = 0xA003;
+const TAG_STRIP_OFFSETS: u16 = 0x0111;
+const TAG_STRIP_BYTES: u16 = 0x0117;
+const TAG_JPEG_OFFSET: u16 = 0x0201;
+const TAG_JPEG_BYTES: u16 = 0x0202;
+
+/// Prepares the source EXIF for a result with upright pixels:
+/// - Orientation (IFD0) becomes 1;
+/// - for orientations 5-8 (a quarter turn), PixelXDimension and PixelYDimension swap;
+/// - the thumbnail (IFD1) is removed: unlinked from IFD0, its table and image data zeroed, and
+///   cut off the blob when it is at the end. It shows the original, watermark included.
+///
+/// A blob that is not a TIFF structure is left alone.
+fn clean_exif(exif: &mut Vec<u8>) {
     let le = match exif.get(..2) {
         Some(b"II") => true,
         Some(b"MM") => false,
         _ => return,
     };
-    let u16_at = |b: &[u8], o: usize| -> Option<u16> {
-        let s: [u8; 2] = b.get(o..o + 2)?.try_into().ok()?;
-        Some(if le {
-            u16::from_le_bytes(s)
-        } else {
-            u16::from_be_bytes(s)
-        })
-    };
-    let Some(ifd) = exif
-        .get(4..8)
-        .and_then(|s| <[u8; 4]>::try_from(s).ok())
-        .map(|s| if le { u32::from_le_bytes(s) } else { u32::from_be_bytes(s) } as usize)
-    else {
+    let mut t = Tiff { b: exif, le };
+    let Some(ifd0) = t.u32_at(4).map(|o| o as usize) else {
         return;
     };
-    let Some(count) = u16_at(exif, ifd) else {
-        return;
-    };
-    for i in 0..count as usize {
-        let e = ifd + 2 + i * 12;
-        if u16_at(exif, e) == Some(0x0112) {
-            let one = if le {
-                1u16.to_le_bytes()
-            } else {
-                1u16.to_be_bytes()
-            };
-            if let Some(slot) = exif.get_mut(e + 8..e + 10) {
-                slot.copy_from_slice(&one);
+    let entries = t.entries(ifd0);
+    let mut exif_ifd = None;
+    let mut quarter_turn = false;
+    for &(e, tag) in &entries {
+        match tag {
+            TAG_ORIENTATION => {
+                quarter_turn = matches!(t.u16_at(e + 8), Some(5..=8));
+                t.put_u16(e + 8, 1);
             }
-            return;
+            TAG_EXIF_IFD => exif_ifd = t.uint(e).map(|o| o as usize),
+            _ => {}
         }
+    }
+    if quarter_turn && let Some(sub) = exif_ifd {
+        let find = |t: &Tiff, tag| t.entries(sub).into_iter().find(|&(_, g)| g == tag);
+        if let (Some((ex, _)), Some((ey, _))) = (find(&t, TAG_PIXEL_X), find(&t, TAG_PIXEL_Y))
+            && let (Some(px), Some(py)) = (t.uint(ex), t.uint(ey))
+        {
+            t.set_long(ex, py);
+            t.set_long(ey, px);
+        }
+    }
+
+    let next_at = ifd0 + 2 + 12 * entries.len();
+    let Some(ifd1) = t.u32_at(next_at).filter(|&o| o != 0).map(|o| o as usize) else {
+        return;
+    };
+    t.put_u32(next_at, 0);
+    // Regions of the thumbnail that are zeroed: the image data, then the IFD1 table.
+    let mut regions = Vec::new();
+    let ifd1_entries = t.entries(ifd1);
+    let value = |tag| {
+        ifd1_entries
+            .iter()
+            .find(|&&(_, g)| g == tag)
+            .and_then(|&(e, _)| t.uint(e))
+            .map(|v| v as usize)
+    };
+    for (off, len) in [
+        (TAG_JPEG_OFFSET, TAG_JPEG_BYTES),
+        (TAG_STRIP_OFFSETS, TAG_STRIP_BYTES),
+    ] {
+        if let (Some(o), Some(n)) = (value(off), value(len)) {
+            regions.push((o, o.saturating_add(n)));
+        }
+    }
+    regions.push((ifd1, ifd1 + 2 + 12 * ifd1_entries.len() + 4));
+    let len = t.b.len();
+    for &(s, e) in &regions {
+        if s < len {
+            t.b[s..e.min(len)].fill(0);
+        }
+    }
+    // Cut off what was zeroed at the end of the blob (repeatedly: the table usually sits right
+    // before the image data).
+    while let Some(&(s, _)) = regions
+        .iter()
+        .find(|&&(s, e)| s < t.b.len() && e >= t.b.len())
+    {
+        t.b.truncate(s);
     }
 }
 
@@ -398,6 +528,10 @@ fn copy_no_clobber(from: &Path, to: &Path) -> std::io::Result<()> {
 /// file in `out_dir`. Writes a hidden `.partial` file in `out_dir`, fsyncs it, then
 /// publishes it under a unique final name that never replaces an existing file.
 ///
+/// EXIF is carried with Orientation set to 1, PixelXDimension / PixelYDimension swapped for
+/// a source that was turned a quarter, and the embedded thumbnail removed (it shows the
+/// original, watermark included).
+///
 /// Known limitation: for TIFF the ICC profile is carried but the EXIF sub-IFD is not
 /// (the saved TIFF has no Orientation tag, as its pixels are upright).
 /// The ICC profile is only attached when its colour space is RGB, because the output
@@ -409,7 +543,7 @@ pub fn save_result(src: &LoadedPhoto, rgb: &RgbImage, out_dir: &Path) -> Result<
         .filter(|i| i.get(16..20) == Some(b"RGB ".as_slice()));
     let encoded = encode(src, rgb, icc)?;
     let exif = src.exif.clone().map(|mut e| {
-        normalise_orientation(&mut e);
+        clean_exif(&mut e);
         e
     });
     let bytes = attach_metadata(encoded, src.format, exif, icc)?;

@@ -412,3 +412,101 @@ fn tiff_alpha_preserved() {
         assert_eq!(p.0, [10, 20, 30, (x * 20 + y) as u8]);
     }
 }
+
+/// Camera-style EXIF: IFD0 (Make, Orientation, Exif IFD pointer), an Exif IFD with
+/// PixelXDimension (LONG) and PixelYDimension (SHORT), and an IFD1 with a JPEG thumbnail.
+fn camera_exif(le: bool, orientation: u16, px: u32, py: u16, thumb: &[u8]) -> Vec<u8> {
+    let mut b = Vec::new();
+    let u16b = |v: u16| if le { v.to_le_bytes() } else { v.to_be_bytes() };
+    let u32b = |v: u32| if le { v.to_le_bytes() } else { v.to_be_bytes() };
+    // (tag, type, count, value bytes left-justified in 4)
+    let entry = |b: &mut Vec<u8>, tag: u16, ty: u16, count: u32, value: [u8; 4]| {
+        b.extend_from_slice(&u16b(tag));
+        b.extend_from_slice(&u16b(ty));
+        b.extend_from_slice(&u32b(count));
+        b.extend_from_slice(&value);
+    };
+    let short = |v: u16| {
+        let s = u16b(v);
+        [s[0], s[1], 0, 0]
+    };
+    b.extend_from_slice(if le { b"II" } else { b"MM" });
+    b.extend_from_slice(&u16b(42));
+    b.extend_from_slice(&u32b(8));
+    // IFD0 at 8: 3 entries, ends at 50; Make data at 50..58; Exif IFD at 58..88; IFD1 at 88..130.
+    b.extend_from_slice(&u16b(3));
+    entry(&mut b, 0x010F, 2, 7, u32b(50));
+    entry(&mut b, 0x0112, 3, 1, short(orientation));
+    entry(&mut b, 0x8769, 4, 1, u32b(58));
+    b.extend_from_slice(&u32b(88));
+    assert_eq!(b.len(), 50);
+    b.extend_from_slice(b"PUWCam\0\0");
+    b.extend_from_slice(&u16b(2));
+    entry(&mut b, 0xA002, 4, 1, u32b(px));
+    entry(&mut b, 0xA003, 3, 1, short(py));
+    b.extend_from_slice(&u32b(0));
+    assert_eq!(b.len(), 88);
+    b.extend_from_slice(&u16b(3));
+    entry(&mut b, 0x0103, 3, 1, short(6));
+    entry(&mut b, 0x0201, 4, 1, u32b(130));
+    entry(&mut b, 0x0202, 4, 1, u32b(thumb.len() as u32));
+    b.extend_from_slice(&u32b(0));
+    assert_eq!(b.len(), 130);
+    b.extend_from_slice(thumb);
+    b
+}
+
+fn contains(hay: &[u8], needle: &[u8]) -> bool {
+    hay.windows(needle.len()).any(|w| w == needle)
+}
+
+#[test]
+fn saved_exif_has_no_thumbnail_and_upright_dimensions() {
+    let dir = tempfile::tempdir().unwrap();
+    let upright = gradient(40, 24);
+    let thumb = jpeg_bytes(&gradient(8, 6));
+    for (le, orientation) in [(true, 6u16), (false, 6), (true, 8), (false, 1), (true, 3)] {
+        let stored = match orientation {
+            6 => image::imageops::rotate270(&upright),
+            8 => image::imageops::rotate90(&upright),
+            3 => image::imageops::rotate180(&upright),
+            _ => upright.clone(),
+        };
+        let (sw, sh) = stored.dimensions();
+        let blob = camera_exif(le, orientation, sw, sh as u16, &thumb);
+        // The source really has a thumbnail that a reader finds.
+        let src_exif = read_exif(&blob);
+        assert!(
+            src_exif.fields().any(|f| f.ifd_num == exif::In::THUMBNAIL),
+            "source thumbnail"
+        );
+        let path = dir.path().join(format!("t{le}{orientation}.jpg"));
+        fs::write(&path, with_meta(jpeg_bytes(&stored), Some(blob), None)).unwrap();
+
+        let photo = load(&path).unwrap();
+        assert_eq!(photo.rgb.dimensions(), (40, 24));
+        let out = save_result(&photo, &photo.rgb, &dir.path().join("out")).unwrap();
+        let bytes = fs::read(&out).unwrap();
+        assert!(
+            !contains(&bytes, &thumb),
+            "le {le} o{orientation}: thumbnail bytes kept"
+        );
+        let saved = load(&out).unwrap();
+        let e = read_exif(saved.exif.as_ref().unwrap());
+        let case = format!("le {le} o{orientation}");
+        assert!(
+            !e.fields().any(|f| f.ifd_num == exif::In::THUMBNAIL),
+            "{case}: IFD1 kept"
+        );
+        let get = |t| {
+            e.get_field(t, exif::In::PRIMARY)
+                .and_then(|f| f.value.get_uint(0))
+        };
+        assert_eq!(get(exif::Tag::Orientation), Some(1), "{case}");
+        assert_eq!(get(exif::Tag::PixelXDimension), Some(40), "{case}");
+        assert_eq!(get(exif::Tag::PixelYDimension), Some(24), "{case}");
+        let make = e.get_field(exif::Tag::Make, exif::In::PRIMARY).unwrap();
+        assert_eq!(make.display_value().to_string(), "\"PUWCam\"", "{case}");
+        assert_eq!(saved.rgb.dimensions(), (40, 24));
+    }
+}
