@@ -102,13 +102,45 @@ What this shows:
   0.45 to 0.48:
   - The real misplacement becomes Unsure, so the user looks at it.
   - The lowest synthetic visible positive (0.515) stays Found, with a margin of 0.035.
-  - Every negative (synthetic and real, except the same-scene artefact above) stays below 0.35.
+  - Every negative stays below 0.35, except the same-scene artefact above. The highest are 0.323
+    (synthetic, random all-references sweep), 0.311 (synthetic, fixed all-references sweep) and
+    0.206 (synthetic negatives against the real set 1 templates); the highest real negative is
+    0.123.
 - `UNSURE` stays 0.35. The right real placements (0.36-0.44) land in Unsure, which is the
   wanted outcome for a mark this faint.
 - With these thresholds, set 1 is not processed automatically; the user is asked to look at each
   photo. Making matching work for faint fixed marks needs a change to the method, not to the
   thresholds. One candidate: when a set's batch layer holds the confirmed mark, use the fixed
   position. The template and library tests pass with the new value.
+
+## Real-set bench: guess and removal (`puw-dev bench --real`)
+
+Release build on an Apple silicon Mac, all models on the processor.
+
+- Engine creation: 32.4 s, a cold load in a fresh process. Other bench runs measured
+  30.9-34.7 s.
+- `auto_guess_set`:
+
+| set | time per photo | coverage % | confidence | empty guesses |
+|---|---|---|---|---|
+| 1 (8 photos, 24 MP) | 6.4 s | 14.63-15.22 (mean 14.99) | 0.917-0.930 | 0 |
+| 2 (1 photo, 36 MP) | 7.5 s | 6.44 | 0.950 | 0 |
+
+Set 1's guess holds all of its batch layer, which is 2.91 % of the photo in 1083 components: the
+mark plus static scene edges. Grown by 24 px, that is most of the 15 %.
+
+- `remove_one` with the auto-guess mask, by working long side:
+
+| set | work side | seconds per photo | LaMa tiles per photo |
+|---|---|---|---|
+| 1 | 4096 | 97.8-113.7 (median 102.1) | 47-55 (median 50) |
+| 1 | 2048 | 27.7-38.1 (median 31.4) | 13-19 (median 16) |
+| 2 | 4096 | 111.4 | 52 |
+| 2 | 2048 | 40.0 | 19 |
+
+That is about 2.0-2.1 s per LaMa tile. At these mask sizes neither working side meets the spec's
+~15 s step-2 preview target on the processor. A smaller preview working side, a tighter mask, or a
+faster preview model is needed (Plan 2).
 
 ## Detection scales (ruling R10 revisit)
 

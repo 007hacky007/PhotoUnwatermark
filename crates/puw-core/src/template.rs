@@ -20,9 +20,10 @@ use image::{ExtendedColorType, GrayImage, ImageBuffer, ImageEncoder, ImageFormat
 use serde::{Deserialize, Serialize};
 
 /// Minimum score for [`MatchStatus::Found`]. Synthetic sets: visible marks score >= 0.515 at
-/// their true placement, photos without the mark <= 0.26. On a real set with a faint mark over a
-/// busy background, wrong placements reached 0.455, so the bar sits above that. See
-/// `docs/notes/thresholds.md`.
+/// their true placement, and photos without the mark score <= 0.33 with any reference. One
+/// exception reaches 0.601: an invisible-mark template on a crop of the same scene. On a real set
+/// with a faint mark over a busy background, wrong placements reached 0.455, so the bar sits
+/// above that. See `docs/notes/thresholds.md`.
 pub const FOUND: f32 = 0.48;
 /// Minimum score for [`MatchStatus::Unsure`]; below it the result is [`MatchStatus::NotFound`].
 pub const UNSURE: f32 = 0.35;
