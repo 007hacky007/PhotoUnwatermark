@@ -1,3 +1,4 @@
+pub mod batch;
 pub mod detect;
 pub mod engine;
 mod error;
