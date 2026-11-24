@@ -193,13 +193,14 @@ def build_fixed(root, sources, rng):
 
 
 def build_random(root, sources, rng):
+    text = rng.choice(MARK_TEXTS)  # one mark for the whole set
     items = []
     for i in range(12):
         long_side = (1536, 1024)[(i // 2) % 2]
         short_side = long_side * 2 // 3
         size = (short_side, long_side) if i % 2 else (long_side, short_side)
         clean = make_photo(sources, i + 3, size, rng)
-        shape, _ = outline_mark(size, long_side, rng, text=rng.choice(MARK_TEXTS))
+        shape, _ = outline_mark(size, long_side, rng, text=text)
         marked, mask = apply_mark(clean, shape, rng.uniform(0.2, 0.35))
         items.append(save_item(root, "random", f"{i:02d}", clean, marked, mask))
     write_manifest(root, "random", "random", items)

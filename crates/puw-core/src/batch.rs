@@ -54,11 +54,7 @@ pub fn median_gradient(images: &[&RgbImage]) -> Result<MagImage> {
             for r in 0..rows + 2 {
                 let sy = (y0 + r).saturating_sub(1).min(hu - 1);
                 let src = &img.as_raw()[sy * wu * 3..(sy + 1) * wu * 3];
-                let dst = &mut luma[r * wu..(r + 1) * wu];
-                for (d, p) in dst.iter_mut().zip(src.as_chunks::<3>().0) {
-                    *d =
-                        (p[0] as u32 * 299 + p[1] as u32 * 587 + p[2] as u32 * 114) as f32 / 1000.0;
-                }
+                luma_row(src, &mut luma[r * wu..(r + 1) * wu]);
             }
             for r in 0..rows {
                 let (up, mid, dn) = (
@@ -67,15 +63,13 @@ pub fn median_gradient(images: &[&RgbImage]) -> Result<MagImage> {
                     &luma[(r + 2) * wu..(r + 3) * wu],
                 );
                 let base = (k * BAND + r) * wu;
-                for x in 0..wu {
-                    let (xl, xr) = (x.saturating_sub(1), (x + 1).min(wu - 1));
-                    // Smooth along y [1,2,1], derivative along x [-1,0,1].
-                    let sm = |c: usize| up[c] + 2.0 * mid[c] + dn[c];
-                    gx[base + x] = sm(xr) - sm(xl);
-                    // Smooth along x [1,2,1], derivative along y [-1,0,1].
-                    let d = |c: usize| dn[c] - up[c];
-                    gy[base + x] = d(xl) + 2.0 * d(x) + d(xr);
-                }
+                sobel_row(
+                    up,
+                    mid,
+                    dn,
+                    &mut gx[base..base + wu],
+                    &mut gy[base..base + wu],
+                );
             }
         }
         for r in 0..rows {
@@ -93,6 +87,43 @@ pub fn median_gradient(images: &[&RgbImage]) -> Result<MagImage> {
         }
     }
     Ok(MagImage::from_raw(w, h, out).expect("sized buffer"))
+}
+
+/// ITU-R 601 luma of packed RGB pixels `src` into `dst` (one value per pixel).
+pub(crate) fn luma_row(src: &[u8], dst: &mut [f32]) {
+    for (d, p) in dst.iter_mut().zip(src.as_chunks::<3>().0) {
+        *d = (p[0] as u32 * 299 + p[1] as u32 * 587 + p[2] as u32 * 114) as f32 / 1000.0;
+    }
+}
+
+/// 3x3 Sobel derivatives of row `mid`, with `up`/`dn` the rows above and below and the edge
+/// columns repeated (scipy 'reflect').
+pub(crate) fn sobel_row(up: &[f32], mid: &[f32], dn: &[f32], gx: &mut [f32], gy: &mut [f32]) {
+    let w = mid.len();
+    for x in 0..w {
+        let (xl, xr) = (x.saturating_sub(1), (x + 1).min(w - 1));
+        // Smooth along y [1,2,1], derivative along x [-1,0,1].
+        let sm = |c: usize| up[c] + 2.0 * mid[c] + dn[c];
+        gx[x] = sm(xr) - sm(xl);
+        // Smooth along x [1,2,1], derivative along y [-1,0,1].
+        let d = |c: usize| dn[c] - up[c];
+        gy[x] = d(xl) + 2.0 * d(x) + d(xr);
+    }
+}
+
+/// Sobel gradient magnitude of a row-major `w` x `h` luma image, edge pixels repeated.
+pub(crate) fn sobel_magnitude(luma: &[f32], w: usize, h: usize) -> Vec<f32> {
+    let mut out = vec![0f32; w * h];
+    let (mut gx, mut gy) = (vec![0f32; w], vec![0f32; w]);
+    for y in 0..h {
+        let row = |r: usize| &luma[r * w..(r + 1) * w];
+        let (up, dn) = (row(y.saturating_sub(1)), row((y + 1).min(h - 1)));
+        sobel_row(up, row(y), dn, &mut gx, &mut gy);
+        for ((o, a), b) in out[y * w..(y + 1) * w].iter_mut().zip(&gx).zip(&gy) {
+            *o = a.hypot(*b);
+        }
+    }
+    out
 }
 
 /// numpy-style median (mean of the two middle values for an even count). Reorders `v`.

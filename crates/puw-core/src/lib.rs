@@ -6,6 +6,8 @@ pub mod faces;
 pub mod image_io;
 pub mod inpaint;
 pub mod mask;
+pub mod ncc;
+pub mod template;
 pub mod tiles;
 
 pub use error::{Error, Result};
