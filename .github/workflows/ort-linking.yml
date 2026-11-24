@@ -1,0 +1,98 @@
+name: ORT linking spike
+
+# Answers docs/notes/ort-linking.md: does one exe link ONNX Runtime statically, and can DirectML
+# come from a helper folder?
+on:
+  workflow_dispatch:
+  push:
+    paths:
+      - .github/workflows/ort-linking.yml
+
+jobs:
+  windows:
+    runs-on: windows-latest
+    env:
+      PUW_MODELS_DIR: ${{ github.workspace }}/models
+    defaults:
+      run:
+        shell: pwsh
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Cache models
+        id: models-cache
+        uses: actions/cache@v4
+        with:
+          path: models
+          key: models-v2-${{ runner.os }}
+      - name: Fetch models
+        if: steps.models-cache.outputs.cache-hit != 'true'
+        run: scripts/fetch-models.ps1
+      - name: Locate dumpbin
+        run: |
+          $vs = & "${env:ProgramFiles(x86)}\Microsoft Visual Studio\Installer\vswhere.exe" -latest -property installationPath
+          $dumpbin = Get-ChildItem "$vs\VC\Tools\MSVC" -Recurse -Filter dumpbin.exe | Where-Object FullName -like '*Hostx64\x64*' | Select-Object -First 1
+          "DUMPBIN=$($dumpbin.FullName)" >> $env:GITHUB_ENV
+
+      - name: Build (plain static link)
+        run: cargo build --release -p puw-core --example device_report -vv 2>&1 | Select-String 'ort-sys.*(rustc-link|warning)|cargo:rustc-link' | Out-String -Width 400
+      - name: Prebuilt ORT files
+        run: |
+          Get-ChildItem "$env:LOCALAPPDATA\ort.pyke.io" -Recurse -File -ErrorAction SilentlyContinue | Select-Object Length, FullName | Format-Table -AutoSize | Out-String -Width 400
+          Get-ChildItem target\release -File | Select-Object Length, Name | Format-Table -AutoSize
+      - name: System DirectML
+        run: |
+          Get-Item C:\Windows\System32\DirectML.dll -ErrorAction SilentlyContinue | ForEach-Object { $_.VersionInfo | Format-List FileVersion, ProductVersion, FileName }
+          Get-CimInstance Win32_VideoController | Select-Object Name, AdapterCompatibility, DriverVersion | Format-List
+      - name: Imports (plain)
+        run: |
+          & $env:DUMPBIN /nologo /dependents target\release\examples\device_report.exe
+          (Get-Item target\release\examples\device_report.exe).Length
+      - name: Run alone in an empty folder (plain)
+        run: |
+          New-Item -ItemType Directory alone | Out-Null
+          Copy-Item target\release\examples\device_report.exe alone\
+          Get-ChildItem alone
+          alone\device_report.exe; "exit code $LASTEXITCODE"
+          alone\device_report.exe --cpu; "exit code $LASTEXITCODE"
+          $global:LASTEXITCODE = 0
+
+      - name: Build (DirectML delay-loaded)
+        env:
+          RUSTFLAGS: -C link-arg=/DELAYLOAD:DirectML.dll -C link-arg=delayimp.lib
+        run: cargo build --release -p puw-core --example device_report --target-dir target-delay
+      - name: Imports (delay-loaded)
+        run: |
+          & $env:DUMPBIN /nologo /dependents target-delay\release\examples\device_report.exe
+          (Get-Item target-delay\release\examples\device_report.exe).Length
+      - name: Run alone (delay-loaded)
+        run: |
+          New-Item -ItemType Directory delay | Out-Null
+          Copy-Item target-delay\release\examples\device_report.exe delay\
+          delay\device_report.exe --cpu; "exit code $LASTEXITCODE"
+          delay\device_report.exe; "exit code $LASTEXITCODE"
+          $global:LASTEXITCODE = 0
+      - name: Run with DirectML.dll in a helper folder (delay-loaded)
+        run: |
+          $dml = Get-ChildItem "$env:LOCALAPPDATA\ort.pyke.io" -Recurse -Filter DirectML.dll -ErrorAction SilentlyContinue | Select-Object -First 1
+          if (-not $dml) { $dml = Get-ChildItem target-delay\release -Filter DirectML.dll | Select-Object -First 1 }
+          if (-not $dml) { "no redistributable DirectML.dll found next to the prebuilt ORT"; exit 0 }
+          "using $($dml.FullName) version $($dml.VersionInfo.FileVersion)"
+          New-Item -ItemType Directory delay\gpu | Out-Null
+          Copy-Item $dml.FullName delay\gpu\
+          delay\device_report.exe --helper delay\gpu; "exit code $LASTEXITCODE"
+          $global:LASTEXITCODE = 0
+
+      - name: Build (static CRT + DirectML delay-loaded)
+        continue-on-error: true
+        env:
+          RUSTFLAGS: -C target-feature=+crt-static -C link-arg=/DELAYLOAD:DirectML.dll -C link-arg=delayimp.lib
+        run: |
+          cargo build --release -p puw-core --example device_report --target-dir target-crt 2>&1 | Select-String -Pattern 'error|LNK|warning: unused|Finished' | Select-Object -First 40 | Out-String -Width 400
+          if (Test-Path target-crt\release\examples\device_report.exe) {
+            & $env:DUMPBIN /nologo /dependents target-crt\release\examples\device_report.exe
+            New-Item -ItemType Directory crt | Out-Null
+            Copy-Item target-crt\release\examples\device_report.exe crt\
+            crt\device_report.exe --cpu; "exit code $LASTEXITCODE"
+          } else { "static CRT build produced no exe" }
+          $global:LASTEXITCODE = 0
