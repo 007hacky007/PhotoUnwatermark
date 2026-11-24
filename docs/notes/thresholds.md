@@ -119,7 +119,7 @@ Release build on an Apple silicon Mac, all models on the processor.
 
 - Engine creation: 32.4 s, a cold load in a fresh process. Other bench runs measured
   30.9-34.7 s.
-- `auto_guess_set`:
+- `auto_guess_set` (since replaced by `build_set_layers` + `guess_photo`):
 
 | set | time per photo | coverage % | confidence | empty guesses |
 |---|---|---|---|---|
@@ -182,3 +182,11 @@ Recommendation: do not add 512.
 
 Set 1, 8 photos of one upright size: batch layer coverage 2.91 %. The research prototype
 measured about 2.9 % on the same set with the same constants.
+
+Since the final fix wave the batch layer comes from `build_set_layers`, which reads photos one
+at a time and keeps an evenly spaced sample of each size group as 2-byte luma (`puw-dev layers
+--real`): set 1 still gives 2.91 % (1084 components, was 1083), in 4.3 s for the 8 photos.
+
+Peak memory of `build_set_layers` on synthetic 36 MP JPEGs (7360x4912, release build, macOS
+peak memory footprint): 0.76 GB for 3 photos, 0.95 GB for 8, 1.53 GB for 40 and 1.53 GB for
+200 (the sample stops at 16 photos at this size, `BATCH_LUMA_BUDGET`). 200 photos took 8.3 s.
