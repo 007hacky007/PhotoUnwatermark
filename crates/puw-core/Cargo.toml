@@ -7,6 +7,7 @@ license.workspace = true
 [dependencies]
 ort = { version = "=2.0.0-rc.15", default-features = false, features = ["std", "tracing", "download-binaries", "tls-native", "copy-dylibs", "api-31"] }
 image = { version = "0.25", default-features = false, features = ["jpeg", "png", "tiff", "webp"] }
+imageproc = { version = "0.27", default-features = false }
 img-parts = "0.4"
 kamadak-exif = "0.6"
 thiserror = "2"
