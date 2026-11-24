@@ -79,6 +79,13 @@ fn read_metadata(bytes: &[u8], format: ImageFormat) -> Metadata {
 }
 
 impl Metadata {
+    /// The orientation to apply: TIFF's own tag, else EXIF's, else none.
+    fn orientation(&self) -> Orientation {
+        self.tiff_orientation
+            .or_else(|| self.exif.as_deref().map(exif_orientation))
+            .unwrap_or(Orientation::NoTransforms)
+    }
+
     fn none() -> Self {
         Metadata {
             exif: None,
@@ -130,15 +137,9 @@ pub fn load(path: &Path) -> Result<LoadedPhoto> {
     }
     let format = image::guess_format(&bytes).map_err(image_err)?;
     let mut img = image::load_from_memory_with_format(&bytes, format).map_err(image_err)?;
-    let Metadata {
-        exif,
-        icc,
-        tiff_orientation,
-    } = read_metadata(&bytes, format);
-
-    let orientation = tiff_orientation
-        .or_else(|| exif.as_deref().map(exif_orientation))
-        .unwrap_or(Orientation::NoTransforms);
+    let meta = read_metadata(&bytes, format);
+    let orientation = meta.orientation();
+    let Metadata { exif, icc, .. } = meta;
     let alpha_plane = img.color().has_alpha().then(|| extract_alpha(&img));
     img.apply_orientation(orientation);
     let alpha = alpha_plane.map(|a| {
@@ -155,6 +156,27 @@ pub fn load(path: &Path) -> Result<LoadedPhoto> {
         exif,
         icc,
     })
+}
+
+/// Upright size of the photo at `path` (its orientation applied) from the file's header and
+/// metadata, without decoding the pixels. The same as `load(path)?.rgb.dimensions()`.
+pub fn upright_size(path: &Path) -> Result<(u32, u32)> {
+    let bytes = fs::read(path)?;
+    if is_heif(&bytes) {
+        return Err(Error::UnsupportedFormat("heic".into()));
+    }
+    let format = image::guess_format(&bytes).map_err(image_err)?;
+    let (w, h) = image::ImageReader::with_format(Cursor::new(&bytes), format)
+        .into_dimensions()
+        .map_err(image_err)?;
+    let turned = matches!(
+        read_metadata(&bytes, format).orientation(),
+        Orientation::Rotate90
+            | Orientation::Rotate270
+            | Orientation::Rotate90FlipH
+            | Orientation::Rotate270FlipH
+    );
+    Ok(if turned { (h, w) } else { (w, h) })
 }
 
 fn extract_alpha(img: &DynamicImage) -> GrayImage {

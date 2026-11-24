@@ -3,7 +3,7 @@ use std::path::Path;
 
 use image::{GrayImage, ImageFormat, Rgb, RgbImage, Rgba, RgbaImage};
 use puw_core::Error;
-use puw_core::image_io::{load, output_dir_for, save_result};
+use puw_core::image_io::{load, output_dir_for, save_result, upright_size};
 
 /// Minimal little-endian TIFF/EXIF block with Make and Orientation.
 fn exif_blob(orientation: u16) -> Vec<u8> {
@@ -509,4 +509,35 @@ fn saved_exif_has_no_thumbnail_and_upright_dimensions() {
         assert_eq!(make.display_value().to_string(), "\"PUWCam\"", "{case}");
         assert_eq!(saved.rgb.dimensions(), (40, 24));
     }
+}
+
+#[test]
+fn upright_size_matches_load() {
+    let dir = tempfile::tempdir().unwrap();
+    let stored = gradient(40, 24);
+    let mut cases = Vec::new();
+    for orientation in 1..=8u16 {
+        let p = dir.path().join(format!("o{orientation}.jpg"));
+        fs::write(
+            &p,
+            with_meta(jpeg_bytes(&stored), Some(exif_blob(orientation)), None),
+        )
+        .unwrap();
+        cases.push(p);
+    }
+    let png = dir.path().join("plain.png");
+    stored.save(&png).unwrap();
+    cases.push(png);
+    for p in &cases {
+        assert_eq!(
+            upright_size(p).unwrap(),
+            load(p).unwrap().rgb.dimensions(),
+            "{}",
+            p.display()
+        );
+    }
+    assert_eq!(upright_size(&cases[5]).unwrap(), (24, 40));
+    let garbage = dir.path().join("x.jpg");
+    fs::write(&garbage, b"not an image").unwrap();
+    assert!(upright_size(&garbage).is_err());
 }
