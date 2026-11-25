@@ -226,10 +226,58 @@ export const copy = {
       return `${first} ${needLook} ${needLook === 1 ? 'needs' : 'need'} a look.`;
     },
   },
+  remove: {
+    /** Before the first progress report. */
+    starting: 'Getting ready...',
+    photo: (n: number, total: number) => `Photo ${n} of ${total}`,
+    /** From the seconds the app expects the rest to take; null until the first photo is done. */
+    timeLeft: (seconds: number | null) => {
+      if (seconds === null) return 'Working out the time left...';
+      if (seconds < 60) return 'Less than a minute left';
+      const minutes = Math.ceil(seconds / 60);
+      return `About ${minutes} ${minutes === 1 ? 'minute' : 'minutes'} left`;
+    },
+    currentPhoto: 'The photo being worked on',
+    finishedPhoto: 'The photo without the watermark',
+    checking: 'Checking where to save the results...',
+    /** `folders` is the list of folders, joined. */
+    cannotSave: (folders: string) =>
+      `The app cannot save next to these photos: ${folders}. Choose a folder for the results.`,
+    chooseFolder: 'Choose a folder...',
+    checkFailed: 'The app could not check where to save the results.',
+    folderFailed: 'That folder could not be used.',
+    failed: 'The watermark could not be removed.',
+    stop: 'Stop',
+    stopTitle: 'Stop after discarding the current photo?',
+    keptNote: 'Finished photos are kept.',
+    keepGoing: 'Keep going',
+    stopping: 'Stopping...',
+    quitTitle: 'Removal is still running. Stop and quit?',
+    stopAndQuit: 'Stop and quit',
+    /** Shown for the rest of the run when the fast hardware stopped working. */
+    fellBack: (mac: boolean) =>
+      `The ${mac ? 'Neural Engine' : 'graphics card'} stopped working, so the app continues on the processor.`,
+  },
   done: {
     openFolder: 'Open folder',
     saveWatermark: 'Save this watermark for next time',
     startNewSet: 'Start a new set',
+    saved: (n: number, folder: string) => `${photos(n)} saved in '${folder}'`,
+    nothingSaved: 'No photos were saved.',
+    stopped: (n: number) => `Stopped. ${n === 1 ? '1 photo was' : `${n} photos were`} finished.`,
+    failedTitle: (n: number) => `${photos(n)} could not be finished:`,
+    failedItem: (name: string, reason: string) => `${name} - ${reason}`,
+    results: 'Results',
+    position: (n: number, total: number) => `Photo ${n} of ${total}`,
+    previous: 'Previous photo',
+    next: 'Next photo',
+    previousGlyph: '←',
+    nextGlyph: '→',
+    name: 'Name for the saved watermark',
+    savedWatermark: 'Saved',
+    saveFailed: 'The watermark could not be saved.',
+    openFailed: 'The folder could not be opened.',
+    newSetFailed: 'A new set could not be started.',
   },
   device: {
     /** Windows, with the graphics card. */

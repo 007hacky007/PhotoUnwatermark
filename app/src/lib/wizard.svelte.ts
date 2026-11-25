@@ -1,7 +1,7 @@
 // Which screen the app shows, and the way back. State the screens share lives here, so going
 // back never loses work.
 
-import type { DetectOutcome } from './types';
+import type { DetectOutcome, RemoveReport } from './types';
 
 export type Screen =
   | 'welcome'
@@ -33,6 +33,8 @@ export class Wizard {
   busy = $state(false);
   /** The photos found in step 1, for the step-2 editor. */
   outcome: DetectOutcome | null = $state(null);
+  /** How the last removal went, for step 5. */
+  report: RemoveReport | null = $state(null);
   #history: Screen[] = $state([]);
 
   get step(): number | null {
@@ -53,6 +55,14 @@ export class Wizard {
   back(): void {
     const previous = this.#history.pop();
     if (previous !== undefined) this.screen = previous;
+  }
+
+  /** A new set: Add photos, with nothing from the last set and no way back to it. */
+  restart(): void {
+    this.outcome = null;
+    this.report = null;
+    this.#history = [];
+    this.screen = 'add';
   }
 }
 

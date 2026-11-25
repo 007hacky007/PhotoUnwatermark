@@ -4,8 +4,9 @@
 
 import { Channel, convertFileSrc, invoke } from '@tauri-apps/api/core';
 import { getCurrentWebview } from '@tauri-apps/api/webview';
+import { getCurrentWindow } from '@tauri-apps/api/window';
 import { open } from '@tauri-apps/plugin-dialog';
-import { openUrl } from '@tauri-apps/plugin-opener';
+import { openUrl, revealItemInDir as reveal } from '@tauri-apps/plugin-opener';
 import type {
   AddResult,
   AppStatus,
@@ -148,6 +149,25 @@ export const setOutputOverride = (path: string | null) =>
 
 export const remove = (onEvent: (e: ProgressEvent) => void) =>
   invoke<RemoveReport>('remove', { onEvent: channel(onEvent) });
+
+/** Shows the file in the system's file manager (Finder, Explorer), in its folder. */
+export const revealItemInDir = (path: string) => reveal(path);
+
+// The window
+
+/**
+ * Holds the window open when the person closes it and calls `onAsk` instead. Resolves with the
+ * function that stops it; the window then closes normally again.
+ */
+export async function onCloseRequested(onAsk: () => void): Promise<() => void> {
+  return getCurrentWindow().onCloseRequested((event) => {
+    event.preventDefault();
+    onAsk();
+  });
+}
+
+/** Closes the window (and so the app) without asking. */
+export const closeWindow = () => getCurrentWindow().destroy();
 
 // Saved watermarks
 

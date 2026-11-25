@@ -8,6 +8,8 @@
   import AddPhotos from './screens/AddPhotos.svelte';
   import CheckAll from './screens/CheckAll.svelte';
   import CheckWatermark from './screens/CheckWatermark.svelte';
+  import Done from './screens/Done.svelte';
+  import Remove from './screens/Remove.svelte';
   import SavedWatermarks from './screens/SavedWatermarks.svelte';
   import Settings from './screens/Settings.svelte';
   import Welcome from './screens/Welcome.svelte';
@@ -55,6 +57,12 @@
     {/if}
     {#if wizard.screen === 'checkAll'}
       <CheckAll {wizard} />
+    {/if}
+    {#if wizard.screen === 'remove'}
+      <Remove {wizard} />
+    {/if}
+    {#if wizard.screen === 'done'}
+      <Done {wizard} />
     {/if}
     {#if wizard.screen === 'settings'}
       <Settings {wizard} />
