@@ -96,6 +96,7 @@
         });
       } catch (e) {
         if (!leaving) error = message(e, c.findingFailed);
+        loaded = true;
         return;
       } finally {
         matching = false;

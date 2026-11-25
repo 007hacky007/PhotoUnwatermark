@@ -209,17 +209,22 @@ describe('Check all photos', () => {
   });
 
   it('removeWaitsForBothAnswers', async () => {
-    setup([st(1, 'found'), st(2, 'unsure')]);
+    // Nothing blocks Remove, so only the in-flight guard can disable it.
+    setup([st(1, 'found'), st(2, 'found')]);
     const button = await primary();
-    removalBlockers.mockResolvedValue([]);
-    let release: (v: number[]) => void = () => {};
-    removalBlockers.mockImplementationOnce(() => new Promise((r) => (release = r)));
+    expect(button.disabled).toBe(false);
+    let answerIncluded: () => void = () => {};
+    let answerBlockers: (v: number[]) => void = () => {};
+    setIncluded.mockImplementationOnce(() => new Promise<void>((r) => (answerIncluded = r)));
+    removalBlockers.mockImplementationOnce(() => new Promise((r) => (answerBlockers = r)));
     await fireEvent.click(screen.getByRole('checkbox', { name: 'Include p2.jpg' }));
-    // setIncluded answered, removalBlockers has not: still blocked.
-    await waitFor(() => expect(setIncluded).toHaveBeenCalled());
     expect(button.disabled).toBe(true);
-    release([]);
+    answerIncluded();
+    await waitFor(() => expect(removalBlockers).toHaveBeenCalledTimes(2));
+    expect(button.disabled).toBe(true);
+    answerBlockers([]);
     await waitFor(() => expect(button.disabled).toBe(false));
+    expect(button.textContent?.trim()).toBe('Remove watermark from 1 photo');
   });
 
   it('blockersFailingAfterTickReadsEverythingAgain', async () => {
@@ -256,6 +261,29 @@ describe('Check all photos', () => {
     expect(await screen.findByText(copy.checkAll.empty)).toBeTruthy();
     await fireEvent.click(screen.getByRole('button', { name: copy.common.back }));
     expect(wizard.screen).toBe('check');
+  });
+
+  it('matchFailureShowsItsMessage', async () => {
+    photoStates.mockResolvedValue([st(1, 'pending', { included: false })]);
+    matchAll.mockRejectedValue({ message: '', details: '' });
+    const wizard = createWizard();
+    wizard.go('check');
+    wizard.go('checkAll');
+    render(CheckAll, { wizard });
+    expect(await screen.findByText(copy.checkAll.findingFailed)).toBeTruthy();
+    expect(screen.queryByText(copy.checkAll.loading)).toBeNull();
+    expect(wizard.busy).toBe(false);
+    await fireEvent.click(screen.getByRole('button', { name: copy.common.back }));
+    expect(wizard.screen).toBe('check');
+  });
+
+  it('firstReadFailureShowsItsMessage', async () => {
+    photoStates.mockRejectedValue({ message: '', details: '' });
+    const wizard = createWizard();
+    wizard.go('checkAll');
+    render(CheckAll, { wizard });
+    expect(await screen.findByText(copy.checkAll.loadFailed)).toBeTruthy();
+    expect(screen.queryByText(copy.checkAll.loading)).toBeNull();
   });
 
   it('refreshFailureAfterMatchHasOwnMessage', async () => {
