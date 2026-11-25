@@ -235,16 +235,16 @@ impl Session {
         self.layers_from = from.iter().copied().collect();
     }
 
-    /// True when there are no layers yet, or a photo added after they were built has a size
-    /// without a layer (its size group may get one now).
-    pub fn layers_stale(&self) -> bool {
-        let Some(layers) = &self.layers else {
+    /// True when there are no layers yet, or a photo of `size` was added after they were
+    /// built. Matching uses only the layer of the template's size, so other sizes never count.
+    pub fn layers_stale(&self, size: (u32, u32)) -> bool {
+        if self.layers.is_none() {
             return true;
-        };
+        }
         self.photos
             .infos()
             .iter()
-            .any(|i| !self.layers_from.contains(&i.id) && layers.get(i.width, i.height).is_none())
+            .any(|i| !self.layers_from.contains(&i.id) && (i.width, i.height) == size)
     }
 
     /// Replaces every step-2 guess with `guesses` and drops every draft, so a draft drawn on
@@ -272,9 +272,12 @@ impl Session {
 
     /// Makes `area` (full size, binary) of photo `id` the set's watermark: earlier results of
     /// photos without their own area are cleared (they wait for matching again, unticked and
-    /// not reviewed), and this photo counts as found with it.
+    /// not reviewed), and this photo counts as found with it, replacing any own area it had.
     pub fn confirm(&mut self, id: PhotoId, template: WatermarkTemplate, area: &Mask) {
         self.template = Some(Arc::new(template));
+        if let Some(d) = self.data.get_mut(&id) {
+            d.own = None;
+        }
         for d in self.data.values_mut() {
             if d.own.is_none() {
                 d.matched = None;

@@ -1003,6 +1003,21 @@ fn grid_image_is_jpeg() {
         "grid {r_grid:.1}, photo {r_plain:.1}"
     );
 
+    // The area is drawn on every call: after it is erased, the photo is shown as it is.
+    let (w, h) = f.core.edit_size(ids[0]).unwrap();
+    f.core
+        .put_draft(ids[0], w, h, vec![0; (w * h) as usize])
+        .unwrap();
+    f.core.save_photo_area(ids[0]).unwrap();
+    let erased = image::load_from_memory(&f.core.grid_image(ids[0]).unwrap())
+        .unwrap()
+        .to_rgb8();
+    let r_erased = redness(&erased);
+    assert!(
+        r_erased < r_plain + 5.0,
+        "erased {r_erased:.1}, photo {r_plain:.1}"
+    );
+
     // A photo where nothing was found is shown as it is.
     let neg_grid = image::load_from_memory(&f.core.grid_image(neg).unwrap()).unwrap();
     assert_eq!(neg_grid.width().max(neg_grid.height()), GRID_LONG_SIDE);
@@ -1011,15 +1026,29 @@ fn grid_image_is_jpeg() {
 
 #[test]
 fn cancel_match_keeps_results() {
-    let f = fixture(None);
+    // More photos than matching threads, so photos are left when the cancel lands: at that
+    // point each thread has at most the photo it is working on.
+    let threads = std::thread::available_parallelism().map_or(1, |n| n.get()) / 2;
+    let to_match = threads.max(1) + 4;
     let names = synth_names("random");
-    let refs: Vec<&str> = names.iter().map(String::as_str).collect();
-    let ids = add_synth(&f.core, "random", &refs);
-    confirm_truth(&f.core, "random", &names[0], ids[0]);
+    let dir = tempfile::tempdir().unwrap();
+    for k in 0..=to_match {
+        let name = &names[k % names.len()];
+        std::fs::copy(
+            synth("random").join("marked").join(format!("{name}.png")),
+            dir.path().join(format!("{k:03}.png")),
+        )
+        .unwrap();
+    }
+    let f = fixture(None);
+    let added = f.core.add_paths(&[dir.path().to_path_buf()]).unwrap().added;
+    assert_eq!(added.len(), to_match + 1);
+    confirm_truth(&f.core, "random", &names[0], added[0].id);
+
     let core = &f.core;
     let err = core
         .match_all(&|e| {
-            if matches!(e, ProgressEvent::Matching { done: 2, .. }) {
+            if matches!(e, ProgressEvent::Matching { done: 1, .. }) {
                 core.cancel();
             }
         })
@@ -1033,11 +1062,75 @@ fn cancel_match_keeps_results() {
             .count() as u32
     };
     let left = pending(core);
-    assert!(left > 0 && left <= 9, "{left} photos left");
+    assert!(
+        left >= 4 && left < to_match as u32,
+        "{left} of {to_match} photos left"
+    );
 
     // The results so far are kept; the next run matches only the rest.
     let rec = Recorder::default();
     core.match_all(&|e| rec.push(e)).unwrap();
     assert_eq!(matching(&rec.events()).last(), Some(&(left, left)));
     assert_eq!(pending(core), 0);
+}
+
+#[test]
+fn confirm_replaces_own_area() {
+    let f = fixture(None);
+    let ids = add_synth(&f.core, "random", &["00", "01"]);
+    confirm_truth(&f.core, "random", "00", ids[0]);
+    f.core.match_all(&noop).unwrap();
+
+    // Photo 1 gets an area of its own in step 3...
+    let one = ids[1];
+    let (w, h) = f.core.edit_size(one).unwrap();
+    f.core
+        .put_draft(one, w, h, rect_area(w, h, 5, 5, 50, 50))
+        .unwrap();
+    f.core.save_photo_area(one).unwrap();
+    assert_eq!(state(&f.core, one).status, AreaStatus::Edited);
+
+    // ...then step 2 confirms a different area on it: that one counts from now on.
+    confirm_truth(&f.core, "random", "01", one);
+    let binary: Vec<u8> = synth_truth("random", "01")
+        .into_raw()
+        .into_iter()
+        .map(|v| if v != 0 { 255 } else { 0 })
+        .collect();
+    assert!(
+        f.core.area(one).unwrap() == binary,
+        "the area is not the confirmed one"
+    );
+    let s = state(&f.core, one);
+    assert_eq!(s.status, AreaStatus::Found);
+    assert!(s.included && s.has_area, "{s:?}");
+}
+
+#[test]
+fn layers_reread_only_for_template_size() {
+    let f = fixture(None);
+    let reads = |core: &AppCore| {
+        let rec = Recorder::default();
+        core.match_all(&|e| rec.push(e)).unwrap();
+        rec.events()
+            .iter()
+            .any(|e| matches!(e, ProgressEvent::Reading { .. }))
+    };
+    // random/00 and random/04 are 1536x1024, random/01 and random/02 are not.
+    let ids = add_synth(&f.core, "random", &["00", "01"]);
+    confirm_truth(&f.core, "random", "00", ids[0]);
+    assert!(reads(&f.core), "the set has no layers yet");
+
+    add_synth(&f.core, "negative", &["00"]);
+    assert!(!reads(&f.core), "a photo of another size was added");
+    add_synth(&f.core, "random", &["02"]);
+    assert!(!reads(&f.core), "a photo of another size was added");
+
+    add_synth(&f.core, "random", &["04"]);
+    assert!(reads(&f.core), "a photo of the watermark's size was added");
+    add_synth(&f.core, "negative", &["01"]);
+    assert!(
+        !reads(&f.core),
+        "the layers were read with photo 04 in the set"
+    );
 }
