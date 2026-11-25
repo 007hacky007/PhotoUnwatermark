@@ -9,10 +9,10 @@ use std::sync::{Mutex, OnceLock};
 
 use image::{GrayImage, RgbImage, imageops};
 use puw_core::batch::{BATCH_HIGH, BATCH_LOW, batch_lines, filter_layer, median_gradient};
-use puw_core::detect::{GuessOptions, guess_single};
+use puw_core::detect::{Guess, GuessOptions, guess_single};
 use puw_core::faces::{detect_faces_near, drop_eye_components, guard};
 use puw_core::mask::{self, Mask, is_empty};
-use puw_core::pipeline::{PRIOR_FOUND, PRIOR_UNSURE};
+use puw_core::pipeline::{PRIOR_FOUND, PRIOR_UNSURE, keep_mark_parts};
 use puw_core::template::MatchBasis;
 use puw_core::{
     Engine, Error, LoadedPhoto, MatchStatus, ModelPaths, Progress, SetLayers, build_set_layers,
@@ -238,6 +238,10 @@ fn set_layers_and_guesses_group_by_size() {
         let keep = (i < 3).then_some(layer);
         // The documented recipe, step by step.
         let single = guess_single(engine, &photo.rgb, &opts).expect("guess");
+        let single = Guess {
+            mask: keep_mark_parts(&single.mask, keep),
+            ..single
+        };
         let grow = mask::grow_for(w, h, opts.grow_frac);
         let near = match keep {
             Some(l) => mask::union(&single.mask, l),

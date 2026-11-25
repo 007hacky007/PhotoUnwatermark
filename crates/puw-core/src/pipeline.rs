@@ -326,7 +326,7 @@ const SPECK_FRAC: f64 = 0.1;
 ///   components near the layer are kept;
 /// - otherwise the components near the layer (if any) and every group of at least
 ///   [`SPECK_FRAC`] of the largest group are kept.
-fn keep_mark_parts(guess: &Mask, layer: Option<&Mask>) -> Mask {
+pub fn keep_mark_parts(guess: &Mask, layer: Option<&Mask>) -> Mask {
     let (w, h) = guess.dimensions();
     let comps = mask::components(guess);
     if comps.len() <= 1 {
