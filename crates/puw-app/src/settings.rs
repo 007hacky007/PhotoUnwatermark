@@ -26,8 +26,8 @@ impl Default for OutputRule {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub enum Detail {
-    Best,
     #[default]
+    Best,
     Balanced,
     Faster,
 }
@@ -102,7 +102,7 @@ mod tests {
                 folder_name: "Without watermark".into()
             }
         );
-        assert_eq!(s.detail, Detail::Balanced);
+        assert_eq!(s.detail, Detail::Best);
         assert!(s.prefer_gpu);
         assert!(s.load_seconds.is_empty());
     }
@@ -153,9 +153,9 @@ mod tests {
     fn settings_partial_file_fills_defaults() {
         let t = tempfile::tempdir().unwrap();
         let p = t.path().join("settings.json");
-        std::fs::write(&p, br#"{"detail":"best"}"#).unwrap();
+        std::fs::write(&p, br#"{"detail":"faster"}"#).unwrap();
         let s = Settings::load(&p);
-        assert_eq!(s.detail, Detail::Best);
+        assert_eq!(s.detail, Detail::Faster);
         assert!(s.prefer_gpu);
     }
 

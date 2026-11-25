@@ -17,7 +17,7 @@ pub struct DataDirs {
 impl DataDirs {
     /// The per-user data folder for this platform.
     pub fn default_location() -> Result<DataDirs> {
-        let base = dirs::data_dir().ok_or_else(|| {
+        let base = dirs::data_local_dir().ok_or_else(|| {
             Error::Io(std::io::Error::new(
                 std::io::ErrorKind::NotFound,
                 "no user data folder",
@@ -69,6 +69,9 @@ mod tests {
     #[test]
     fn default_location_is_named_for_the_app() {
         let d = DataDirs::default_location().unwrap();
-        assert!(d.root.ends_with("PhotoUnwatermark"));
+        assert_eq!(
+            d.root,
+            dirs::data_local_dir().unwrap().join("PhotoUnwatermark")
+        );
     }
 }
