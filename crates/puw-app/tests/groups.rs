@@ -10,10 +10,11 @@ use std::sync::Arc;
 
 use common::{
     Mixed, Recorder, add_synth, confirm_truth, fixture, logo_photos, matching, mixed_set, noop,
-    put_truth, rect_area, settle, state,
+    put_truth, rect_area, settle, state, synth_truth,
 };
+use image::GrayImage;
 use puw_app::images::jpeg;
-use puw_app::{AppCore, AppError, AreaStatus, GroupInfo, PhotoState};
+use puw_app::{AppCore, AppError, AreaStatus, GroupInfo, PhotoState, Placed, StripPlacement};
 
 /// The members of every group, plus the photos with no group yet, plus the ones that cannot be
 /// read, are all the photos.
@@ -479,4 +480,188 @@ fn counts_always_add_up() {
     assert_counts(core);
     let g = core.groups();
     assert_eq!(g.unreadable, 1, "{g:?}");
+}
+
+// ---- The shared drawing on the strip photos ----
+
+/// Bounding box of the set pixels as `[x0, y0, x1, y1]`, at the pixel edges.
+fn edge_box(m: &GrayImage) -> [f32; 4] {
+    let (mut x0, mut y0, mut x1, mut y1) = (u32::MAX, u32::MAX, 0, 0);
+    for (x, y, p) in m.enumerate_pixels() {
+        if p.0[0] != 0 {
+            (x0, y0) = (x0.min(x), y0.min(y));
+            (x1, y1) = (x1.max(x + 1), y1.max(y + 1));
+        }
+    }
+    assert!(x0 < x1, "an empty mask");
+    [x0 as f32, y0 as f32, x1 as f32, y1 as f32]
+}
+
+/// IoU of `from` (a reference box) moved by `p`, and `to`.
+fn placed_iou(p: &StripPlacement, from: [f32; 4], to: [f32; 4]) -> f32 {
+    let a = [
+        from[0] * p.scale_x + p.dx,
+        from[1] * p.scale_y + p.dy,
+        from[2] * p.scale_x + p.dx,
+        from[3] * p.scale_y + p.dy,
+    ];
+    let w = (a[2].min(to[2]) - a[0].max(to[0])).max(0.0);
+    let h = (a[3].min(to[3]) - a[1].max(to[1])).max(0.0);
+    let area = |r: [f32; 4]| (r[2] - r[0]) * (r[3] - r[1]);
+    let inter = w * h;
+    inter / (area(a) + area(to) - inter)
+}
+
+fn not_found() -> StripPlacement {
+    StripPlacement {
+        status: Placed::NotFound,
+        scale_x: 0.0,
+        scale_y: 0.0,
+        dx: 0.0,
+        dy: 0.0,
+    }
+}
+
+#[test]
+fn placement_on_the_reference_is_identity() {
+    let f = fixture(None);
+    let ids = add_synth(&f.core, "random", &["00", "01"]);
+    put_truth(&f.core, ids[0], &synth_truth("random", "00"));
+    let identity = StripPlacement {
+        status: Placed::Found,
+        scale_x: 1.0,
+        scale_y: 1.0,
+        dx: 0.0,
+        dy: 0.0,
+    };
+    assert_eq!(f.core.place_on(ids[0], ids[0]).unwrap(), identity);
+    // Even with no drawing at all, and without building a template.
+    assert_eq!(f.core.place_on(ids[1], ids[1]).unwrap(), identity);
+    assert_eq!(f.core.strip_templates_built(), 0);
+}
+
+#[test]
+fn placement_follows_the_drawing() {
+    let f = fixture(None);
+    let dir = tempfile::tempdir().unwrap();
+    let m = mixed_set(&f.core, dir.path());
+    put_truth(&f.core, m.logos[0], &m.logo_truths[0]);
+    let p = f.core.place_on(m.logos[0], m.logos[1]).unwrap();
+    assert_eq!(p.status, Placed::Found, "{p:?}");
+    let v = placed_iou(&p, edge_box(&m.logo_truths[0]), edge_box(&m.logo_truths[1]));
+    assert!(v >= 0.8, "{p:?}: iou {v}");
+}
+
+/// Review Focus 1: a landscape reference placed on portrait photos of two sizes.
+#[test]
+fn placement_crosses_sizes() {
+    let f = fixture(None);
+    let ids = add_synth(&f.core, "random", &["00", "01", "03"]);
+    let truth = synth_truth("random", "00");
+    put_truth(&f.core, ids[0], &truth);
+    for (id, name) in [(ids[1], "01"), (ids[2], "03")] {
+        let p = f.core.place_on(ids[0], id).unwrap();
+        assert_eq!(p.status, Placed::Found, "{name}: {p:?}");
+        let v = placed_iou(&p, edge_box(&truth), edge_box(&synth_truth("random", name)));
+        assert!(v >= 0.8, "{name}: {p:?}: iou {v}");
+    }
+}
+
+#[test]
+fn empty_drawing_is_not_found_anywhere() {
+    let f = fixture(None);
+    let dir = tempfile::tempdir().unwrap();
+    let m = mixed_set(&f.core, dir.path());
+    // No drawing at all (no draft, no guess, no group).
+    assert_eq!(
+        f.core.place_on(m.logos[0], m.logos[1]).unwrap(),
+        not_found()
+    );
+    // An empty draft.
+    let (w, h) = f.core.edit_size(m.logos[0]).unwrap();
+    f.core
+        .put_draft(m.logos[0], w, h, vec![0; (w * h) as usize])
+        .unwrap();
+    assert_eq!(
+        f.core.place_on(m.logos[0], m.logos[1]).unwrap(),
+        not_found()
+    );
+    // The photo is not read: one that is gone gives no error.
+    let gone = dir.path().join("marked").join("logo-02.png");
+    std::fs::remove_file(gone).unwrap();
+    assert_eq!(
+        f.core.place_on(m.logos[0], m.logos[2]).unwrap(),
+        not_found()
+    );
+    assert!(f.core.photos().iter().all(|i| i.problem.is_none()));
+}
+
+#[test]
+fn placement_on_a_photo_without_it() {
+    let f = fixture(None);
+    let dir = tempfile::tempdir().unwrap();
+    let m = mixed_set(&f.core, dir.path());
+    put_truth(&f.core, m.logos[0], &m.logo_truths[0]);
+    assert_eq!(
+        f.core.place_on(m.logos[0], m.plain[0]).unwrap(),
+        not_found()
+    );
+}
+
+/// An unsure placement keeps where it was found, so the drawing can be shown there.
+#[test]
+fn placement_unsure_keeps_transform() {
+    let f = fixture(None);
+    let ids = add_synth(&f.core, "random", &["05", "10"]);
+    let truth = synth_truth("random", "05");
+    put_truth(&f.core, ids[0], &truth);
+    let p = f.core.place_on(ids[0], ids[1]).unwrap();
+    assert_eq!(p.status, Placed::Unsure, "{p:?}");
+    assert!(p.scale_x > 0.0 && p.scale_y > 0.0, "{p:?}");
+    let v = placed_iou(&p, edge_box(&truth), edge_box(&synth_truth("random", "10")));
+    assert!(v >= 0.6, "{p:?}: iou {v}");
+}
+
+#[test]
+fn placement_on_an_unreadable_photo_fails() {
+    let f = fixture(None);
+    let dir = tempfile::tempdir().unwrap();
+    let m = mixed_set(&f.core, dir.path());
+    let broken = f.core.add_paths(&[broken_jpeg(dir.path())]).unwrap().added[0].id;
+    put_truth(&f.core, m.logos[0], &m.logo_truths[0]);
+    assert!(f.core.place_on(m.logos[0], broken).is_err());
+    assert_eq!(state(&f.core, broken).status, AreaStatus::Unreadable);
+}
+
+#[test]
+fn template_is_kept_until_the_drawing_changes() {
+    let f = fixture(None);
+    let dir = tempfile::tempdir().unwrap();
+    let m = mixed_set(&f.core, dir.path());
+    put_truth(&f.core, m.logos[0], &m.logo_truths[0]);
+    f.core.place_on(m.logos[0], m.logos[1]).unwrap();
+    f.core.place_on(m.logos[0], m.logos[2]).unwrap();
+    assert_eq!(f.core.strip_templates_built(), 1);
+
+    // The same drawing sent again is the same drawing.
+    put_truth(&f.core, m.logos[0], &m.logo_truths[0]);
+    f.core.place_on(m.logos[0], m.logos[1]).unwrap();
+    assert_eq!(f.core.strip_templates_built(), 1);
+
+    let (w, h) = f.core.edit_size(m.logos[0]).unwrap();
+    f.core
+        .put_draft(m.logos[0], w, h, rect_area(w, h, 60, 60, 141, 141))
+        .unwrap();
+    f.core.place_on(m.logos[0], m.logos[1]).unwrap();
+    assert_eq!(f.core.strip_templates_built(), 2);
+
+    // Another reference with its own drawing.
+    put_truth(&f.core, m.logos[1], &m.logo_truths[1]);
+    f.core.place_on(m.logos[1], m.logos[0]).unwrap();
+    assert_eq!(f.core.strip_templates_built(), 3);
+
+    // Clearing the groups forgets the template.
+    f.core.clear_groups().unwrap();
+    f.core.place_on(m.logos[1], m.logos[0]).unwrap();
+    assert_eq!(f.core.strip_templates_built(), 4);
 }

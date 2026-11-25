@@ -16,8 +16,8 @@ pub mod settings;
 
 pub use crate::core::{
     AppCore, AreaStatus, DetectOutcome, Done, Failed, GroupInfo, GroupsState, MatchSummary,
-    OutputCheck, PREVIEW_LONG_SIDE, PhotoState, RemoveReport, SavedInfo, Suggestion,
-    default_watermark_name,
+    OutputCheck, PREVIEW_LONG_SIDE, PhotoState, Placed, RemoveReport, SavedInfo, StripPlacement,
+    Suggestion, default_watermark_name,
 };
 pub use device::{DeviceFix, DeviceState, DeviceStatus, Platform, device_status};
 pub use estimate::{Eta, load_fraction};

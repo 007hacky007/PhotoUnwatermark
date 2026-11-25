@@ -14,8 +14,8 @@
 //! into `AppCore` (to cancel, say) cannot deadlock either.
 //!
 //! A long call (detection, model loading, the saved-watermark search, matching, adding, removing or
-//! clearing photos, confirming a group's area, clearing the groups, the preview, the removal run,
-//! saving the watermark, removing the downloaded data) holds the job slot from start to end, so
+//! clearing photos, confirming a group's area, clearing the groups, placing the drawing on a
+//! strip photo, the preview, the removal run, saving the watermark, removing the downloaded data) holds the job slot from start to end, so
 //! only one runs at a time and another one gets [`AppError::Busy`]. It locks the session to copy
 //! its inputs, works without it, and locks it again to store the results (matching stores each
 //! photo's result as soon as it is ready, and so does the removal run). Because the photo list
@@ -51,10 +51,12 @@ use crate::{AppError, DataDirs, OutputRule, Result, Settings, load_fraction};
 mod remove;
 mod saved;
 mod step3;
+mod strip;
 
 pub use remove::{Done, Failed, OutputCheck, PREVIEW_LONG_SIDE, RemoveReport};
 pub use saved::{SavedInfo, default_watermark_name};
 pub use step3::{AreaStatus, GroupInfo, GroupsState, MatchSummary, PhotoState};
+pub use strip::{Placed, StripPlacement};
 
 /// Load speed assumed for a model that was never loaded on this computer.
 const LOAD_BYTES_PER_SECOND: f32 = 20_000_000.0;

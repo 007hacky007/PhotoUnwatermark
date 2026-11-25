@@ -253,6 +253,11 @@ pub(crate) struct Session {
     /// The folder the person chose for the results of this set, when the usual one cannot
     /// be written.
     pub output_override: Option<PathBuf>,
+    /// The template the strip placements use: learned from this photo and drawing (full
+    /// size), kept until either changes.
+    pub strip: Option<(PhotoId, Arc<Area>, Arc<WatermarkTemplate>)>,
+    /// How many times `strip` was built.
+    pub strip_built: usize,
 }
 
 impl Session {
@@ -674,10 +679,12 @@ impl Session {
         }
     }
 
-    /// Removes every group, and every photo's result, tick, opened state and own area. The
-    /// step-2 guesses, the last first guess, previews and removal results stay.
+    /// Removes every group, and every photo's result, tick, opened state and own area, and
+    /// forgets the strip template. The step-2 guesses, the last first guess, previews and
+    /// removal results stay.
     pub fn clear_groups(&mut self) {
         self.groups.clear();
+        self.strip = None;
         let ids: Vec<PhotoId> = self.data.keys().copied().collect();
         for id in ids {
             self.reset(id);
@@ -698,6 +705,7 @@ impl Session {
         self.last_detect = None;
         self.data.clear();
         self.output_override = None;
+        self.strip = None;
     }
 }
 
