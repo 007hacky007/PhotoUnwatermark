@@ -284,3 +284,37 @@ the batch layer, so the layer supports its own placement by construction): `find
 (4 Unsure, 3 NotFound). Saved-position score min 0.234, median 0.329, max 0.435. `match_photo`:
 Found 6 / Unsure 1 / NotFound 0. The one photo of the other real set (different size) stays not
 `Found` (the prior does not apply).
+
+## App timings (Plan 2)
+
+Measured with `cargo test -p puw-app --release --test timings -- --ignored --nocapture` (needs
+`PUW_MODELS_DIR`, and `PUW_REAL_DIR` for the real rows), which drives `AppCore` the way the UI
+does. Machine: Apple silicon Mac, Core ML (Neural Engine / GPU), nothing else heavy running. Aggregates only; the real set-a has 8 photos of 24.0 MP.
+Two full runs were made; the table shows the second (the first differed by a few seconds at most).
+
+| Step | Time |
+|---|---|
+| Finder load (segmenter + face), cold Core ML cache | 17.0 s |
+| Remover load (LaMa), cold Core ML cache | 22.3 s |
+| Finder load, warm cache (new engine, same cache folder) | 0.9 s |
+| Remover load, warm cache | 1.9 s |
+| detect, synthetic `fixed` (8 photos of 1536x1024, models loaded, 3 looked at) | 13.8 s |
+| detect, real set-a (8 photos, 3 looked at, finder load and reading the set included) | 25.0 s |
+| match_all, synthetic `random` (12 photos; 11 found, 1 not found) | 1.5 s |
+| match_all, real set-a (8 photos; 1 found, 3 unsure, 4 not found) | 33.8 s |
+| Preview of one 24 MP photo, remover loaded (edit image at 1536) | 25.8 s |
+| Preview of the same photo, first use (includes about 2 s remover load) | 29.1 s |
+| Removal of one 24 MP photo at Best (4096) | 78.0 s and 86.5 s (2 photos) |
+| Removal of one 24 MP photo at Faster (2048) | 35.1 s and 33.1 s (2 photos) |
+
+The real match_all row used the finder's own guess as the set area (no hand editing), so its
+found/unsure split says nothing about matching quality; only the time is of interest.
+
+Honest comparison with the spec: the preview target is about 15 s. Measured 26 s with a warm
+remover and 29 s the first time, so the preview is about 1.7-1.9 times over the target on this
+machine. Removal at Best takes 78-87 s per 24 MP photo, so a 100-photo set at Best is about
+2.3 hours; at Faster it is about 34 s per photo (about 55 minutes for 100). The cold Core ML
+compile (17 s + 22 s) happens once per machine and models folder; every later start takes
+about 3 s. Where the preview time goes was not profiled here (the photo is decoded at full
+size, the area is applied at the working size, then LaMa runs); that is the place to look if
+the target matters.
