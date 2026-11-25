@@ -204,7 +204,15 @@ export const copy = {
     list: 'Photos',
     /** Shown while a ticked photo still has a "?". */
     needLookHint: 'Open or untick the photos with a ?',
-    openPhoto: (name: string) => `Open ${name}`,
+    loading: 'Loading the photos...',
+    empty: 'There are no photos to check.',
+    refreshFailed: 'The photos were checked, but the list could not be shown.',
+    /** The tile button's name: the photo and what we know about it. */
+    openPhoto: (name: string, status: 'unsure' | 'notFound' | 'edited' | null) =>
+      status === null
+        ? `Open ${name}`
+        : `Open ${name}, ${status === 'unsure' ? 'not sure the watermark was found' : status === 'notFound' ? 'watermark not found' : 'checked'}`,
+    include: (name: string) => `Include ${name}`,
     noAreaTip: 'Open this photo and paint the watermark area first.',
     badgeUnsure: '?',
     badgeUnsureLabel: 'Not sure the watermark was found',

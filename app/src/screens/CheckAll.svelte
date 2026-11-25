@@ -26,6 +26,9 @@
   let states: PhotoState[] = $state([]);
   let blockers: PhotoId[] = $state([]);
   let versions: Record<PhotoId, number> = $state({});
+  let loaded = $state(false);
+  /** Ticks waiting for the app; Remove waits for them. */
+  let ticking = $state(0);
   let matching = $state(false);
   let done = $state(0);
   let total = $state(0);
@@ -71,30 +74,41 @@
   });
 
   async function start() {
+    let first: PhotoState[];
     try {
-      const first = await photoStates();
-      total = first.length;
-      if (first.some((s) => s.status === 'pending')) {
-        matching = true;
-        setBusy(true);
-        try {
-          await matchAll((e) => {
-            if (e.phase === 'matching') {
-              done = e.done;
-              total = e.total;
-            }
-          });
-        } finally {
-          matching = false;
-          setBusy(false);
-        }
+      first = await photoStates();
+    } catch (e) {
+      if (!leaving) error = message(e, c.loadFailed);
+      loaded = true;
+      return;
+    }
+    if (leaving) return;
+    total = first.length;
+    if (first.some((s) => s.status === 'pending')) {
+      matching = true;
+      setBusy(true);
+      try {
+        await matchAll((e) => {
+          if (e.phase === 'matching') {
+            done = e.done;
+            total = e.total;
+          }
+        });
+      } catch (e) {
+        if (!leaving) error = message(e, c.findingFailed);
+        return;
+      } finally {
+        matching = false;
+        setBusy(false);
       }
-      if (leaving) return;
+    }
+    if (leaving) return;
+    try {
       await refresh();
     } catch (e) {
-      if (leaving) return;
-      error = message(e, c.findingFailed);
+      if (!leaving) error = message(e, first.some((s) => s.status === 'pending') ? c.refreshFailed : c.loadFailed);
     }
+    loaded = true;
   }
 
   function stop() {
@@ -106,14 +120,34 @@
   async function tick(s: PhotoState, box: HTMLInputElement) {
     const on = box.checked;
     error = null;
+    ticking++;
     try {
-      await setIncluded(s.id, on);
+      let stuck: PhotoId[];
+      try {
+        await setIncluded(s.id, on);
+      } catch (e) {
+        error = message(e, c.tickFailed);
+        // The box shows what the app has, not what was clicked.
+        box.checked = s.included;
+        return;
+      }
+      try {
+        stuck = await removalBlockers();
+      } catch {
+        // The change was kept; read everything again so the list and Remove agree.
+        try {
+          await refresh();
+        } catch (e) {
+          error = message(e, c.loadFailed);
+        }
+        box.checked = states.find((x) => x.id === s.id)?.included ?? s.included;
+        return;
+      }
+      // Both together, so Remove never sees one without the other.
       states = states.map((x) => (x.id === s.id ? { ...x, included: on } : x));
-      blockers = await removalBlockers();
-    } catch (e) {
-      error = message(e, c.tickFailed);
-      // The box shows what the app has, not what was clicked.
-      box.checked = s.included;
+      blockers = stuck;
+    } finally {
+      ticking--;
     }
   }
 
@@ -161,10 +195,21 @@
         onCancel={stop}
         cancelLabel={copy.common.back}
       />
-    {:else if error !== null && states.length === 0}
-      <p class="error" role="alert">{error}</p>
-      <button type="button" onclick={() => wizard.back()}>{copy.common.back}</button>
-    {:else if states.length > 0}
+    {:else if !loaded}
+      <p class="summary">{c.loading}</p>
+      <footer>
+        <button type="button" onclick={() => wizard.back()}>{copy.common.back}</button>
+      </footer>
+    {:else if states.length === 0}
+      {#if error !== null}
+        <p class="error" role="alert">{error}</p>
+      {:else}
+        <p class="summary">{c.empty}</p>
+      {/if}
+      <footer>
+        <button type="button" onclick={() => wizard.back()}>{copy.common.back}</button>
+      </footer>
+    {:else}
       <p class="summary">{c.summary(found, states.length, blockers.length)}</p>
       {#if error !== null}
         <p class="error" role="alert">{error}</p>
@@ -177,38 +222,37 @@
             <button
               type="button"
               class="open"
-              aria-label={c.openPhoto(name)}
+              aria-label={c.openPhoto(name, kind)}
               onclick={() => openPhoto(s.id)}
             >
               <img src={imageUrl('grid', s.id, versions[s.id])} alt={name} loading="lazy" decoding="async" />
             </button>
             {#if kind === 'unsure'}
-              <span class="badge unsure"
-                ><span aria-hidden="true">{c.badgeUnsure}</span><span class="sr">{c.badgeUnsureLabel}</span></span
-              >
+              <span class="badge unsure" aria-hidden="true">{c.badgeUnsure}</span>
             {:else if kind === 'notFound'}
-              <span class="badge notFound">{c.badgeNotFound}</span>
+              <span class="badge notFound" aria-hidden="true">{c.badgeNotFound}</span>
             {:else if kind === 'edited'}
-              <span class="badge edited">{c.badgeEdited}</span>
+              <span class="badge edited" aria-hidden="true">{c.badgeEdited}</span>
             {/if}
             <input
               type="checkbox"
-              aria-label={name}
+              aria-label={c.include(name)}
               checked={s.included}
               disabled={!s.included && !s.hasArea}
               title={!s.included && !s.hasArea ? c.noAreaTip : undefined}
               onchange={(e) => tick(s, e.currentTarget)}
             />
+            {#if !s.included && !s.hasArea}
+              <span class="why">{c.noAreaTip}</span>
+            {/if}
           </li>
         {/each}
       </ul>
       <footer>
         <button type="button" onclick={() => wizard.back()}>{copy.common.back}</button>
         <div class="actions">
-          {#if blocked}
-            <span class="hint">{c.needLookHint}</span>
-          {/if}
-          <button type="button" class="primary" disabled={blocked || included === 0} onclick={() => wizard.go('remove')}>
+          <span class="hint" aria-live="polite">{blocked ? c.needLookHint : ''}</span>
+          <button type="button" class="primary" disabled={blocked || included === 0 || ticking > 0} onclick={() => wizard.go('remove')}>
             {c.removeFrom(included)}
           </button>
         </div>
@@ -231,9 +275,17 @@
   .error {
     margin: 0;
   }
-  .error,
-  .hint {
+  .error {
     color: var(--danger);
+  }
+  .hint {
+    color: var(--text-muted);
+  }
+  .why {
+    display: block;
+    padding: var(--space-1) var(--space-2);
+    font-size: var(--text-small);
+    color: var(--text-muted);
   }
   .grid {
     display: grid;
@@ -299,14 +351,6 @@
     background: var(--surface);
     color: var(--text);
     border: 1px solid var(--border);
-  }
-  .sr {
-    position: absolute;
-    width: 1px;
-    height: 1px;
-    overflow: hidden;
-    clip-path: inset(50%);
-    white-space: nowrap;
   }
   footer {
     position: sticky;

@@ -77,7 +77,7 @@ describe('Check all photos', () => {
   it('buttonCountsIncluded', async () => {
     setup([st(1, 'found'), st(2, 'found'), st(3, 'notFound')]);
     expect((await primary()).textContent?.trim()).toBe('Remove watermark from 2 photos');
-    await fireEvent.click(screen.getByRole('checkbox', { name: 'p1.jpg' }));
+    await fireEvent.click(screen.getByRole('checkbox', { name: 'Include p1.jpg' }));
     expect(setIncluded).toHaveBeenCalledWith(1, false);
     await waitFor(() => expect(screen.getByRole('button', { name: 'Remove watermark from 1 photo' })).toBeTruthy());
   });
@@ -94,7 +94,7 @@ describe('Check all photos', () => {
     expect(button.disabled).toBe(true);
     expect(screen.getByText(copy.checkAll.needLookHint)).toBeTruthy();
     removalBlockers.mockResolvedValue([]);
-    await fireEvent.click(screen.getByRole('checkbox', { name: 'p2.jpg' }));
+    await fireEvent.click(screen.getByRole('checkbox', { name: 'Include p2.jpg' }));
     await waitFor(() => expect(button.disabled).toBe(false));
     expect(screen.queryByText(copy.checkAll.needLookHint)).toBeNull();
     expect(button.textContent?.trim()).toBe('Remove watermark from 1 photo');
@@ -103,12 +103,13 @@ describe('Check all photos', () => {
   it('notFoundStartsUnticked', async () => {
     setup([st(1, 'found'), st(2, 'notFound')]);
     await primary();
-    expect((screen.getByRole('checkbox', { name: 'p1.jpg' }) as HTMLInputElement).checked).toBe(true);
-    const box = screen.getByRole('checkbox', { name: 'p2.jpg' }) as HTMLInputElement;
+    expect((screen.getByRole('checkbox', { name: 'Include p1.jpg' }) as HTMLInputElement).checked).toBe(true);
+    const box = screen.getByRole('checkbox', { name: 'Include p2.jpg' }) as HTMLInputElement;
     expect(box.checked).toBe(false);
     // No area: it cannot be ticked, and the reason is given.
     expect(box.disabled).toBe(true);
     expect(box.getAttribute('title')).toBe(copy.checkAll.noAreaTip);
+    expect(screen.getByText(copy.checkAll.noAreaTip)).toBeTruthy();
     expect(screen.getByText(copy.checkAll.badgeNotFound)).toBeTruthy();
   });
 
@@ -116,15 +117,18 @@ describe('Check all photos', () => {
     setup([st(1, 'found'), st(2, 'unsure'), st(3, 'edited')]);
     await primary();
     expect(screen.getByText(copy.checkAll.badgeUnsure)).toBeTruthy();
-    expect(screen.getByText(copy.checkAll.badgeUnsureLabel)).toBeTruthy();
     expect(screen.getByText(copy.checkAll.badgeEdited)).toBeTruthy();
+    // The status is part of what a screen reader says for the tile.
+    expect(screen.getByRole('button', { name: 'Open p1.jpg' })).toBeTruthy();
+    expect(screen.getByRole('button', { name: 'Open p2.jpg, not sure the watermark was found' })).toBeTruthy();
+    expect(screen.getByRole('button', { name: 'Open p3.jpg, checked' })).toBeTruthy();
   });
 
   it('failedTickIsRolledBack', async () => {
     setup([st(1, 'found')]);
     await primary();
     setIncluded.mockRejectedValue({ message: 'nope', details: '' });
-    const box = screen.getByRole('checkbox', { name: 'p1.jpg' }) as HTMLInputElement;
+    const box = screen.getByRole('checkbox', { name: 'Include p1.jpg' }) as HTMLInputElement;
     await fireEvent.click(box);
     expect(await screen.findByText('nope')).toBeTruthy();
     expect(box.checked).toBe(true);
@@ -134,7 +138,7 @@ describe('Check all photos', () => {
     setup([st(1, 'found'), st(2, 'unsure')]);
     const button = await primary();
     expect(button.disabled).toBe(true);
-    const tile = screen.getByRole('button', { name: copy.checkAll.openPhoto('p2.jpg') });
+    const tile = screen.getByRole('button', { name: copy.checkAll.openPhoto('p2.jpg', 'unsure') });
     expect(screen.getByAltText('p2.jpg').getAttribute('src')).toMatch(/^puw:\/\/grid\/2\?v=\d+$/);
     const before = screen.getByAltText('p2.jpg').getAttribute('src');
     await fireEvent.click(tile);
@@ -188,6 +192,83 @@ describe('Check all photos', () => {
     setup([st(1, 'found')]);
     await primary();
     expect(matchAll).not.toHaveBeenCalled();
+  });
+
+  it('notFoundStatusInTileName', async () => {
+    setup([st(1, 'notFound')]);
+    await primary();
+    expect(screen.getByRole('button', { name: 'Open p1.jpg, watermark not found' })).toBeTruthy();
+  });
+
+  it('hintIsPoliteNotAnError', async () => {
+    setup([st(1, 'unsure')]);
+    await primary();
+    const hint = screen.getByText(copy.checkAll.needLookHint);
+    expect(hint.getAttribute('aria-live')).toBe('polite');
+    expect(hint.getAttribute('role')).toBeNull();
+  });
+
+  it('removeWaitsForBothAnswers', async () => {
+    setup([st(1, 'found'), st(2, 'unsure')]);
+    const button = await primary();
+    removalBlockers.mockResolvedValue([]);
+    let release: (v: number[]) => void = () => {};
+    removalBlockers.mockImplementationOnce(() => new Promise((r) => (release = r)));
+    await fireEvent.click(screen.getByRole('checkbox', { name: 'Include p2.jpg' }));
+    // setIncluded answered, removalBlockers has not: still blocked.
+    await waitFor(() => expect(setIncluded).toHaveBeenCalled());
+    expect(button.disabled).toBe(true);
+    release([]);
+    await waitFor(() => expect(button.disabled).toBe(false));
+  });
+
+  it('blockersFailingAfterTickReadsEverythingAgain', async () => {
+    setup([st(1, 'found'), st(2, 'unsure')]);
+    const button = await primary();
+    removalBlockers.mockRejectedValueOnce({ message: 'x', details: '' });
+    photoStates.mockResolvedValue([st(1, 'found'), st(2, 'unsure', { included: false })]);
+    removalBlockers.mockResolvedValue([]);
+    const box = screen.getByRole('checkbox', { name: 'Include p2.jpg' }) as HTMLInputElement;
+    await fireEvent.click(box);
+    await waitFor(() => expect(button.disabled).toBe(false));
+    expect(box.checked).toBe(false);
+    expect(screen.queryByText(copy.checkAll.tickFailed)).toBeNull();
+  });
+
+  it('unmountBeforeStatesDoesNotMatch', async () => {
+    let answer: (s: PhotoState[]) => void = () => {};
+    photoStates.mockImplementation(() => new Promise((r) => (answer = r)));
+    listPhotos.mockResolvedValue([]);
+    removalBlockers.mockResolvedValue([]);
+    const wizard = createWizard();
+    wizard.go('checkAll');
+    const view = render(CheckAll, { wizard });
+    expect(screen.getByText(copy.checkAll.loading)).toBeTruthy();
+    view.unmount();
+    answer([st(1, 'pending', { included: false })]);
+    await new Promise((r) => setTimeout(r, 0));
+    expect(matchAll).not.toHaveBeenCalled();
+    expect(wizard.busy).toBe(false);
+  });
+
+  it('emptySetShowsMessageAndBack', async () => {
+    const wizard = setup([]);
+    expect(await screen.findByText(copy.checkAll.empty)).toBeTruthy();
+    await fireEvent.click(screen.getByRole('button', { name: copy.common.back }));
+    expect(wizard.screen).toBe('check');
+  });
+
+  it('refreshFailureAfterMatchHasOwnMessage', async () => {
+    listPhotos.mockRejectedValue({ message: '', details: '' });
+    photoStates.mockResolvedValue([st(1, 'pending', { included: false })]);
+    removalBlockers.mockResolvedValue([]);
+    matchAll.mockResolvedValue({ found: 1, unsure: 0, notFound: 0, total: 1 });
+    const wizard = createWizard();
+    wizard.go('check');
+    wizard.go('checkAll');
+    render(CheckAll, { wizard });
+    expect(await screen.findByText(copy.checkAll.refreshFailed)).toBeTruthy();
+    expect(screen.getByRole('button', { name: copy.common.back })).toBeTruthy();
   });
 
   it('noBannedWordsRendered', async () => {
