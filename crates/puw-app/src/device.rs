@@ -84,6 +84,15 @@ fn rank(reason: &CpuReason) -> u8 {
 /// What the engine reports on an Intel Mac (`puw_core` engine, macOS platform module).
 const NO_NEURAL_ENGINE: &str = "This Mac has no Neural Engine";
 
+/// What DirectML says on a PC without a graphics card it can use (seen on a virtual machine
+/// with only the basic display adapter). Trying again cannot help there.
+const NO_DEVICE: &str = "no devices detected";
+
+/// Whether the error text says the system has no graphics device the provider can use.
+fn no_device(text: &str) -> bool {
+    text.to_lowercase().contains(NO_DEVICE)
+}
+
 /// The hardware the reasons talk about: Macs use the Neural Engine through Core ML.
 fn hardware(platform: Platform) -> &'static str {
     if platform == Platform::MacOs {
@@ -131,6 +140,10 @@ fn explain(reason: &CpuReason, platform: Platform) -> (String, Vec<DeviceFix>) {
         CpuReason::ProviderUnavailable(_) if mac => (
             "The Neural Engine could not be used.".into(),
             vec![TryAgain],
+        ),
+        CpuReason::ProviderUnavailable(t) | CpuReason::LoadFailed(t) if no_device(t) => (
+            "This computer has no graphics card the app can use, so the processor is used.".into(),
+            vec![],
         ),
         CpuReason::ProviderUnavailable(_) => (
             "This computer's graphics card could not be used.".into(),
@@ -208,7 +221,7 @@ pub fn device_status(
             } else {
                 "the graphics hardware"
             };
-            format!("Most of the work runs on {hardware}; a small part runs on the processor.")
+            format!("Part of the work runs on {hardware} and part on the processor.")
         });
         return DeviceStatus {
             state: DeviceState::Gpu,
@@ -337,6 +350,20 @@ mod tests {
                 vec![TryAgain, UseProcessor],
             ),
             (
+                CpuReason::ProviderUnavailable(
+                    "DirectML: No devices detected that match the filter criteria.".into(),
+                ),
+                "This computer has no graphics card the app can use, so the processor is used.",
+                Some("No devices detected"),
+                vec![],
+            ),
+            (
+                CpuReason::LoadFailed("No devices detected that match the filter criteria".into()),
+                "This computer has no graphics card the app can use, so the processor is used.",
+                Some("No devices detected"),
+                vec![],
+            ),
+            (
                 CpuReason::PartialGpu {
                     gpu_nodes: 10,
                     total_nodes: 12,
@@ -448,7 +475,7 @@ mod tests {
         let reason = st.reason.unwrap();
         assert_eq!(
             reason,
-            "Most of the work runs on the Neural Engine; a small part runs on the processor."
+            "Part of the work runs on the Neural Engine and part on the processor."
         );
         assert_plain(&reason);
         assert_eq!(st.fixes, vec![]);
@@ -463,9 +490,7 @@ mod tests {
         let st = device_status(Some(&r), true, Platform::Windows);
         assert_eq!(
             st.reason.as_deref(),
-            Some(
-                "Most of the work runs on the graphics hardware; a small part runs on the processor."
-            )
+            Some("Part of the work runs on the graphics hardware and part on the processor.")
         );
     }
 

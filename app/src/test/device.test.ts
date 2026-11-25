@@ -29,7 +29,7 @@ const loadFailed: DeviceStatus = {
 };
 const shared: DeviceStatus = {
   state: 'gpu',
-  reason: 'Most of the work runs on the Neural Engine; a small part runs on the processor.',
+  reason: 'Part of the work runs on the Neural Engine and part on the processor.',
   details: 'watermark remover: Core ML runs 1680 of 2877 steps',
   fixes: [],
 };
