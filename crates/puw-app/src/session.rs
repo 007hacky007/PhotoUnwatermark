@@ -758,6 +758,7 @@ mod tests {
             confidence: 0.9,
             mask,
             basis: MatchBasis::Search,
+            transform: None,
         };
         let mut s = Session::default();
         s.set_match(7, Matched::new(&r), Some(1));
@@ -777,6 +778,7 @@ mod tests {
             confidence: 0.1,
             mask: Mask::new(6000, 4000),
             basis: MatchBasis::Search,
+            transform: None,
         });
         assert_eq!(none.area.stored_bytes(), std::mem::size_of::<Area>());
     }

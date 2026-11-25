@@ -15,9 +15,9 @@ use puw_core::mask::{self, Mask, is_empty};
 use puw_core::pipeline::{PRIOR_FOUND, PRIOR_UNSURE, keep_mark_parts};
 use puw_core::template::MatchBasis;
 use puw_core::{
-    Engine, Error, LoadedPhoto, MatchStatus, ModelPaths, Progress, SetLayers, build_set_layers,
-    build_template, find, guess_photo, load, match_photo, output_dir_for, pick_representative,
-    remove_one, representative_sample,
+    Engine, Error, LoadedPhoto, MatchStatus, ModelPaths, Progress, SetLayers, Transform,
+    build_set_layers, build_template, find, guess_photo, load, match_photo, output_dir_for,
+    pick_representative, remove_one, representative_sample,
 };
 
 fn engine() -> Option<&'static Engine> {
@@ -500,6 +500,7 @@ fn prior_finds_faint_fixed_mark() {
         found += (m.status == MatchStatus::Found) as usize;
         if m.basis == MatchBasis::SetPosition {
             assert!(m.confidence >= PRIOR_UNSURE, "photo {i}");
+            assert_eq!(m.transform, Some(Transform::IDENTITY), "photo {i}");
         }
         let q = iou(&m.mask, &gts[i]);
         assert!(q >= 0.8, "photo {i}: iou {q:.3}");

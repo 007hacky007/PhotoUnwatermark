@@ -39,7 +39,8 @@ use crate::image_io::{LoadedPhoto, load, save_result, upright_size};
 use crate::inpaint::{Progress, inpaint};
 use crate::mask::{self, Mask, is_empty};
 use crate::template::{
-    MatchBasis, MatchResult, MatchStatus, WatermarkTemplate, find, saved_placement, saved_score,
+    MatchBasis, MatchResult, MatchStatus, Transform, WatermarkTemplate, find, saved_placement,
+    saved_score,
 };
 use crate::{Error, Result};
 use image::RgbImage;
@@ -299,6 +300,7 @@ pub fn match_photo(t: &WatermarkTemplate, img: &RgbImage, layers: &SetLayers) ->
         confidence: score,
         mask: mask::binarize(&placed),
         basis: MatchBasis::SetPosition,
+        transform: Some(Transform::IDENTITY),
     }
 }
 

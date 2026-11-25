@@ -107,6 +107,32 @@ pub enum MatchBasis {
     SetPosition,
 }
 
+/// Where a [`MatchResult`] put the watermark: maps the reference photo's native pixels onto the
+/// searched photo's native pixels, per axis a scale and a shift, with `(0, 0)` at the top-left
+/// corner of the first pixel.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct Transform {
+    pub scale_x: f32,
+    pub scale_y: f32,
+    pub dx: f32,
+    pub dy: f32,
+}
+
+impl Transform {
+    /// Every point stays where it is.
+    pub const IDENTITY: Transform = Transform {
+        scale_x: 1.0,
+        scale_y: 1.0,
+        dx: 0.0,
+        dy: 0.0,
+    };
+
+    /// Point `(x, y)` of the reference photo on the searched photo.
+    pub fn apply(&self, x: f32, y: f32) -> (f32, f32) {
+        (x * self.scale_x + self.dx, y * self.scale_y + self.dy)
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct MatchResult {
     pub status: MatchStatus,
@@ -119,6 +145,10 @@ pub struct MatchResult {
     /// [`MatchStatus::NotFound`].
     pub mask: Mask,
     pub basis: MatchBasis,
+    /// Where the reference photo lands on this one: `None` for [`MatchStatus::NotFound`],
+    /// [`Transform::IDENTITY`] for [`MatchBasis::SetPosition`], else the placement of the
+    /// largest piece searched for (the one carried pieces follow).
+    pub transform: Option<Transform>,
 }
 
 /// Learn the watermark under `mask` (non-zero = mark) in `img`.
@@ -220,6 +250,7 @@ pub fn find(t: &WatermarkTemplate, img: &RgbImage) -> MatchResult {
         confidence,
         mask: GrayImage::new(w, h),
         basis: MatchBasis::Search,
+        transform: None,
     };
     if w == 0 || h == 0 || t.ref_w == 0 || t.ref_h == 0 || t.pieces.is_empty() {
         return not_found(0.0);
@@ -292,6 +323,7 @@ pub fn find(t: &WatermarkTemplate, img: &RgbImage) -> MatchResult {
         confidence,
         mask: out,
         basis: MatchBasis::Search,
+        transform: anchor.map(|(a, ap)| transform(a, &ap, size.0, size.1)),
     }
 }
 
@@ -922,6 +954,24 @@ fn refine(target: &Target, tm: &Tmpl, start: Placement, claimed: &[[f32; 4]]) ->
         r = FINE_PX;
     }
     best
+}
+
+/// The reference-to-target map of native pixels that places piece `p` at `pl`, as [`paste`]
+/// places it: a reference-space point `u` of the reference lands at `u - p.ox + pl.x` in
+/// k-space, and native reference pixels are `s_ref` reference-space pixels.
+fn transform(
+    p: &Prepared,
+    pl: &Placement,
+    (nw, nh): (u32, u32),
+    (tw, th): (usize, usize),
+) -> Transform {
+    let (fx, fy) = (pl.k * nw as f32 / tw as f32, pl.k * nh as f32 / th as f32);
+    Transform {
+        scale_x: p.s_ref * fx,
+        scale_y: p.s_ref * fy,
+        dx: (pl.x - p.ox) as f32 * fx,
+        dy: (pl.y - p.oy) as f32 * fy,
+    }
 }
 
 /// Paste piece `p`'s shape for an edge-crop placement `pl` into the image-size mask `out`.

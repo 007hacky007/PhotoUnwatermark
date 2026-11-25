@@ -23,4 +23,6 @@ pub use pipeline::{
     SetLayers, build_set_layers, guess_photo, match_photo, pick_representative, remove_one,
     representative_sample,
 };
-pub use template::{MatchBasis, MatchResult, MatchStatus, WatermarkTemplate, build_template, find};
+pub use template::{
+    MatchBasis, MatchResult, MatchStatus, Transform, WatermarkTemplate, build_template, find,
+};

@@ -4,7 +4,8 @@ use image::{GrayImage, Luma, RgbImage};
 use puw_core::mask::Mask;
 use puw_core::ncc::masked_ncc;
 use puw_core::template::{
-    MatchResult, MatchStatus, WatermarkTemplate, build_template, find, main_bbox, saved_score,
+    MatchResult, MatchStatus, Transform, WatermarkTemplate, build_template, find, main_bbox,
+    saved_score,
 };
 use std::path::Path;
 use std::time::Instant;
@@ -171,6 +172,101 @@ fn random_set() {
     }
     assert!(visible >= 10, "only {visible} visible marks");
     assert!(found * 100 >= visible * 95, "Found {found} of {visible}");
+}
+
+/// Bounding box of the set pixels as `[x0, y0, x1, y1]`, the pixel edges (pixel `(x, y)` covers
+/// `x..x + 1`).
+fn edge_box(m: &Mask) -> [f32; 4] {
+    let b = puw_core::mask::bbox(m).expect("a set pixel");
+    [
+        b.left() as f32,
+        b.top() as f32,
+        (b.right() + 1) as f32,
+        (b.bottom() + 1) as f32,
+    ]
+}
+
+/// `[x0, y0, x1, y1]` with both corners mapped through `t`.
+fn mapped(t: &Transform, b: [f32; 4]) -> [f32; 4] {
+    let (x0, y0) = t.apply(b[0], b[1]);
+    let (x1, y1) = t.apply(b[2], b[3]);
+    [x0, y0, x1, y1]
+}
+
+fn box_iou(a: [f32; 4], b: [f32; 4]) -> f32 {
+    let w = (a[2].min(b[2]) - a[0].max(b[0])).max(0.0);
+    let h = (a[3].min(b[3]) - a[1].max(b[1])).max(0.0);
+    let area = |r: [f32; 4]| (r[2] - r[0]) * (r[3] - r[1]);
+    let inter = w * h;
+    inter / (area(a) + area(b) - inter)
+}
+
+/// The transform of a `Found` result carries the reference's mark onto the photo's, across
+/// sizes and orientations. `random/02` (invisible, see [`MIN_VISIBLE`]) need not be found.
+#[test]
+fn transform_maps_the_reference_onto_the_found_mark() {
+    let set = common::synth_dir().join("random");
+    let names = names(&set);
+    let truth0 = gt(&set, &names[0]);
+    let t = build_template(&rgb(&set, "marked", &names[0]), &truth0);
+    let from = edge_box(&truth0);
+    let mut portrait = 0;
+    for name in &names[1..] {
+        let img = rgb(&set, "marked", name);
+        let r = find(&t, &img);
+        if visibility(&set, name) < MIN_VISIBLE && r.status != MatchStatus::Found {
+            continue;
+        }
+        assert_eq!(r.status, MatchStatus::Found, "{name}");
+        let tr = r.transform.expect("a found mark has a transform");
+        let v = box_iou(mapped(&tr, from), edge_box(&gt(&set, name)));
+        eprintln!(
+            "transform {name} {:?}: {tr:?} box iou {v:.3}",
+            img.dimensions()
+        );
+        assert!(v >= 0.8, "{name}: box iou {v}");
+        portrait += (img.height() > img.width()) as u32;
+    }
+    assert!(portrait >= 4, "only {portrait} portrait photos");
+}
+
+/// The fixed set's mark sits at the same place on photos of the same size.
+#[test]
+fn fixed_set_transform_is_identity() {
+    let set = common::synth_dir().join("fixed");
+    let names = names(&set);
+    let t = build_template(&rgb(&set, "marked", &names[0]), &gt(&set, &names[0]));
+    for name in &names {
+        let r = find(&t, &rgb(&set, "marked", name));
+        let tr = r.transform.expect("found");
+        assert!(
+            (tr.scale_x - 1.0).abs() <= 0.01 && (tr.scale_y - 1.0).abs() <= 0.01,
+            "{name}: {tr:?}"
+        );
+        assert!(tr.dx.abs() <= 3.0 && tr.dy.abs() <= 3.0, "{name}: {tr:?}");
+    }
+}
+
+#[test]
+fn not_found_has_no_transform() {
+    let random = common::synth_dir().join("random");
+    let t = build_template(&rgb(&random, "marked", "00"), &gt(&random, "00"));
+    let set = common::synth_dir().join("negative");
+    let mut not_found = 0;
+    for name in names(&set) {
+        let r = find(&t, &rgb(&set, "marked", &name));
+        assert_eq!(
+            r.transform.is_none(),
+            r.status == MatchStatus::NotFound,
+            "{name}: {:?}",
+            r.status
+        );
+        not_found += (r.status == MatchStatus::NotFound) as u32;
+    }
+    assert!(not_found >= 1, "no photo without the mark gave NotFound");
+    let img = rgb(&random, "marked", "00");
+    let empty = build_template(&img, &GrayImage::new(img.width(), img.height()));
+    assert_eq!(find(&empty, &img).transform, None);
 }
 
 /// `m` plus a filled disc of radius 12 (the editor's default brush dot) at `(cx, cy)`.
