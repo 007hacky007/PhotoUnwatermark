@@ -26,7 +26,10 @@
   let hovering = $state(false);
   let adding = $state(false);
   /** The running job, or null while this screen is the one showing. */
-  let job: ((onEvent: (e: ProgressEvent) => void) => Promise<DetectOutcome>) | null = $state(null);
+  type Run = (onEvent: (e: ProgressEvent) => void) => Promise<DetectOutcome>;
+  let job: { run: Run; first?: string } | null = $state(null);
+  /** Counts offers asked for, so an answer that arrives after a newer question is dropped. */
+  let asked = 0;
 
   onMount(() => {
     let stop: (() => void) | undefined;
@@ -51,6 +54,17 @@
     };
   });
 
+  async function refreshOffer() {
+    const mine = ++asked;
+    suggestion = null;
+    try {
+      const found = await suggestSaved();
+      if (mine === asked) suggestion = found;
+    } catch {
+      // The offer is a bonus; without it the person just finds the watermark.
+    }
+  }
+
   async function add(paths: string[]) {
     if (adding || job !== null || paths.length === 0) return;
     adding = true;
@@ -59,14 +73,8 @@
       const result = await addPaths(paths);
       skipped = result.skipped;
       photos = await listPhotos();
-      suggestion = null;
-      if (result.added.length > 0) {
-        try {
-          suggestion = await suggestSaved();
-        } catch {
-          // The offer is a bonus; without it the person just finds the watermark.
-        }
-      }
+      if (result.added.length > 0) await refreshOffer();
+      else suggestion = null;
     } catch (e) {
       error = (e as Partial<UserError> | null)?.message || copy.addPhotos.addFailed;
     } finally {
@@ -88,20 +96,27 @@
       await removePhoto(photo.id);
       photos = photos.filter((p) => p.id !== photo.id);
     } catch (e) {
-      error = (e as Partial<UserError> | null)?.message || copy.addPhotos.addFailed;
+      error = (e as Partial<UserError> | null)?.message || copy.addPhotos.removeFailed;
+      return;
+    }
+    if (photos.length > 0) await refreshOffer();
+    else {
+      asked++;
+      suggestion = null;
     }
   }
 
-  function begin(run: (onEvent: (e: ProgressEvent) => void) => Promise<DetectOutcome>) {
+  function begin(run: Run, first?: string) {
+    asked++;
     suggestion = null;
     wizard.busy = true;
-    job = run;
+    job = { run, first };
   }
 
   function useSuggested() {
     if (suggestion === null) return;
     const id = suggestion.id;
-    begin((onEvent) => useSaved(id, onEvent));
+    begin((onEvent) => useSaved(id, onEvent), copy.finding.neutral);
   }
 
   function leave() {
@@ -118,7 +133,7 @@
 </script>
 
 {#if job !== null}
-  <Finding run={job} onDone={done} onBack={leave} />
+  <Finding run={job.run} first={job.first} onDone={done} onBack={leave} />
 {:else}
   <section class="add">
     <div class="drop" class:hovering role="group" aria-label={copy.addPhotos.drop}>

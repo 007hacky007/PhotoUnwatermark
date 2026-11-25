@@ -49,9 +49,11 @@ export const copy = {
     yes: 'Yes',
     no: 'No',
     find: 'Find the watermark →',
+    removeFailed: 'The photo could not be removed from the list.',
     addFailed: 'The photos could not be added.',
   },
   finding: {
+    neutral: 'Looking for the watermark...',
     reading: 'Reading your photos...',
     looking: (photo: number, total: number) => `Looking for the watermark... photo ${photo} of ${total}`,
     failed: 'The watermark could not be found.',

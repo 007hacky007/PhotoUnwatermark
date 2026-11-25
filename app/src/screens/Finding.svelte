@@ -7,16 +7,19 @@
 
   type Props = {
     /** Starts the job (finding the watermark, or using a saved one) and reports its progress. */
+    /** The sentence shown before the first event; the finder's loading sentence when left out. */
+    first?: string;
     run: (onEvent: (e: ProgressEvent) => void) => Promise<DetectOutcome>;
     onDone: (outcome: DetectOutcome) => void;
     /** Leaves the wait: after Back, or after a failure. */
     onBack: () => void;
   };
 
-  let { run, onDone, onBack }: Props = $props();
+  let { run, first, onDone, onBack }: Props = $props();
 
-  // Start with the finder's loading sentence: the job begins by getting the models ready.
-  let sentence: string = $state(copy.loading.finder);
+  // Detection begins by getting the models ready; using a saved watermark loads none.
+  // svelte-ignore state_referenced_locally
+  let sentence: string = $state(first ?? copy.loading.finder);
   let fraction: number | null = $state(null);
   let error: string | null = $state(null);
   let left = false;

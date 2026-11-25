@@ -175,6 +175,47 @@ describe('Add photos', () => {
     expect(wizard.busy).toBe(false);
   });
 
+  it('removeRefreshesOffer', async () => {
+    await offered();
+    let answer: (v: { id: string; name: string } | null) => void = () => {};
+    suggestSaved.mockImplementationOnce(() => new Promise((r) => (answer = r)));
+    removePhoto.mockResolvedValueOnce();
+    await fireEvent.click(screen.getByRole('button', { name: copy.addPhotos.remove('p2.jpg') }));
+    await waitFor(() => expect(suggestSaved).toHaveBeenCalledTimes(2));
+    expect(screen.queryByText('These look like Studio. Use it?')).toBeNull();
+    answer({ id: 's1', name: 'Studio' });
+    expect(await screen.findByText('These look like Studio. Use it?')).toBeTruthy();
+  });
+
+  it('removingLastPhotoClearsOffer', async () => {
+    await start([photo(1)]);
+    suggestSaved.mockResolvedValueOnce({ id: 's1', name: 'Studio' });
+    choosePhotos.mockResolvedValueOnce(['/a/1.jpg']);
+    addPaths.mockResolvedValueOnce({ added: [photo(1)], skipped: [] });
+    await fireEvent.click(screen.getByRole('button', { name: copy.addPhotos.choosePhotos }));
+    await screen.findByText('These look like Studio. Use it?');
+    removePhoto.mockResolvedValueOnce();
+    await fireEvent.click(screen.getByRole('button', { name: copy.addPhotos.remove('p1.jpg') }));
+    await waitFor(() => expect(screen.queryByText('1 photo')).toBeNull());
+    expect(screen.queryByText('These look like Studio. Use it?')).toBeNull();
+    expect(suggestSaved).toHaveBeenCalledTimes(1);
+  });
+
+  it('failedRemoveSaysSo', async () => {
+    await start([photo(1)]);
+    removePhoto.mockRejectedValueOnce({ message: '', details: '' });
+    await fireEvent.click(await screen.findByRole('button', { name: copy.addPhotos.remove('p1.jpg') }));
+    expect(await screen.findByText(copy.addPhotos.removeFailed)).toBeTruthy();
+  });
+
+  it('savedPathStartsNeutral', async () => {
+    useSaved.mockImplementation(openJob().impl);
+    await offered();
+    await fireEvent.click(screen.getByRole('button', { name: copy.addPhotos.yes }));
+    expect(await screen.findByText(copy.finding.neutral)).toBeTruthy();
+    expect(screen.queryByText(copy.loading.finder)).toBeNull();
+  });
+
   it('findingSentencesFollowEvents', async () => {
     const job = openJob();
     detect.mockImplementation(job.impl);
