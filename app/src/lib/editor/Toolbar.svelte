@@ -3,6 +3,7 @@
   // the focus onto a button (so Space keeps hiding the red layer instead of pressing it);
   // keyboard users still reach every button with Tab.
   import { copy } from '../copy';
+  import { keepFocus as keep } from './keys';
   import { LOUPE_STEPS } from './loupe';
   import { MAX_SIZE, MIN_SIZE, type Tool } from './tools';
 
@@ -42,15 +43,12 @@
   }: Props = $props();
 
   const e = copy.editor;
+  const k = copy.editor.keys;
   const tools: { id: Tool; name: string; key: string }[] = [
-    { id: 'brush', name: copy.tools.brush, key: 'B' },
-    { id: 'eraser', name: copy.tools.eraser, key: 'E' },
-    { id: 'rect', name: copy.tools.rectangle, key: 'R' },
+    { id: 'brush', name: copy.tools.brush, key: k.brush },
+    { id: 'eraser', name: copy.tools.eraser, key: k.eraser },
+    { id: 'rect', name: copy.tools.rectangle, key: k.rectangle },
   ];
-  const undoKey = $derived(isMac ? 'Cmd+Z' : 'Ctrl+Z');
-  const redoKey = $derived(isMac ? 'Shift+Cmd+Z' : 'Ctrl+Y');
-
-  const keep = (ev: MouseEvent) => ev.preventDefault();
 </script>
 
 <div class="toolbar" role="group" aria-label={e.toolbar}>
@@ -76,17 +74,17 @@
         step="1"
         bind:value={size}
         aria-valuetext={e.sizeValue(size)}
-        title={e.withKey(e.size, '[ ]')}
+        title={e.withKey(e.size, k.size)}
       />
     </label>
     <span class="value">{e.sizeValue(size)}</span>
   </div>
 
   <div class="group">
-    <button type="button" disabled={!canUndo} title={e.withKey(e.undo, undoKey)} onmousedown={keep} onclick={onUndo}
+    <button type="button" disabled={!canUndo} title={e.withKey(e.undo, k.undo(isMac))} onmousedown={keep} onclick={onUndo}
       >{e.undo}</button
     >
-    <button type="button" disabled={!canRedo} title={e.withKey(e.redo, redoKey)} onmousedown={keep} onclick={onRedo}
+    <button type="button" disabled={!canRedo} title={e.withKey(e.redo, k.redo(isMac))} onmousedown={keep} onclick={onRedo}
       >{e.redo}</button
     >
   </div>
@@ -96,22 +94,22 @@
       type="button"
       class="square"
       aria-label={e.zoomOut}
-      title={e.withKey(e.zoomOut, '-')}
+      title={e.withKey(e.zoomOut, k.zoomOut)}
       onmousedown={keep}
       onclick={onZoomOut}>{e.zoomOutGlyph}</button
     >
-    <button type="button" title={e.withKey(e.actualSizeHint, '1')} onmousedown={keep} onclick={onActualSize}
+    <button type="button" title={e.withKey(e.actualSizeHint, k.actualSize)} onmousedown={keep} onclick={onActualSize}
       >{e.actualSize}</button
     >
     <button
       type="button"
       class="square"
       aria-label={e.zoomIn}
-      title={e.withKey(e.zoomIn, '+')}
+      title={e.withKey(e.zoomIn, k.zoomIn)}
       onmousedown={keep}
       onclick={onZoomIn}>{e.zoomInGlyph}</button
     >
-    <button type="button" title={e.withKey(e.fitHint, '0')} onmousedown={keep} onclick={onFit}>{e.fit}</button>
+    <button type="button" title={e.withKey(e.fitHint, k.fit)} onmousedown={keep} onclick={onFit}>{e.fit}</button>
     <span class="value">{e.zoom(zoom)}</span>
   </div>
 
@@ -119,7 +117,7 @@
     <button
       type="button"
       aria-pressed={loupe}
-      title={e.withKey(e.magnifier, 'M')}
+      title={e.withKey(e.magnifier, k.magnifier)}
       onmousedown={keep}
       onclick={() => (loupe = !loupe)}>{e.magnifier}</button
     >

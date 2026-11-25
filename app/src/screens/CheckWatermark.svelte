@@ -9,6 +9,12 @@
    */
   const editsBySet = new WeakMap<DetectOutcome, Map<PhotoId, Area>>();
 
+  /**
+   * The number in each preview's URL (`preview/<id>?v=<n>`). It only grows, across every mount,
+   * so a new preview never reuses the URL of a picture the page already loaded.
+   */
+  let previews = 0;
+
   function editsFor(outcome: DetectOutcome): Map<PhotoId, Area> {
     let edits = editsBySet.get(outcome);
     if (!edits) editsBySet.set(outcome, (edits = new Map()));
@@ -39,6 +45,7 @@
   import Waiting from '../lib/components/Waiting.svelte';
   import { copy } from '../lib/copy';
   import Editor from '../lib/editor/Editor.svelte';
+  import { keepFocus } from '../lib/editor/keys';
   import { isEmpty } from '../lib/editor/paint';
   import type { ProgressEvent, UserError } from '../lib/types';
   import type { Wizard } from '../lib/wizard.svelte';
@@ -73,11 +80,14 @@
   let loaded = $state(false);
   let hint = $state(false);
   let error: string | null = $state(null);
-  /** edit: painting; previewing: the preview runs; preview: before/after shown; saving: confirming or saving. */
-  let phase: 'edit' | 'previewing' | 'preview' | 'saving' = $state('edit');
+  /** The photo whose area could not be read; "Try again" reads it again. */
+  let failed: PhotoId | null = $state(null);
+  /** edit: painting; previewing: the preview runs; preview: before/after shown. */
+  let phase: 'edit' | 'previewing' | 'preview' = $state('edit');
+  /** True while "Looks right →" or "Save this photo" waits for the app. */
+  let saving = $state(false);
   let sentence: string = $state(c.trying);
   let fraction: number | null = $state(null);
-  /** Bumped after each preview, so the result picture loads again. */
   let version = $state(0);
   let chip = $state(0);
   /** Counts photo loads and previews, so an answer that arrives too late is dropped. */
@@ -127,6 +137,7 @@
     loaded = false;
     hint = false;
     error = null;
+    failed = null;
     try {
       const area = edits.get(id) ?? (await loadArea(id));
       edits.set(id, area);
@@ -136,7 +147,9 @@
       editor.setArea(area);
       loaded = true;
     } catch (e) {
-      if (mine === shown) error = message(e, c.areaFailed);
+      if (mine !== shown) return;
+      error = message(e, c.areaFailed);
+      failed = id;
     }
   }
 
@@ -185,7 +198,7 @@
     }
     if (mine !== job) return;
     setBusy(false);
-    version++;
+    version = ++previews;
     chip++;
     phase = 'preview';
   }
@@ -204,7 +217,7 @@
     const area = areaToSend(single);
     if (id === null || !area) return;
     error = null;
-    phase = 'saving';
+    saving = true;
     setBusy(true);
     try {
       await putDraft(id, area.w, area.h, area.data);
@@ -212,9 +225,9 @@
       else await confirmSetArea(id);
     } catch (e) {
       error = message(e, single ? c.saveFailed : c.confirmFailed);
-      phase = 'edit';
       return;
     } finally {
+      saving = false;
       setBusy(false);
     }
     if (single) close(true);
@@ -231,20 +244,31 @@
     else wizard.back();
   }
 
-  const editing = $derived(phase === 'edit' || phase === 'saving');
+  const editing = $derived(phase === 'edit');
 </script>
 
 <section class="check">
   <p class="help">{single ? c.photoHelp : c.help}</p>
 
   {#if error !== null}
-    <p class="error" role="alert">{error}</p>
+    <div class="problem">
+      <p class="error" role="alert">{error}</p>
+      {#if failed !== null}
+        {@const again = failed}
+        <button type="button" onmousedown={keepFocus} onclick={() => show(again)}>{c.tryAgain}</button>
+      {/if}
+    </div>
   {/if}
 
   <div class="work">
     {#if current !== null}
-      <div class="editor" class:gone={!editing}>
-        <Editor bind:this={editor} photoId={current} active={phase === 'edit'} onChange={() => (hint = false)} />
+      <div class="pane" hidden={!editing}>
+        <Editor
+          bind:this={editor}
+          photoId={current}
+          active={editing && loaded && !saving}
+          onChange={() => (hint = false)}
+        />
       </div>
     {/if}
     {#if phase === 'previewing'}
@@ -252,7 +276,9 @@
     {:else if phase === 'preview' && current !== null}
       <div class="result">
         <BeforeAfter before={imageUrl('edit', current)} after={imageUrl('preview', current, version)} />
-        <button type="button" onclick={() => (phase = 'edit')}>{c.backToEditing}</button>
+        <button type="button" disabled={saving} onmousedown={keepFocus} onclick={() => (phase = 'edit')}
+          >{c.backToEditing}</button
+        >
       </div>
     {/if}
     {#if !editing}
@@ -267,7 +293,8 @@
           type="button"
           aria-pressed={id === current}
           aria-label={c.stripPhoto(i + 1, sample.length)}
-          disabled={phase !== 'edit'}
+          disabled={saving}
+          onmousedown={keepFocus}
           onclick={() => id !== current && show(id)}
         >
           <img src={imageUrl('thumb', id)} alt="" />
@@ -282,12 +309,20 @@
 
   {#if phase !== 'previewing'}
     <footer>
-      <button type="button" disabled={phase === 'saving'} onclick={back}>{copy.common.back}</button>
+      <button type="button" disabled={saving} onmousedown={keepFocus} onclick={back}>{copy.common.back}</button>
       <div class="actions">
         {#if editing}
-          <button type="button" disabled={!loaded || phase !== 'edit'} onclick={runPreview}>{c.preview}</button>
+          <button type="button" disabled={!loaded || saving} onmousedown={keepFocus} onclick={runPreview}
+            >{c.preview}</button
+          >
         {/if}
-        <button type="button" class="primary" disabled={!loaded || phase === 'saving'} onclick={finish}>
+        <button
+          type="button"
+          class="primary"
+          disabled={!loaded || saving}
+          onmousedown={keepFocus}
+          onclick={finish}
+        >
           {single ? c.savePhoto : c.looksRight}
         </button>
       </div>
@@ -322,13 +357,19 @@
     justify-content: center;
     min-height: 0;
   }
-  .editor {
+  .pane {
     align-self: stretch;
     flex: 1;
     min-height: 0;
   }
-  .gone {
+  .pane[hidden] {
     display: none;
+  }
+  .problem {
+    display: flex;
+    flex-wrap: wrap;
+    align-items: center;
+    gap: var(--space-2);
   }
   .result {
     display: flex;

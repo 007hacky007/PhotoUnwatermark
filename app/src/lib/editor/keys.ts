@@ -57,3 +57,12 @@ export function isTextField(target: EventTarget | null): boolean {
   if (target.isContentEditable || target.tagName === 'TEXTAREA' || target.tagName === 'SELECT') return true;
   return target instanceof HTMLInputElement && target.type !== 'range' && target.type !== 'checkbox';
 }
+
+/**
+ * For `onmousedown` on the editor screen's buttons: a mouse click then leaves the focus where
+ * it was, so Space keeps hiding the red layer instead of pressing the last button clicked.
+ * Keyboard users still reach the buttons with Tab, and Space presses a button focused that way.
+ */
+export function keepFocus(e: MouseEvent): void {
+  e.preventDefault();
+}

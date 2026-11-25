@@ -142,6 +142,26 @@ fn render(core: &AppCore, route: &Route) -> puw_app::Result<(Vec<u8>, &'static s
     })
 }
 
+/// Whether the picture behind `route` changes while its URL stays the same: a new preview or
+/// result replaces the old one. The interface adds `?v=<n>`, and these are never cached
+/// either, so a reused URL cannot show an old picture.
+fn changes(route: &Route) -> bool {
+    matches!(route, Route::Preview(_) | Route::Result(_))
+}
+
+/// A served picture: its media type, cross-origin access for canvases, and `no-store` for
+/// pictures that [`changes`].
+fn picture(route: &Route, bytes: Vec<u8>, media_type: &str) -> Response<Vec<u8>> {
+    let mut r = Response::builder()
+        .header(header::CONTENT_TYPE, media_type)
+        // Lets a canvas read the pixels where the page and the protocol differ in origin.
+        .header(header::ACCESS_CONTROL_ALLOW_ORIGIN, "*");
+    if changes(route) {
+        r = r.header(header::CACHE_CONTROL, "no-store");
+    }
+    r.body(bytes).unwrap_or_default()
+}
+
 fn is_not_found(e: &AppError) -> bool {
     matches!(e, AppError::Core(puw_core::Error::Io(io)) if io.kind() == ErrorKind::NotFound)
 }
@@ -161,12 +181,7 @@ fn respond(core: &AppCore, path: &str) -> Response<Vec<u8>> {
         return status(StatusCode::NOT_FOUND, Vec::new());
     };
     match render(core, &route) {
-        Ok((bytes, media_type)) => Response::builder()
-            .header(header::CONTENT_TYPE, media_type)
-            // Lets a canvas read the pixels where the page and the protocol differ in origin.
-            .header(header::ACCESS_CONTROL_ALLOW_ORIGIN, "*")
-            .body(bytes)
-            .unwrap_or_default(),
+        Ok((bytes, media_type)) => picture(&route, bytes, media_type),
         Err(e) if is_not_found(&e) => status(StatusCode::NOT_FOUND, Vec::new()),
         Err(e) => status(
             StatusCode::INTERNAL_SERVER_ERROR,
@@ -285,6 +300,37 @@ mod tests {
                 StatusCode::NOT_FOUND,
                 "{path}"
             );
+        }
+    }
+
+    #[test]
+    fn changing_pictures_are_never_cached() {
+        let uuid = "0f8fad5b-d9cb-469f-a165-70867728950e".to_string();
+        for (route, no_store) in [
+            (Route::Preview(1), true),
+            (Route::Result(1), true),
+            (Route::Thumb(1), false),
+            (Route::Grid(1), false),
+            (Route::Edit(1), false),
+            (Route::Original(1), false),
+            (Route::Saved(uuid), false),
+        ] {
+            let r = picture(&route, vec![1, 2, 3], "image/jpeg");
+            assert_eq!(r.status(), StatusCode::OK, "{route:?}");
+            assert_eq!(r.headers()[header::CONTENT_TYPE], "image/jpeg", "{route:?}");
+            assert_eq!(
+                r.headers()[header::ACCESS_CONTROL_ALLOW_ORIGIN],
+                "*",
+                "{route:?}"
+            );
+            assert_eq!(
+                r.headers()
+                    .get(header::CACHE_CONTROL)
+                    .map(|v| v.to_str().unwrap()),
+                no_store.then_some("no-store"),
+                "{route:?}"
+            );
+            assert_eq!(r.body(), &[1, 2, 3], "{route:?}");
         }
     }
 

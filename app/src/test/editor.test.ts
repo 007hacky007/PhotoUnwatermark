@@ -60,6 +60,21 @@ async function ready(name: string = copy.checkWatermark.looksRight) {
   await waitFor(() => expect((screen.getByRole('button', { name }) as HTMLButtonElement).disabled).toBe(false));
 }
 
+/** The red layer's canvas and the transformed sheet that holds it. */
+const redLayer = () => document.querySelector<HTMLCanvasElement>('canvas[data-layer="red"]')!;
+const sheet = () => document.querySelector<HTMLElement>('[data-layer="sheet"]')!;
+
+/** Clicks like a browser: a mousedown that is not prevented moves the focus to the element. */
+async function click(el: HTMLElement) {
+  if (await fireEvent.mouseDown(el)) el.focus();
+  await fireEvent.mouseUp(el);
+  await fireEvent.click(el);
+}
+
+/** Space pressed and released where the focus is, as the keyboard does. */
+const spaceDown = () => fireEvent.keyDown(document.activeElement ?? window, { key: ' ' });
+const spaceUp = () => fireEvent.keyUp(document.activeElement ?? window, { key: ' ' });
+
 const pressed = (name: string) => screen.getByRole('button', { name }).getAttribute('aria-pressed');
 
 /** Paints a short stroke at the top-left of the editor; with the default brush it covers the tiny test photo. */
@@ -289,5 +304,154 @@ describe('Check the watermark', () => {
     await ready(copy.checkWatermark.savePhoto);
     await fireEvent.keyDown(window, { key: 'm' });
     assertPlainText(photo.container);
+  });
+
+  it('previewUrlChangesAcrossMounts', async () => {
+    preview.mockResolvedValue();
+    const urls: string[] = [];
+    for (let i = 0; i < 2; i++) {
+      const view = await openSet({ 1: someArea() });
+      await fireEvent.click(screen.getByRole('button', { name: copy.checkWatermark.preview }));
+      await screen.findByRole('button', { name: copy.checkWatermark.backToEditing });
+      urls.push(screen.getByAltText(copy.beforeAfter.after).getAttribute('src')!);
+      view.unmount();
+    }
+    expect(urls[0]).toMatch(/^puw:\/\/preview\/1\?v=\d+$/);
+    expect(urls[1]).not.toBe(urls[0]);
+  });
+
+  it('holdSpaceHidesRedAndReleaseShowsIt', async () => {
+    await openSet({ 1: someArea() });
+    expect(redLayer().style.visibility).toBe('visible');
+    await spaceDown();
+    expect(redLayer().style.visibility).toBe('hidden');
+    await spaceUp();
+    expect(redLayer().style.visibility).toBe('visible');
+  });
+
+  it('spaceDragPansWithoutPainting', async () => {
+    await openSet({ 1: someArea() });
+    const before = sheet().style.transform;
+    const stage = screen.getByRole('application');
+    await spaceDown();
+    await fireEvent.pointerDown(stage, { pointerId: 1, button: 0, clientX: 0, clientY: 0, pointerType: 'mouse' });
+    // While dragging the red layer shows again.
+    expect(redLayer().style.visibility).toBe('visible');
+    await fireEvent.pointerMove(stage, { pointerId: 1, button: 0, clientX: 30, clientY: 20, pointerType: 'mouse' });
+    await fireEvent.pointerUp(stage, { pointerId: 1, button: 0, clientX: 30, clientY: 20, pointerType: 'mouse' });
+    await spaceUp();
+    expect(sheet().style.transform).not.toBe(before);
+    expect((screen.getByRole('button', { name: copy.editor.undo }) as HTMLButtonElement).disabled).toBe(true);
+    await fireEvent.click(screen.getByRole('button', { name: copy.checkWatermark.looksRight }));
+    await waitFor(() => expect(confirmSetArea).toHaveBeenCalled());
+    expect(putDraft).toHaveBeenCalledWith(1, W, H, someArea());
+  });
+
+  it('spaceStillHidesRedAfterClickingButtons', async () => {
+    preview.mockResolvedValue();
+    await openSet({ 1: someArea(), 2: someArea() });
+    await click(screen.getByRole('button', { name: copy.checkWatermark.stripPhoto(2, 2) }));
+    await ready();
+    await spaceDown();
+    expect(redLayer().style.visibility).toBe('hidden');
+    await spaceUp();
+    expect(redLayer().style.visibility).toBe('visible');
+    // The same after Preview and "Back to editing".
+    await click(screen.getByRole('button', { name: copy.checkWatermark.preview }));
+    await click(await screen.findByRole('button', { name: copy.checkWatermark.backToEditing }));
+    await spaceDown();
+    expect(redLayer().style.visibility).toBe('hidden');
+    await spaceUp();
+  });
+
+  it('spaceIsReleasedOnWindowBlur', async () => {
+    await openSet({ 1: someArea() });
+    await spaceDown();
+    expect(redLayer().style.visibility).toBe('hidden');
+    await fireEvent.blur(window);
+    expect(redLayer().style.visibility).toBe('visible');
+  });
+
+  it('spaceDuringAStrokeKeepsRed', async () => {
+    await openSet({ 1: empty() });
+    const stage = screen.getByRole('application');
+    await fireEvent.pointerDown(stage, { pointerId: 1, button: 0, clientX: 0, clientY: 0, pointerType: 'mouse' });
+    await spaceDown();
+    expect(redLayer().style.visibility).toBe('visible');
+    await fireEvent.pointerUp(stage, { pointerId: 1, button: 0, clientX: 0, clientY: 0, pointerType: 'mouse' });
+    await spaceUp();
+    expect((screen.getByRole('button', { name: copy.editor.undo }) as HTMLButtonElement).disabled).toBe(false);
+  });
+
+  it('noStrokesWhileTheNextPhotoLoads', async () => {
+    await openSet({ 1: empty() });
+    let resolve: (a: Uint8Array) => void = () => {};
+    getArea.mockImplementationOnce(() => new Promise((r) => (resolve = r)));
+    await fireEvent.click(screen.getByRole('button', { name: copy.checkWatermark.stripPhoto(2, 2) }));
+    // The first photo's red layer is not shown over the second photo, and painting does nothing.
+    expect(redLayer().style.visibility).toBe('hidden');
+    await paint();
+    await fireEvent.keyDown(window, { key: 'z', ctrlKey: true });
+    resolve(someArea());
+    await ready();
+    expect(redLayer().style.visibility).toBe('visible');
+    await fireEvent.click(screen.getByRole('button', { name: copy.checkWatermark.stripPhoto(1, 2) }));
+    await ready();
+    await fireEvent.click(screen.getByRole('button', { name: copy.checkWatermark.looksRight }));
+    expect(await screen.findByText(copy.checkWatermark.emptyArea)).toBeTruthy();
+    expect(putDraft).not.toHaveBeenCalled();
+  });
+
+  it('failedAreaLoadOffersTryAgain', async () => {
+    getArea.mockRejectedValueOnce({ message: '', details: 'gone' });
+    getArea.mockResolvedValueOnce(someArea());
+    render(CheckWatermark, { wizard: createWizard(), mode: 'photo', photoId: 7, onDone: () => {} });
+    expect(await screen.findByText(copy.checkWatermark.areaFailed)).toBeTruthy();
+    const save = screen.getByRole('button', { name: copy.checkWatermark.savePhoto }) as HTMLButtonElement;
+    expect(save.disabled).toBe(true);
+    await fireEvent.click(screen.getByRole('button', { name: copy.checkWatermark.tryAgain }));
+    await ready(copy.checkWatermark.savePhoto);
+    expect(getArea).toHaveBeenCalledTimes(2);
+    expect(screen.queryByText(copy.checkWatermark.areaFailed)).toBeNull();
+    expect(screen.queryByRole('button', { name: copy.checkWatermark.tryAgain })).toBeNull();
+  });
+
+  it('failedStripLoadOffersTryAgain', async () => {
+    await openSet({ 1: someArea() });
+    getArea.mockRejectedValueOnce({ message: '', details: 'gone' });
+    await fireEvent.click(screen.getByRole('button', { name: copy.checkWatermark.stripPhoto(2, 2) }));
+    await fireEvent.click(await screen.findByRole('button', { name: copy.checkWatermark.tryAgain }));
+    await ready();
+    expect(getArea).toHaveBeenLastCalledWith(2);
+  });
+
+  it('shortcutLabelsComeFromCopy', async () => {
+    await openSet({ 1: someArea() });
+    const k = copy.editor.keys;
+    const title = (name: string) => screen.getByRole('button', { name }).getAttribute('title');
+    expect(title(copy.tools.brush)).toBe(copy.editor.withKey(copy.tools.brush, k.brush));
+    expect(title(copy.tools.rectangle)).toBe(copy.editor.withKey(copy.tools.rectangle, k.rectangle));
+    expect(title(copy.editor.undo)).toBe(copy.editor.withKey(copy.editor.undo, k.undo(false)));
+    expect(title(copy.editor.redo)).toBe(copy.editor.withKey(copy.editor.redo, k.redo(false)));
+    expect(title(copy.editor.magnifier)).toBe(copy.editor.withKey(copy.editor.magnifier, k.magnifier));
+    expect(k.undo(true)).toBe('Cmd+Z');
+    expect(k.redo(true)).toBe('Shift+Cmd+Z');
+    expect(k.redo(false)).toBe('Ctrl+Y');
+  });
+
+  it('confirmingFromThePreviewKeepsThePreview', async () => {
+    const { wizard } = await openSet({ 1: someArea() });
+    preview.mockResolvedValue();
+    await fireEvent.click(screen.getByRole('button', { name: copy.checkWatermark.preview }));
+    await screen.findByRole('button', { name: copy.checkWatermark.backToEditing });
+    let finish: () => void = () => {};
+    confirmSetArea.mockImplementationOnce(() => new Promise<void>((r) => (finish = r)));
+    await fireEvent.click(screen.getByRole('button', { name: copy.checkWatermark.looksRight }));
+    await waitFor(() => expect(confirmSetArea).toHaveBeenCalled());
+    expect(screen.getByRole('slider', { name: copy.beforeAfter.divider })).toBeTruthy();
+    expect(screen.queryByRole('group', { name: copy.checkWatermark.strip })).toBeNull();
+    expect(screen.queryByRole('button', { name: copy.tools.brush })).toBeNull();
+    finish();
+    await waitFor(() => expect(wizard.screen).toBe('checkAll'));
   });
 });

@@ -22,7 +22,7 @@
     photoId: PhotoId;
     /** Called after each change to the area (a stroke, a rectangle, undo, redo). */
     onChange?: () => void;
-    /** False while the editor is covered: its shortcuts then do nothing. */
+    /** False while the editor is covered or busy: its shortcuts and pointer input then do nothing. */
     active?: boolean;
   };
 
@@ -41,8 +41,13 @@
   let steps = $state(0);
   let space = $state(false);
   let panning = $state(false);
+  /** True while a brush, eraser or rectangle stroke runs: Space then changes nothing. */
+  let stroking = $state(false);
   let photoFailed = $state(false);
-  const hideRed = $derived(space && !panning);
+  /** The photo the red layer belongs to. Until setArea brings the new photo's area, the old one is not shown or edited. */
+  let shownFor: PhotoId | null = $state(null);
+  const stale = $derived(shownFor !== photoId);
+  const hideRed = $derived(space && !panning && !stroking);
   const canUndo = $derived.by(() => (void steps, red?.history.canUndo ?? false));
   const canRedo = $derived.by(() => (void steps, red?.history.canRedo ?? false));
 
@@ -70,14 +75,16 @@
 
   /** The area being edited (the same object it was given, changed in place), or null before setArea. */
   export function getArea(): Area | null {
-    return red?.area ?? null;
+    return stale ? null : (red?.area ?? null);
   }
 
   /** Shows `a` (at edit size) as the red layer of the current photo; undo starts afresh. */
   export function setArea(a: Area): void {
     stroke = null;
     panning = false;
+    stroking = false;
     red?.set(a);
+    shownFor = photoId;
     steps++;
     dims = { w: a.w, h: a.h };
     fitView();
@@ -139,7 +146,7 @@
 
   // Anything that changes what the outline or the magnifier shows.
   $effect(() => {
-    void [view, tool, size, loupeOn, loupeMag, hideRed, panning];
+    void [view, tool, size, loupeOn, loupeMag, hideRed, panning, stale];
     untrack(redraw);
   });
 
@@ -187,7 +194,7 @@
   }
 
   function down(e: PointerEvent) {
-    if (stroke || !red?.area || !active) return;
+    if (stroke || !red?.area || !active || stale) return;
     const [px, py] = local(e);
     pointer = { x: px, y: py };
     if (e.button === 1 || (e.button === 0 && space)) {
@@ -197,9 +204,11 @@
       const [ix, iy] = toImage(view, px, py);
       if (tool === 'rect') {
         stroke = { kind: 'rect', start: [ix, iy], end: [ix, iy] };
+        stroking = true;
       } else {
         red.begin();
         stroke = { kind: 'paint', value: tool === 'brush' ? 255 : 0, last: [ix, iy], dirty: null };
+        stroking = true;
         paintTo(ix, iy);
       }
     } else {
@@ -233,6 +242,7 @@
     if (!stroke || e.pointerId !== pointerId) return;
     const s = stroke;
     stroke = null;
+    stroking = false;
     pointerId = -1;
     if (s.kind === 'pan') {
       panning = false;
@@ -260,11 +270,11 @@
   }
 
   function undo() {
-    if (!stroke && red?.undo()) changed();
+    if (!stroke && !stale && red?.undo()) changed();
   }
 
   function redo() {
-    if (!stroke && red?.redo()) changed();
+    if (!stroke && !stale && red?.redo()) changed();
   }
 
   function redraw() {
@@ -277,7 +287,7 @@
     if (!ctx) return;
     if (drawn) ctx.clearRect(drawn.x, drawn.y, drawn.w, drawn.h);
     drawn = null;
-    if (!pointer || !red?.area || panning || (space && !stroke)) return;
+    if (!pointer || !red?.area || stale || panning || (space && !stroke)) return;
     if (stroke?.kind === 'rect') {
       const [ax, ay] = toScreen(view, ...stroke.start);
       const [bx, by] = toScreen(view, ...stroke.end);
@@ -294,7 +304,7 @@
   function drawLoupe() {
     const area = red?.area;
     if (!loupe) return;
-    if (!loupeOn || !area || !pointer || panning) return loupe.hide();
+    if (!loupeOn || !area || stale || !pointer || panning) return loupe.hide();
     const [ix, iy] = toImage(view, pointer.x, pointer.y);
     if (ix < 0 || iy < 0 || ix >= area.w || iy >= area.h) return loupe.hide();
     const rect = stroke?.kind === 'rect' ? stroke : null;
@@ -319,10 +329,12 @@
   function keydown(e: KeyboardEvent) {
     if (!active || isTextField(e.target)) return;
     if (e.key === ' ') {
-      // On a focused button Space presses it, as everywhere else.
+      // A button the keyboard focused is pressed with Space, as everywhere else (the screen's
+      // buttons do not take the focus on a mouse click, see keepFocus).
       if (e.target instanceof HTMLButtonElement) return;
       e.preventDefault();
-      space = true;
+      // Mid-stroke Space neither hides the red layer nor turns the stroke into a pan.
+      if (!stroking) space = true;
       return;
     }
     const action = actionFor(e, isMac);
@@ -414,13 +426,15 @@
   >
     <div
       class="sheet"
+      data-layer="sheet"
       class:pixels={view.scale >= 2}
       style:width="{dims?.w ?? 0}px"
       style:height="{dims?.h ?? 0}px"
       style:transform="translate({view.x}px, {view.y}px) scale({view.scale})"
     >
       <canvas bind:this={photoCanvas}></canvas>
-      <canvas bind:this={overlayCanvas} style:visibility={hideRed ? 'hidden' : 'visible'}></canvas>
+      <canvas bind:this={overlayCanvas} data-layer="red" style:visibility={hideRed || stale ? 'hidden' : 'visible'}
+      ></canvas>
     </div>
     <canvas bind:this={cursorCanvas} class="outline" style:width="{boxW}px" style:height="{boxH}px"></canvas>
     <Loupe bind:this={loupe} />

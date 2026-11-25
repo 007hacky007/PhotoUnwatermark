@@ -140,6 +140,7 @@ export const copy = {
     stripPhoto: (n: number, total: number) => `Photo ${n} of ${total}`,
     photoFailed: 'The photo could not be shown.',
     areaFailed: 'The watermark area of this photo could not be read.',
+    tryAgain: 'Try again',
     previewFailed: 'The preview did not work.',
     confirmFailed: 'The watermark area could not be used.',
     saveFailed: 'The photo could not be saved.',
@@ -156,6 +157,20 @@ export const copy = {
     tools: 'Tools',
     /** A tool or button name with its keyboard shortcut, shown on hover: "Brush (B)". */
     withKey: (name: string, key: string) => `${name} (${key})`,
+    /** The keys shown in those hints; the undo keys depend on the system. */
+    keys: {
+      brush: 'B',
+      eraser: 'E',
+      rectangle: 'R',
+      size: '[ ]',
+      undo: (mac: boolean) => (mac ? 'Cmd+Z' : 'Ctrl+Z'),
+      redo: (mac: boolean) => (mac ? 'Shift+Cmd+Z' : 'Ctrl+Y'),
+      zoomOut: '-',
+      zoomIn: '+',
+      actualSize: '1',
+      fit: '0',
+      magnifier: 'M',
+    },
     size: 'Size',
     sizeValue: (px: number) => `${px} px`,
     undo: 'Undo',
