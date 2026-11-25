@@ -12,12 +12,16 @@ export type Action =
   | 'zoomIn'
   | 'zoomOut';
 
-type KeyEvent = { key: string; metaKey: boolean; ctrlKey: boolean; shiftKey: boolean };
+type KeyEvent = { key: string; metaKey: boolean; ctrlKey: boolean; shiftKey: boolean; altKey: boolean };
 
 export function actionFor(e: KeyEvent, isMac: boolean): Action | null {
   const key = e.key.toLowerCase();
-  const mod = isMac ? e.metaKey : e.ctrlKey;
-  const other = isMac ? e.ctrlKey : e.metaKey;
+  // AltGr reports ctrlKey + altKey on Windows: such a key is a plain typed character.
+  const altGr = e.altKey && e.ctrlKey;
+  if (e.altKey && !altGr) return null;
+  const ctrl = e.ctrlKey && !altGr;
+  const mod = isMac ? e.metaKey : ctrl;
+  const other = isMac ? ctrl : e.metaKey;
   if (other) return null;
   if (mod) {
     if (key === 'z') return e.shiftKey ? 'redo' : 'undo';

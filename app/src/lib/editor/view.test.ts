@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest';
-import { fit, toImage, toScreen, zoomAt, ZOOM_STEPS } from './view';
+import { fit, nextZoomStep, prevZoomStep, toImage, toScreen, zoomAt, ZOOM_STEPS } from './view';
 
 describe('view', () => {
   it('fitCentres', () => {
@@ -35,5 +35,16 @@ describe('view', () => {
     const [ix, iy] = toImage(v, 100, 50);
     expect(toScreen(v, ix, iy)).toEqual([100, 50]);
     expect([...ZOOM_STEPS].sort((a, b) => a - b)).toEqual(ZOOM_STEPS);
+  });
+
+  it('steps to the next and previous zoom entry, clamped', () => {
+    expect(nextZoomStep(1)).toBe(1.5);
+    expect(nextZoomStep(0.3)).toBe(0.5);
+    expect(nextZoomStep(16)).toBe(16);
+    expect(nextZoomStep(0.01)).toBe(0.05);
+    expect(prevZoomStep(1)).toBe(0.75);
+    expect(prevZoomStep(0.3)).toBe(0.25);
+    expect(prevZoomStep(0.05)).toBe(0.05);
+    expect(prevZoomStep(40)).toBe(16);
   });
 });

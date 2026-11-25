@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest';
-import { fillRect, isEmpty, renderOverlay, stampLine, type Area } from './paint';
+import { fillRect, isEmpty, renderOverlay, stampLine, unionRect, type Area } from './paint';
 
 const area = (w: number, h: number): Area => ({ w, h, data: new Uint8Array(w * h) });
 
@@ -35,6 +35,16 @@ describe('paint', () => {
     expect(r.y).toBe(0);
     expect(r.w).toBeLessThanOrEqual(10);
     expect(a.data.length).toBe(100);
+    const b = area(10, 10);
+    stampLine(b, 9, 4, 14, 4, 3, 255);
+    stampLine(b, 3, 9, 3, 14, 3, 255);
+    expect(b.data[4 * 10 + 9]).toBe(255); // right edge pixel
+    expect(b.data[9 * 10 + 3]).toBe(255); // bottom edge pixel
+    // Nothing wrapped to the left of the stroke on rows 3..5 or into row 0 from the right edge.
+    for (let x = 0; x < 5; x++) expect(b.data[4 * 10 + x]).toBe(0);
+    for (let x = 0; x < 10; x++) expect(b.data[0 * 10 + x]).toBe(0);
+    for (let x = 0; x < 5; x++) expect(b.data[3 * 10 + x]).toBe(0);
+    for (let x = 0; x < 3; x++) expect(b.data[5 * 10 + x]).toBe(0);
     const off = stampLine(a, 50, 50, 60, 60, 2, 255);
     expect(off.w * off.h).toBe(0);
   });
@@ -90,5 +100,23 @@ describe('paint', () => {
     expect(isEmpty(a)).toBe(true);
     a.data[24] = 255;
     expect(isEmpty(a)).toBe(false);
+  });
+
+  it('radius <= 0 is clamped to 0.5 and terminates', () => {
+    const a = area(10, 10);
+    const r = stampLine(a, 2.5, 2.5, 6.5, 2.5, 0, 255);
+    expect(r.w * r.h).toBeGreaterThan(0);
+    expect(a.data[2 * 10 + 2]).toBe(255);
+    expect(a.data[2 * 10 + 6]).toBe(255);
+    stampLine(a, 5.5, 5.5, 5.5, 5.5, -3, 255);
+    expect(a.data[5 * 10 + 5]).toBe(255);
+  });
+
+  it('unionRect', () => {
+    const r = { x: 2, y: 3, w: 4, h: 5 };
+    expect(unionRect(null, r)).toEqual(r);
+    expect(unionRect(r, { x: 10, y: 0, w: 2, h: 2 })).toEqual({ x: 2, y: 0, w: 10, h: 8 });
+    expect(unionRect(r, { x: 0, y: 0, w: 0, h: 0 })).toEqual(r);
+    expect(unionRect({ x: 0, y: 0, w: 0, h: 0 }, r)).toEqual(r);
   });
 });

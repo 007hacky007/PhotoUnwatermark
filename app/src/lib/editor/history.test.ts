@@ -100,4 +100,70 @@ describe('History', () => {
     h.commit(a, { x: 0, y: 0, w: 0, h: 0 });
     expect(h.canUndo).toBe(false);
   });
+
+  const sum = (h: History) =>
+    [...(h as any).undoStack, ...(h as any).redoStack].reduce((n: number, s: any) => n + s.before.length + s.after.length, 0);
+
+  it('byte accounting matches the stacks after undo, redo and a new stroke', () => {
+    const a = area(60, 40);
+    const h = new History();
+    h.begin(a);
+    stroke(h, a, 5, 5);
+    stroke(h, a, 20, 15);
+    stroke(h, a, 35, 25);
+    expect(h.byteSize).toBe(sum(h));
+    h.undo(a);
+    h.undo(a);
+    expect(h.byteSize).toBe(sum(h));
+    stroke(h, a, 40, 30);
+    expect(h.byteSize).toBe(sum(h));
+    for (let i = 0; i < 50; i++) {
+      h.undo(a);
+      stroke(h, a, 10 + i, 30);
+    }
+    expect(h.byteSize).toBe(sum(h));
+    expect(h.byteSize).toBeLessThan(2000);
+  });
+
+  it('begin re-syncs when the dimensions change with the same pixel count', () => {
+    const h = new History();
+    const a = area(100, 20);
+    h.begin(a);
+    stroke(h, a, 10, 10);
+    const b = area(50, 40);
+    h.begin(b);
+    expect(h.canUndo).toBe(false);
+    const r = stroke(h, b, 10, 10);
+    h.undo(b);
+    expect(b.data.some((v) => v)).toBe(false);
+    expect(h.redo(b)).toEqual(r);
+  });
+
+  it('reset drops steps and re-syncs after an edit made outside commit', () => {
+    const a = area(60, 40);
+    const h = new History();
+    h.begin(a);
+    stroke(h, a, 5, 5);
+    h.undo(a);
+    a.data.fill(255); // clear-all style edit, not committed
+    h.reset(a);
+    expect(h.canUndo).toBe(false);
+    expect(h.canRedo).toBe(false);
+    expect(h.byteSize).toBe(0);
+    h.commit(a, stampLine(a, 20, 20, 20, 20, 4, 0));
+    h.undo(a);
+    expect(a.data.every((v) => v === 255)).toBe(true);
+  });
+
+  it('a stroke that changes nothing creates no undo step', () => {
+    const a = area(30, 30);
+    const h = new History();
+    h.begin(a);
+    stroke(h, a, 5, 5);
+    h.undo(a);
+    h.commit(a, stampLine(a, 15, 15, 20, 15, 3, 0)); // erase on empty area: no change
+    expect(h.canUndo).toBe(false);
+    expect(h.canRedo).toBe(true); // redo of the undone stroke survives
+    expect(h.byteSize).toBe(sum(h));
+  });
 });

@@ -1,11 +1,12 @@
 import { describe, expect, it } from 'vitest';
 import { actionFor } from './keys';
 
-const k = (key: string, o: Partial<{ metaKey: boolean; ctrlKey: boolean; shiftKey: boolean }> = {}) => ({
+const k = (key: string, o: Partial<{ metaKey: boolean; ctrlKey: boolean; shiftKey: boolean; altKey: boolean }> = {}) => ({
   key,
   metaKey: false,
   ctrlKey: false,
   shiftKey: false,
+  altKey: false,
   ...o,
 });
 
@@ -33,5 +34,14 @@ describe('keys', () => {
     expect(actionFor(k('x'), true)).toBeNull();
     expect(actionFor(k('b', { metaKey: true }), true)).toBeNull();
     expect(actionFor(k('b', { ctrlKey: true }), false)).toBeNull();
+  });
+
+  it('treats AltGr (ctrl+alt) as a plain key and ignores plain Alt', () => {
+    expect(actionFor(k('[', { ctrlKey: true, altKey: true }), false)).toBe('sizeDown');
+    expect(actionFor(k(']', { ctrlKey: true, altKey: true }), false)).toBe('sizeUp');
+    expect(actionFor(k('z', { ctrlKey: true, altKey: true }), false)).toBeNull();
+    expect(actionFor(k('b', { altKey: true }), false)).toBeNull();
+    expect(actionFor(k('b', { altKey: true }), true)).toBeNull();
+    expect(actionFor(k('[', { altKey: true }), true)).toBeNull();
   });
 });

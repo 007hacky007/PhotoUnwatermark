@@ -27,3 +27,13 @@ export function toImage(v: View, px: number, py: number): [number, number] {
 export function toScreen(v: View, ix: number, iy: number): [number, number] {
   return [ix * v.scale + v.x, iy * v.scale + v.y];
 }
+
+/** The next larger ZOOM_STEPS entry (the largest one when already at the top). */
+export function nextZoomStep(scale: number): number {
+  return ZOOM_STEPS.find((s) => s > scale * (1 + 1e-9)) ?? ZOOM_STEPS[ZOOM_STEPS.length - 1];
+}
+
+/** The next smaller ZOOM_STEPS entry (the smallest one when already at the bottom). */
+export function prevZoomStep(scale: number): number {
+  return [...ZOOM_STEPS].reverse().find((s) => s < scale * (1 - 1e-9)) ?? ZOOM_STEPS[0];
+}

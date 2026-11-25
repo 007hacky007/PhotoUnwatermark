@@ -26,6 +26,8 @@ function write(a: Area, r: Rect, patch: Uint8Array): void {
  */
 export class History {
   private shadow: Uint8Array | null = null;
+  private shadowW = 0;
+  private shadowH = 0;
   private undoStack: Step[] = [];
   private redoStack: Step[] = [];
   private bytes = 0;
@@ -43,14 +45,31 @@ export class History {
     return this.redoStack.length > 0;
   }
 
-  /** Call before the first edit (and before each stroke; later calls are cheap). */
+  /** Bytes held by both stacks (exposed for tests and diagnostics). */
+  get byteSize(): number {
+    return this.bytes;
+  }
+
+  /**
+   * Call before the first edit of an area. Starts fresh when there is no shadow yet or the
+   * area's dimensions changed; otherwise it does nothing, so it is cheap to call per stroke.
+   */
   begin(a: Area): void {
-    if (!this.shadow || this.shadow.length !== a.data.length) {
-      this.shadow = a.data.slice();
-      this.undoStack = [];
-      this.redoStack = [];
-      this.bytes = 0;
-    }
+    if (!this.shadow || this.shadowW !== a.w || this.shadowH !== a.h) this.reset(a);
+  }
+
+  /**
+   * Forget all steps and re-sync with `a`. Task 15 must call this when it loads a photo's area
+   * and after any change made outside commit (clear-all, a detected area, a replaced buffer),
+   * because the shadow would otherwise be stale and undo would restore wrong bytes.
+   */
+  reset(a: Area): void {
+    this.shadow = a.data.slice();
+    this.shadowW = a.w;
+    this.shadowH = a.h;
+    this.undoStack = [];
+    this.redoStack = [];
+    this.bytes = 0;
   }
 
   /** Record the edit that changed rect `dirty` of `a` since the last commit. */
@@ -59,7 +78,9 @@ export class History {
     if (dirty.w <= 0 || dirty.h <= 0) return;
     const shadowArea: Area = { w: a.w, h: a.h, data: this.shadow };
     const step: Step = { rect: { ...dirty }, before: read(shadowArea, dirty), after: read(a, dirty) };
+    if (step.before.every((v, i) => v === step.after[i])) return;
     write(shadowArea, dirty, step.after);
+    for (const s of this.redoStack) this.bytes -= s.before.length + s.after.length;
     this.redoStack = [];
     this.undoStack.push(step);
     this.bytes += step.before.length + step.after.length;

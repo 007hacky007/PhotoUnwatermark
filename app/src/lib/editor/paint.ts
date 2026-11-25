@@ -41,6 +41,7 @@ export function stampLine(
   radius: number,
   value: 0 | 255,
 ): Rect {
+  radius = Math.max(0.5, radius);
   const step = radius / 2;
   const n = Math.max(1, Math.ceil(Math.hypot(x1 - x0, y1 - y0) / step));
   for (let i = 0; i <= n; i++) {
@@ -80,4 +81,13 @@ export function renderOverlay(a: Area, out: OverlayBuffer, r: Rect): void {
 
 export function isEmpty(a: Area): boolean {
   return !a.data.some((v) => v !== 0);
+}
+
+/** Smallest rectangle containing both; an empty rectangle contributes nothing. */
+export function unionRect(a: Rect | null, b: Rect): Rect {
+  if (!a || a.w <= 0 || a.h <= 0) return { ...b };
+  if (b.w <= 0 || b.h <= 0) return { ...a };
+  const x = Math.min(a.x, b.x);
+  const y = Math.min(a.y, b.y);
+  return { x, y, w: Math.max(a.x + a.w, b.x + b.w) - x, h: Math.max(a.y + a.h, b.y + b.h) - y };
 }
