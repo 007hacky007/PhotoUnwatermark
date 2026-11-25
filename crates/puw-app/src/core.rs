@@ -3,7 +3,7 @@
 //! # Locking
 //!
 //! `AppCore` has these locks, each held only for a few field reads or writes:
-//! the job slot, `settings`, `engine`, `session` and the two image caches (`image_cache`). No lock is held while a
+//! the job slot, `settings`, `engine`, `session`, `announced` and the image caches (`image_cache`). No lock is held while a
 //! photo is read, a model loads or runs, an image is encoded, or progress is reported. The only
 //! nesting is `engine` -> `settings` (reading `prefer_gpu` while the engine is created); nothing
 //! takes them the other way round, so the locks cannot deadlock.
@@ -25,6 +25,7 @@
 //! photo in the meantime, and the removal run works with the photos and areas it copied when
 //! it started.
 
+use std::collections::HashSet;
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 use std::time::Instant;
@@ -83,6 +84,9 @@ pub struct AppCore {
     engine: Mutex<Option<Arc<Engine>>>,
     session: Mutex<Session>,
     images: ImageCache,
+    /// Models of the current engine whose move to the processor was announced
+    /// ([`ProgressEvent::FellBackToProcessor`]).
+    announced: Mutex<HashSet<ModelKind>>,
 }
 
 fn lock<T>(m: &Mutex<T>) -> MutexGuard<'_, T> {
@@ -129,6 +133,7 @@ impl AppCore {
             engine: Mutex::new(None),
             session: Mutex::new(Session::default()),
             images: ImageCache::new(),
+            announced: Mutex::new(HashSet::new()),
         })
     }
 
@@ -152,6 +157,7 @@ impl AppCore {
         };
         if gpu_changed {
             *lock(&self.engine) = None;
+            lock(&self.announced).clear();
         }
         Ok(())
     }

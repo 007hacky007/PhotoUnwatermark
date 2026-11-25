@@ -7,6 +7,9 @@ pub enum Error {
     Io(#[from] std::io::Error),
     #[error("image error: {0}")]
     Image(String),
+    /// The file ends before the photo does (a copy or download that was cut short).
+    #[error("incomplete file: {0}")]
+    Incomplete(String),
     /// A value passed in by the caller is not acceptable (an empty name, a malformed id).
     #[error("invalid input: {0}")]
     InvalidInput(String),

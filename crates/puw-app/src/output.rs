@@ -3,6 +3,7 @@
 use std::collections::BTreeMap;
 use std::fs;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU32, Ordering};
 
 use crate::OutputRule;
 
@@ -44,7 +45,12 @@ fn can_write(dir: &Path) -> bool {
     if fs::create_dir_all(dir).is_err() {
         return false;
     }
-    let probe = dir.join(format!(".puw-write-check.{}", std::process::id()));
+    static PROBES: AtomicU32 = AtomicU32::new(0);
+    let probe = dir.join(format!(
+        ".puw-write-check.{}.{}",
+        std::process::id(),
+        PROBES.fetch_add(1, Ordering::Relaxed)
+    ));
     let written = fs::write(&probe, b"").is_ok();
     let _ = fs::remove_file(&probe);
     written && !probe.exists()

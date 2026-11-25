@@ -510,18 +510,19 @@ fn vanished_photo_is_a_failure() {
     let tmp = tempfile::tempdir().unwrap();
     let paths = copy_fixed(tmp.path(), 3);
     let ids = add(&f.core, &paths);
-    confirm_and_match(&f.core, ids[0]);
-    fs::remove_file(&paths[1]).unwrap();
+    confirm_and_match(&f.core, ids[1]);
+    fs::remove_file(&paths[0]).unwrap();
 
-    let report = f.core.remove(&|_| {}).unwrap();
+    let rec = Recorder::default();
+    let report = f.core.remove(&|e| rec.push(e)).unwrap();
     assert!(!report.cancelled);
     assert_eq!(
         report.done.iter().map(|d| d.id).collect::<Vec<_>>(),
-        [ids[0], ids[2]]
+        [ids[1], ids[2]]
     );
     assert_eq!(report.failed.len(), 1, "{report:?}");
     let failed = &report.failed[0];
-    assert_eq!((failed.id, failed.name.as_str()), (ids[1], "01.png"));
+    assert_eq!((failed.id, failed.name.as_str()), (ids[0], "00.png"));
     assert!(
         failed.reason.contains("could not be found"),
         "{}",
@@ -529,37 +530,78 @@ fn vanished_photo_is_a_failure() {
     );
     assert_eq!(
         names_in(&tmp.path().join("photos").join(OUT)),
-        ["00.png", "02.png"]
+        ["01.png", "02.png"]
     );
+
+    // The missing photo took no time: it does not count toward the time left, which stays
+    // unknown until a photo was really worked on.
+    let left = |photo: u32| -> Vec<Option<u32>> {
+        rec.events()
+            .iter()
+            .filter_map(|e| match e {
+                ProgressEvent::Removing {
+                    photo: p,
+                    seconds_left,
+                    ..
+                } if *p == photo => Some(*seconds_left),
+                _ => None,
+            })
+            .collect()
+    };
+    let second = left(ids[1]);
+    assert!(
+        second[..second.len() - 1].iter().all(Option::is_none),
+        "{second:?}"
+    );
+    assert!(left(ids[2]).iter().all(Option::is_some));
 }
 
 #[test]
-fn damaged_photo_is_a_failure() {
+fn damaged_photos_are_failures() {
     let Some(f) = model_fixture() else { return };
     let tmp = tempfile::tempdir().unwrap();
-    // The header is fine (it is added), the pixel data is damaged. (A JPEG cut short is not
-    // enough: its missing part decodes as grey.)
-    let good = tmp.path().join("a.png");
-    let bad = tmp.path().join("b.png");
+    // Each header is fine (the photos are added); the pixel data is not.
     let img = photo_with_block(300, 200, (20, 20, 80, 60));
-    img.save(&good).unwrap();
-    let mut bytes = fs::read(&good).unwrap();
+    let good = tmp.path().join("a.jpg");
+    write_jpeg(&good, &img, None);
+    // A JPEG cut short, as an interrupted copy leaves it.
+    let cut = tmp.path().join("b.jpg");
+    let bytes = fs::read(&good).unwrap();
+    fs::write(&cut, &bytes[..bytes.len() * 2 / 3]).unwrap();
+    // A PNG with scrambled pixel data.
+    let png = tmp.path().join("c.png");
+    img.save(&png).unwrap();
+    let mut bytes = fs::read(&png).unwrap();
     let idat = bytes.windows(4).position(|w| w == b"IDAT").unwrap();
     for b in &mut bytes[idat + 8..idat + 64] {
         *b ^= 0x5A;
     }
-    fs::write(&bad, &bytes).unwrap();
-    let ids = add(&f.core, &[good, bad]);
+    fs::write(&png, &bytes).unwrap();
+
+    let ids = add(&f.core, &[cut, good, png]);
     for &id in &ids {
         paint(&f.core, id, (10, 10, 90, 70));
     }
     let report = f.core.remove(&|_| {}).unwrap();
-    assert_eq!(report.done.len(), 1, "{report:?}");
-    assert_eq!(report.failed.len(), 1);
-    assert_eq!(report.failed[0].name, "b.png");
     assert_eq!(
-        report.failed[0].reason,
-        user_message(&AppError::Core(puw_core::Error::Image("x".into())))
+        report.done.iter().map(|d| d.id).collect::<Vec<_>>(),
+        [ids[1]],
+        "{report:?}"
+    );
+    let failed: Vec<(&str, &str)> = report
+        .failed
+        .iter()
+        .map(|x| (x.name.as_str(), x.reason.as_str()))
+        .collect();
+    assert_eq!(
+        failed,
+        [
+            ("b.jpg", "The photo file is incomplete or damaged."),
+            (
+                "c.png",
+                "The photo could not be opened. The file may be damaged."
+            ),
+        ]
     );
 }
 
@@ -818,4 +860,60 @@ fn save_watermark_roundtrip() {
     assert!(f.core.list_saved().unwrap().is_empty());
     assert!(f.core.delete_saved(&saved).is_err());
     assert!(f.core.saved_thumbnail(&saved).is_err());
+}
+
+/// One 300x200 photo with an area, ready for removal.
+fn one_small_photo(core: &AppCore, dir: &Path) -> u32 {
+    let p = dir.join("s.jpg");
+    write_jpeg(&p, &photo_with_block(300, 200, (20, 20, 80, 60)), None);
+    let id = add(core, &[p])[0];
+    paint(core, id, (10, 10, 90, 70));
+    id
+}
+
+fn notices(events: &[ProgressEvent]) -> usize {
+    events
+        .iter()
+        .filter(|e| matches!(e, ProgressEvent::FellBackToProcessor { .. }))
+        .count()
+}
+
+#[test]
+fn fallback_in_preview_is_announced_once() {
+    let Some(f) = model_fixture() else { return };
+    let tmp = tempfile::tempdir().unwrap();
+    let id = one_small_photo(&f.core, tmp.path());
+    f.core
+        .engine()
+        .unwrap()
+        .simulate_gpu_failure(ModelKind::Lama)
+        .unwrap();
+    let rec = Recorder::default();
+    f.core.preview(id, &|e| rec.push(e)).unwrap();
+    assert_eq!(notices(&rec.events()), 1, "{:?}", rec.events());
+    // Already said: the run after it does not repeat it.
+    let rec = Recorder::default();
+    assert_eq!(f.core.remove(&|e| rec.push(e)).unwrap().done.len(), 1);
+    assert_eq!(notices(&rec.events()), 0);
+}
+
+#[test]
+fn fallback_outside_a_run_is_not_missed() {
+    let Some(f) = model_fixture() else { return };
+    let tmp = tempfile::tempdir().unwrap();
+    let id = one_small_photo(&f.core, tmp.path());
+    // The remover falls back while the app is not watching (no preview, no run).
+    let engine = f.core.engine().unwrap();
+    engine.simulate_gpu_failure(ModelKind::Lama).unwrap();
+    let img = photo_with_block(64, 64, (0, 0, 8, 8));
+    let mut area = GrayImage::new(64, 64);
+    area.put_pixel(3, 3, image::Luma([255]));
+    puw_core::inpaint::inpaint(&engine, &img, &area, None, puw_core::Progress::none()).unwrap();
+    // The next run says it, once.
+    let rec = Recorder::default();
+    assert_eq!(f.core.remove(&|e| rec.push(e)).unwrap().done.len(), 1);
+    assert_eq!(notices(&rec.events()), 1);
+    let rec = Recorder::default();
+    f.core.preview(id, &|e| rec.push(e)).unwrap();
+    assert_eq!(notices(&rec.events()), 0);
 }

@@ -541,3 +541,41 @@ fn upright_size_matches_load() {
     fs::write(&garbage, b"not an image").unwrap();
     assert!(upright_size(&garbage).is_err());
 }
+
+#[test]
+fn cut_short_jpeg_is_refused() {
+    let dir = tempfile::tempdir().unwrap();
+    let thumb = jpeg_bytes(&gradient(16, 12));
+    let full = with_meta(
+        jpeg_bytes(&gradient(320, 240)),
+        Some(camera_exif(true, 1, 320, 240, &thumb)),
+        None,
+    );
+    assert!(full.ends_with(&[0xFF, 0xD9]));
+    // Cut inside the pixel data: the header is whole (the size can be read), the end is missing.
+    // The embedded thumbnail's own end marker must not count.
+    for keep in [full.len() / 2, full.len() - 2, full.len() - 1] {
+        let p = dir.path().join(format!("cut{keep}.jpg"));
+        fs::write(&p, &full[..keep]).unwrap();
+        assert_eq!(upright_size(&p).unwrap(), (320, 240));
+        assert!(
+            matches!(load(&p), Err(Error::Incomplete(_))),
+            "kept {keep} of {} bytes",
+            full.len()
+        );
+    }
+}
+
+#[test]
+fn bytes_after_the_end_are_accepted() {
+    let dir = tempfile::tempdir().unwrap();
+    let img = gradient(64, 48);
+    let mut bytes = jpeg_bytes(&img);
+    // Cameras pad files, or append data after the image.
+    bytes.extend_from_slice(&[0; 300]);
+    bytes.extend_from_slice(b"\xFF\xDAtrailing junk \xFF\xD8");
+    let p = dir.path().join("padded.jpg");
+    fs::write(&p, &bytes).unwrap();
+    let photo = load(&p).unwrap();
+    assert!(max_diff(&photo.rgb, &img) < 12);
+}

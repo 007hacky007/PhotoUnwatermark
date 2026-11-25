@@ -129,13 +129,81 @@ fn exif_orientation(exif: &[u8]) -> Orientation {
         .unwrap_or(Orientation::NoTransforms)
 }
 
-/// Load a photo, applying its EXIF orientation so `rgb` is upright.
+/// False when the JPEG `b` ends before its end-of-image marker (`FF D9`) after the scan data:
+/// a file cut short, which the decoder would fill with grey instead of failing.
+///
+/// Walks the segments from the start (lengths skip the metadata, so an embedded thumbnail's own
+/// end marker does not count) and the entropy-coded data of each scan (`FF 00` stuffing,
+/// restart markers and fill bytes are data). Anything after the end marker is ignored, as
+/// cameras pad files or append data. A file whose structure cannot be followed is left to the
+/// decoder (true).
+fn jpeg_is_complete(b: &[u8]) -> bool {
+    let n = b.len();
+    let mut i = 2;
+    loop {
+        if i >= n {
+            return false;
+        }
+        if b[i] != 0xFF {
+            return true;
+        }
+        while i < n && b[i] == 0xFF {
+            i += 1;
+        }
+        if i >= n {
+            return false;
+        }
+        let marker = b[i];
+        i += 1;
+        match marker {
+            0xD9 => return true,
+            0x01 | 0xD0..=0xD8 => continue,
+            _ => {}
+        }
+        if i + 2 > n {
+            return false;
+        }
+        let len = usize::from(u16::from_be_bytes([b[i], b[i + 1]]));
+        if len < 2 {
+            return true;
+        }
+        i += len;
+        if marker != 0xDA {
+            continue;
+        }
+        // Scan data runs to the next marker that is not stuffing, a restart or a fill byte.
+        loop {
+            match b
+                .get(i..)
+                .and_then(|rest| rest.iter().position(|&v| v == 0xFF))
+            {
+                None => return false,
+                Some(k) => i += k,
+            }
+            match b.get(i + 1) {
+                None => return false,
+                Some(0x00 | 0xD0..=0xD7) => i += 2,
+                Some(0xFF) => i += 1,
+                Some(_) => break,
+            }
+        }
+    }
+}
+
+/// Load a photo, applying its EXIF orientation so `rgb` is upright. A JPEG that ends before
+/// its image does fails with [`Error::Incomplete`].
 pub fn load(path: &Path) -> Result<LoadedPhoto> {
     let bytes = fs::read(path)?;
     if is_heif(&bytes) {
         return Err(Error::UnsupportedFormat("heic".into()));
     }
     let format = image::guess_format(&bytes).map_err(image_err)?;
+    if format == ImageFormat::Jpeg && !jpeg_is_complete(&bytes) {
+        return Err(Error::Incomplete(format!(
+            "{} ends before the end of the image",
+            path.display()
+        )));
+    }
     let mut img = image::load_from_memory_with_format(&bytes, format).map_err(image_err)?;
     let meta = read_metadata(&bytes, format);
     let orientation = meta.orientation();
@@ -606,8 +674,31 @@ pub fn save_result(src: &LoadedPhoto, rgb: &RgbImage, out_dir: &Path) -> Result<
 
 #[cfg(test)]
 mod tests {
-    use super::{copy_no_clobber, publish_no_clobber};
+    use super::{copy_no_clobber, jpeg_is_complete, publish_no_clobber};
     use std::fs;
+
+    #[test]
+    fn jpeg_end_found_past_scan_data() {
+        let soi = [0xFF, 0xD8];
+        // APP1 holding an end marker of its own, then a scan with stuffing, a restart marker
+        // and fill bytes in its data.
+        let app1 = [0xFF, 0xE1, 0x00, 0x06, 0xFF, 0xD9, 0x00, 0x00];
+        let sos = [
+            0xFF, 0xDA, 0x00, 0x02, 0x12, 0xFF, 0x00, 0x34, 0xFF, 0xD3, 0x56, 0xFF, 0xFF,
+        ];
+        let file = |end: &[u8]| [&soi[..], &app1, &sos, end].concat();
+        assert!(jpeg_is_complete(&file(&[0xD9])));
+        assert!(jpeg_is_complete(&file(&[0xD9, 0, 0, 0xFF])));
+        assert!(!jpeg_is_complete(&file(&[])));
+        assert!(!jpeg_is_complete(&[&soi[..], &app1].concat()));
+        assert!(!jpeg_is_complete(&[&soi[..], &app1[..5]].concat()));
+        // A second scan after tables (progressive files).
+        let dht = [0xFF, 0xC4, 0x00, 0x03, 0x00];
+        assert!(jpeg_is_complete(&file(
+            &[&dht[1..], &sos, &[0xFF, 0xD9]].concat()
+        )));
+        assert!(!jpeg_is_complete(&file(&[&dht[1..], &sos].concat())));
+    }
 
     #[test]
     fn publish_never_replaces_and_picks_next_suffix() {

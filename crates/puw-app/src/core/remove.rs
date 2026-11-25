@@ -8,10 +8,10 @@ use std::time::Instant;
 use puw_core::engine::{Backend, CpuReason, DeviceReport};
 use puw_core::inpaint::inpaint;
 use puw_core::mask::{self, Mask};
-use puw_core::{Error, ModelKind, Progress, load, remove_one};
+use puw_core::{Engine, Error, ModelKind, Progress, load, remove_one};
 use serde::Serialize;
 
-use super::{AppCore, no_photo, not_found};
+use super::{AppCore, lock, no_photo, not_found};
 use crate::images::{self, jpeg};
 use crate::jobs::{Events, LoadPurpose, ProgressEvent};
 use crate::output::{output_dirs, remove_stale_partials};
@@ -66,21 +66,22 @@ struct Todo {
     area: Arc<Area>,
 }
 
-/// The error text of a model that went from the graphics card to the processor between
-/// `before` and `after` because a run failed.
-fn newly_failed(before: &DeviceReport, after: &DeviceReport) -> Option<String> {
+/// The models that moved from the graphics card to the processor because a run failed, with
+/// the error text.
+fn fallbacks(report: &DeviceReport) -> Vec<(ModelKind, String)> {
     [
-        (&before.segmenter, &after.segmenter),
-        (&before.lama, &after.lama),
-        (&before.face, &after.face),
+        (ModelKind::Segmenter, &report.segmenter),
+        (ModelKind::Lama, &report.lama),
+        (ModelKind::Face, &report.face),
     ]
     .into_iter()
-    .find_map(|(b, a)| match a {
+    .filter_map(|(kind, backend)| match backend {
         Some(Backend::Cpu {
             reason: CpuReason::RunFailed(text),
-        }) if b != a => Some(text.clone()),
+        }) => Some((kind, text.clone())),
         _ => None,
     })
+    .collect()
 }
 
 fn is_cancelled(e: &AppError) -> bool {
@@ -88,6 +89,23 @@ fn is_cancelled(e: &AppError) -> bool {
 }
 
 impl AppCore {
+    /// Sends [`ProgressEvent::FellBackToProcessor`] (with the first error text) when a model
+    /// of `engine` moved to the processor and that was not said yet. Each model is announced
+    /// once per engine, whichever job notices it first.
+    fn announce_fallback(&self, engine: &Engine, ev: Events) {
+        let fresh: Vec<String> = {
+            let mut announced = lock(&self.announced);
+            fallbacks(&engine.report())
+                .into_iter()
+                .filter(|(kind, _)| announced.insert(*kind))
+                .map(|(_, text)| text)
+                .collect()
+        };
+        if let Some(reason) = fresh.into_iter().next() {
+            ev(ProgressEvent::FellBackToProcessor { reason });
+        }
+    }
+
     /// Tries the removal on photo `id` with its draft (or, without one, its current area):
     /// loads the remover if needed ([`ProgressEvent::LoadingModels`] with
     /// [`LoadPurpose::Remover`]), then works on the edit image at [`PREVIEW_LONG_SIDE`]
@@ -130,7 +148,9 @@ impl AppCore {
             on_fraction: &on_fraction,
             cancel: job.flag(),
         };
-        let filled = inpaint(&engine, &edit, &area, Some(PREVIEW_LONG_SIDE), progress)?;
+        let filled = inpaint(&engine, &edit, &area, Some(PREVIEW_LONG_SIDE), progress);
+        self.announce_fallback(&engine, ev);
+        let filled = filled?;
         let bytes = Arc::new(jpeg(&filled, IMAGE_QUALITY));
         self.session().data.entry(id).or_default().preview = Some(bytes);
         Ok(())
@@ -202,8 +222,8 @@ impl AppCore {
     /// A photo that fails (moved, deleted, damaged, or the remover failed on it) is listed in
     /// [`RemoveReport::failed`] and the run goes on. Cancelling discards the photo being worked
     /// on and keeps the finished ones (`cancelled: true`). When a model moves from the graphics
-    /// card to the processor during the run, [`ProgressEvent::FellBackToProcessor`] is sent
-    /// once, with the error text.
+    /// card to the processor (in this run, or unannounced before it),
+    /// [`ProgressEvent::FellBackToProcessor`] is sent once, with the error text.
     pub fn remove(&self, ev: Events) -> Result<RemoveReport> {
         let job = self.jobs.start()?;
         let (blocked, todo) = {
@@ -249,10 +269,10 @@ impl AppCore {
             }
             other => other?,
         };
+        self.announce_fallback(&engine, ev);
         let work_long_side = self.settings().detail.work_long_side();
         let total = todo.len() as u32;
         let mut eta = Eta::new(todo.len());
-        let mut told_fallback = false;
         for (i, t) in todo.iter().enumerate() {
             if job.check().is_err() {
                 report.cancelled = true;
@@ -270,14 +290,15 @@ impl AppCore {
                 })
             };
             removing(0.0, eta.seconds_left(0.0));
-            let before = engine.report();
             let on_fraction = |f: f32| removing(f, eta.seconds_left(start.elapsed().as_secs_f32()));
             let progress = Progress {
                 on_fraction: &on_fraction,
                 cancel: job.flag(),
             };
             let out_dir = t.path.parent().and_then(|p| dirs.get(p));
-            let result = load(&t.path).map_err(AppError::from).and_then(|photo| {
+            let photo = load(&t.path);
+            let loaded = photo.is_ok();
+            let result = photo.map_err(AppError::from).and_then(|photo| {
                 let out_dir = out_dir.ok_or(AppError::NoWritableOutput)?;
                 let (w, h) = photo.rgb.dimensions();
                 let area = mask::binarize(&t.area.resized(w, h));
@@ -290,10 +311,7 @@ impl AppCore {
                     progress,
                 )?)
             });
-            if !told_fallback && let Some(reason) = newly_failed(&before, &engine.report()) {
-                told_fallback = true;
-                ev(ProgressEvent::FellBackToProcessor { reason });
-            }
+            self.announce_fallback(&engine, ev);
             match result {
                 Ok(saved) => {
                     if let Some(d) = self.session().data.get_mut(&t.id) {
@@ -314,7 +332,12 @@ impl AppCore {
                     reason: user_message(&e),
                 }),
             }
-            eta.photo_done(start.elapsed().as_secs_f32());
+            // A photo that could not be read took no time and says nothing about the others.
+            if loaded {
+                eta.photo_done(start.elapsed().as_secs_f32());
+            } else {
+                eta.photo_skipped();
+            }
             ev(ProgressEvent::Removing {
                 done: done + 1,
                 total,
@@ -371,17 +394,16 @@ mod tests {
     }
 
     #[test]
-    fn fallback_seen_only_when_it_happens() {
+    fn fallbacks_are_run_failures_only() {
+        assert!(fallbacks(&report(gpu())).is_empty());
         assert_eq!(
-            newly_failed(&report(gpu()), &report(failed())),
-            Some("boom".into())
+            fallbacks(&report(failed())),
+            [(ModelKind::Lama, "boom".to_string())]
         );
-        assert_eq!(newly_failed(&report(failed()), &report(failed())), None);
-        assert_eq!(newly_failed(&report(gpu()), &report(gpu())), None);
         let cpu = Some(Backend::Cpu {
             reason: CpuReason::NotRequested,
         });
-        assert_eq!(newly_failed(&report(None), &report(cpu)), None);
+        assert!(fallbacks(&report(cpu)).is_empty());
     }
 
     #[test]

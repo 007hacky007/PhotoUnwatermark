@@ -32,6 +32,12 @@ impl Eta {
         self.spent += seconds;
     }
 
+    /// Record that one photo was skipped at once (it could not be read), so it neither
+    /// counts toward the time per photo nor stays among the photos left.
+    pub fn photo_skipped(&mut self) {
+        self.total = self.total.saturating_sub(1);
+    }
+
     /// Seconds left, or `None` until the first photo has finished.
     /// `current_elapsed` is how long the photo in progress has already taken.
     pub fn seconds_left(&self, current_elapsed: f32) -> Option<u32> {
@@ -70,6 +76,17 @@ mod tests {
         // mean 15, 3 remaining, 5 already spent on the current one
         assert_eq!(e.seconds_left(5.0), Some(40));
         assert_eq!(e.seconds_left(100.0), Some(0));
+    }
+
+    #[test]
+    fn skipped_photo_does_not_count() {
+        // The first photo was missing (skipped at once): no time is known yet.
+        let mut e = Eta::new(4);
+        e.photo_skipped();
+        assert_eq!(e.seconds_left(0.0), None);
+        e.photo_done(10.0);
+        // Two photos are left at 10 s each, not two at 5 s.
+        assert_eq!(e.seconds_left(0.0), Some(20));
     }
 
     #[test]

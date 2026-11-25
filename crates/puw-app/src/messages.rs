@@ -95,6 +95,7 @@ fn core_message(e: &Error) -> String {
             _ => "The app could not read or save the photo. Check that the disk is not full or disconnected.".into(),
         },
         Error::Image(_) => "The photo could not be opened. The file may be damaged.".into(),
+        Error::Incomplete(_) => "The photo file is incomplete or damaged.".into(),
         Error::InvalidInput(_) => {
             "That name cannot be used. Choose a different name and try again.".into()
         }
@@ -122,6 +123,7 @@ mod tests {
             .collect();
         v.extend([
             Error::Image("x".into()).into(),
+            Error::Incomplete("x".into()).into(),
             Error::InvalidInput("x".into()).into(),
             Error::Model("x".into()).into(),
             Error::SizeMismatch.into(),
