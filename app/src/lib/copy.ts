@@ -196,6 +196,20 @@ export const copy = {
     divider: 'Before and after',
   },
   checkAll: {
+    /** While the watermark is looked for in every photo. */
+    finding: (done: number, total: number) => `Finding the watermark in all photos... ${done} of ${total}`,
+    findingFailed: 'The watermark could not be looked for in all photos.',
+    loadFailed: 'The photos could not be shown.',
+    tickFailed: 'The change could not be kept.',
+    list: 'Photos',
+    /** Shown while a ticked photo still has a "?". */
+    needLookHint: 'Open or untick the photos with a ?',
+    openPhoto: (name: string) => `Open ${name}`,
+    noAreaTip: 'Open this photo and paint the watermark area first.',
+    badgeUnsure: '?',
+    badgeUnsureLabel: 'Not sure the watermark was found',
+    badgeNotFound: 'Not found',
+    badgeEdited: 'Checked',
     removeFrom: (n: number) => `Remove watermark from ${photos(n)}`,
     /** "Found in X of Y photos. Z need a look." The second sentence only when Z > 0. */
     summary: (found: number, total: number, needLook: number) => {

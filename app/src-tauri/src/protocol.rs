@@ -143,10 +143,10 @@ fn render(core: &AppCore, route: &Route) -> puw_app::Result<(Vec<u8>, &'static s
 }
 
 /// Whether the picture behind `route` changes while its URL stays the same: a new preview or
-/// result replaces the old one. The interface adds `?v=<n>`, and these are never cached
+/// result replaces the old one, and a grid tile shows the photo's area, which can change. The interface adds `?v=<n>`, and these are never cached
 /// either, so a reused URL cannot show an old picture.
 fn changes(route: &Route) -> bool {
-    matches!(route, Route::Preview(_) | Route::Result(_))
+    matches!(route, Route::Preview(_) | Route::Result(_) | Route::Grid(_))
 }
 
 /// A served picture: its media type, cross-origin access for canvases, and `no-store` for
@@ -310,7 +310,7 @@ mod tests {
             (Route::Preview(1), true),
             (Route::Result(1), true),
             (Route::Thumb(1), false),
-            (Route::Grid(1), false),
+            (Route::Grid(1), true),
             (Route::Edit(1), false),
             (Route::Original(1), false),
             (Route::Saved(uuid), false),

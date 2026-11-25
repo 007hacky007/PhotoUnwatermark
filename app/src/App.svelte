@@ -6,6 +6,7 @@
   import { wizard as appWizard, type Wizard } from './lib/wizard.svelte';
   import About from './screens/About.svelte';
   import AddPhotos from './screens/AddPhotos.svelte';
+  import CheckAll from './screens/CheckAll.svelte';
   import CheckWatermark from './screens/CheckWatermark.svelte';
   import SavedWatermarks from './screens/SavedWatermarks.svelte';
   import Settings from './screens/Settings.svelte';
@@ -53,10 +54,7 @@
       <CheckWatermark {wizard} />
     {/if}
     {#if wizard.screen === 'checkAll'}
-      <!-- Placeholder until step 3, which opens CheckWatermark with mode 'photo' for one photo. -->
-      <section class="page">
-        <h1>{copy.steps[2]}</h1>
-      </section>
+      <CheckAll {wizard} />
     {/if}
     {#if wizard.screen === 'settings'}
       <Settings {wizard} />
@@ -92,8 +90,5 @@
     flex: 1;
     min-height: 0;
     overflow: auto;
-  }
-  .page {
-    padding: var(--space-5);
   }
 </style>
