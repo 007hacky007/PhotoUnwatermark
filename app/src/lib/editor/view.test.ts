@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest';
-import { fit, nextZoomStep, prevZoomStep, toImage, toScreen, zoomAt, ZOOM_STEPS } from './view';
+import { fit, nextZoomStep, prevZoomStep, toImage, toScreen, wheelZoom, zoomAt, ZOOM_STEPS } from './view';
 
 describe('view', () => {
   it('fitCentres', () => {
@@ -46,5 +46,15 @@ describe('view', () => {
     expect(prevZoomStep(0.3)).toBe(0.25);
     expect(prevZoomStep(0.05)).toBe(0.05);
     expect(prevZoomStep(40)).toBe(16);
+  });
+
+  it('wheelZoomDirectionAndUnits', () => {
+    expect(wheelZoom(-100, 0, false, 800)).toBeGreaterThan(1);
+    expect(wheelZoom(100, 0, false, 800)).toBeLessThan(1);
+    expect(wheelZoom(100, 0, false, 800) * wheelZoom(-100, 0, false, 800)).toBeCloseTo(1);
+    expect(wheelZoom(3, 1, false, 800)).toBeCloseTo(wheelZoom(48, 0, false, 800));
+    expect(wheelZoom(1, 2, false, 800)).toBeCloseTo(wheelZoom(800, 0, false, 800));
+    // A pinch's small deltas still zoom noticeably.
+    expect(wheelZoom(-10, 0, true, 800)).toBeCloseTo(Math.exp(0.1));
   });
 });

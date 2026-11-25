@@ -37,3 +37,13 @@ export function nextZoomStep(scale: number): number {
 export function prevZoomStep(scale: number): number {
   return [...ZOOM_STEPS].reverse().find((s) => s < scale * (1 - 1e-9)) ?? ZOOM_STEPS[0];
 }
+
+/**
+ * Zoom factor for one wheel event. `deltaMode` 1 counts lines, 2 pages (`pageHeight` pixels).
+ * A pinch on a Mac trackpad arrives as a wheel event with ctrlKey and small deltas, so it
+ * zooms faster per unit.
+ */
+export function wheelZoom(deltaY: number, deltaMode: number, ctrlKey: boolean, pageHeight: number): number {
+  const unit = deltaMode === 1 ? 16 : deltaMode === 2 ? pageHeight : 1;
+  return Math.exp(-deltaY * unit * (ctrlKey ? 0.01 : 0.002));
+}

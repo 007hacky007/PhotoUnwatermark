@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest';
-import { actionFor } from './keys';
+import { actionFor, isTextField, repeats } from './keys';
 
 const k = (key: string, o: Partial<{ metaKey: boolean; ctrlKey: boolean; shiftKey: boolean; altKey: boolean }> = {}) => ({
   key,
@@ -43,5 +43,26 @@ describe('keys', () => {
     expect(actionFor(k('b', { altKey: true }), false)).toBeNull();
     expect(actionFor(k('b', { altKey: true }), true)).toBeNull();
     expect(actionFor(k('[', { altKey: true }), true)).toBeNull();
+  });
+});
+
+describe('key helpers', () => {
+  it('onlyStepActionsRepeat', () => {
+    for (const a of ['sizeDown', 'sizeUp', 'zoomIn', 'zoomOut', 'undo', 'redo'] as const) expect(repeats(a), a).toBe(true);
+    for (const a of ['brush', 'eraser', 'rect', 'toggleLoupe', 'fit', 'actualSize'] as const) expect(repeats(a), a).toBe(false);
+  });
+
+  it('textFieldsKeepTheirKeys', () => {
+    const make = (html: string) => {
+      const box = document.createElement('div');
+      box.innerHTML = html;
+      return box.firstElementChild;
+    };
+    expect(isTextField(make('<input type="text">'))).toBe(true);
+    expect(isTextField(make('<textarea></textarea>'))).toBe(true);
+    expect(isTextField(make('<input type="range">'))).toBe(false);
+    expect(isTextField(make('<button>B</button>'))).toBe(false);
+    expect(isTextField(window)).toBe(false);
+    expect(isTextField(null)).toBe(false);
   });
 });

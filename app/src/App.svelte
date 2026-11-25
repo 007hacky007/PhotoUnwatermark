@@ -6,6 +6,7 @@
   import { wizard as appWizard, type Wizard } from './lib/wizard.svelte';
   import About from './screens/About.svelte';
   import AddPhotos from './screens/AddPhotos.svelte';
+  import CheckWatermark from './screens/CheckWatermark.svelte';
   import SavedWatermarks from './screens/SavedWatermarks.svelte';
   import Settings from './screens/Settings.svelte';
   import Welcome from './screens/Welcome.svelte';
@@ -49,9 +50,12 @@
       <AddPhotos {wizard} />
     {/if}
     {#if wizard.screen === 'check'}
-      <!-- Placeholder until the watermark editor; it reads wizard.outcome. -->
+      <CheckWatermark {wizard} />
+    {/if}
+    {#if wizard.screen === 'checkAll'}
+      <!-- Placeholder until step 3, which opens CheckWatermark with mode 'photo' for one photo. -->
       <section class="page">
-        <h1>{copy.steps[1]}</h1>
+        <h1>{copy.steps[2]}</h1>
       </section>
     {/if}
     {#if wizard.screen === 'settings'}

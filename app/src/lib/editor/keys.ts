@@ -43,3 +43,17 @@ export function actionFor(e: KeyEvent, isMac: boolean): Action | null {
     default: return null;
   }
 }
+
+const REPEATING = new Set<Action>(['sizeDown', 'sizeUp', 'zoomIn', 'zoomOut', 'undo', 'redo']);
+
+/** Whether holding the key down keeps acting; the others act once per press. */
+export function repeats(action: Action): boolean {
+  return REPEATING.has(action);
+}
+
+/** True when `target` takes typed text, so letter shortcuts must leave the keys to it. */
+export function isTextField(target: EventTarget | null): boolean {
+  if (!(target instanceof HTMLElement)) return false;
+  if (target.isContentEditable || target.tagName === 'TEXTAREA' || target.tagName === 'SELECT') return true;
+  return target instanceof HTMLInputElement && target.type !== 'range' && target.type !== 'checkbox';
+}
