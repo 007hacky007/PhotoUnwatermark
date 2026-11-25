@@ -285,6 +285,82 @@ the batch layer, so the layer supports its own placement by construction): `find
 Found 6 / Unsure 1 / NotFound 0. The one photo of the other real set (different size) stays not
 `Found` (the prior does not apply).
 
+## Detector specks in the first guess (Plan 2 fix wave, C1)
+
+The first guess used to keep every component the detector found, union it with the batch layer
+and grow the lot. On the synthetic `fixed` set the batch layer is clean (the mark alone), but the
+detector also finds dozens of small specks on fur, vessels and stars, so a guess covered 4-11 %
+of the photo for a mark of 1.22 %. Those specks went into the step-3 template (matching found the
+mark in 1 of 8 photos) and into the saved watermark (its box spanned most of the photo, and the
+offer took minutes on one core).
+
+`pipeline::guess_photo` now passes the detector's mask through `keep_mark_parts` before the face
+guard, the union with the layer and the growth:
+
+| step | constant | value |
+|---|---|---|
+| "near" the layer, and the grouping distance of detector components | `LAYER_NEAR_FRAC` | 0.02 of the long side |
+| the layer is the mark when the detector comes near at least this share of its pixels | `LAYER_SEEN` | 0.9 |
+| without that, a group with less than this share of the largest group's pixels is a speck | `SPECK_FRAC` | 0.1 |
+
+- Layer seen by the detector (the fixed set: 1.0 on every photo): only components near the layer
+  stay.
+- Otherwise (no layer, an empty one, or a layer of static scene edges the detector does not see,
+  as in the random and styles sets, 0.0-0.95 per photo, mostly below 0.6): components near the
+  layer stay, and so does every group of at least 10 % of the largest group. Tiled text is many
+  groups of about the same size, so it stays.
+- 0.02 is the distance at which components join one piece in `filter_layer` and the template
+  (30 px at 1536). The rule "keep only components near any non-empty layer" (as first planned)
+  cut the random set's recall to 0.974 and the styles set's to 0.642, because their layers hold
+  scene edges while the marks move; the 0.9 gate keeps it to layers that are the mark.
+
+`puw-dev guess --all --set target/synth/<set>` (new `--all`: every photo, with recall against
+mask/), Core ML, before -> after:
+
+| set | recall mean (min) | guess coverage % mean (min-max) | mark coverage % mean |
+|---|---|---|---|
+| fixed (8) | 1.000 (1.000) -> 1.000 (1.000) | 7.60 (3.84-11.03) -> 2.61 (2.48-2.76) | 1.22 |
+| random (12) | 0.975 (0.704) -> 0.975 (0.704) | 6.73 (2.44-16.09) -> 4.64 (1.97-11.18) | 1.31 |
+| styles (5) | 0.809 (0.049) -> 0.805 (0.047) | 13.34 (7.33-27.21) -> 11.65 (6.58-26.00) | 5.20 |
+
+- fixed: 2.61 % is about the batch layer (1.90 %, the mark grown by 3 px) grown by the guess's
+  7 px; the guess holds the whole mark and nothing else.
+- styles: the 0.4 point drop is styles/02 (tiled text, 0.996 -> 0.981): the cut-off tiles at the
+  photo's edges are small groups. styles/03 (full-frame thin lines) stays at 0.05, as before.
+- Real sets (`guess --real`, 3 + 1 photos, coverage only, no ground truth): set 1 9.18 (8.89-9.46)
+  -> 8.79 (8.44-9.11) %, set 2 6.40 -> 4.67 %. Set 1's layer is not seen by the detector (the
+  faint outline), so it takes the size rule; its coverage is mostly the grown layer (R12). The
+  overlay of set 2 was checked by eye: the whole mark is still in the guess.
+
+`puw-dev bench --set ...` (guess and removal at 4096, Core ML), before -> after:
+
+| set | recall mean | mark PSNR after, mean dB | time per photo, mean s |
+|---|---|---|---|
+| fixed | 1.000 -> 1.000 | 23.62 -> 23.58 | 34.9 -> 13.5 |
+| random | 0.975 -> 0.975 | 27.67 -> 27.63 | 20.5 -> 12.5 |
+| styles | 0.809 -> 0.805 | 19.98 -> 19.98 | 19.8 -> 14.8 |
+
+The PSNR in the mark is unchanged (within 0.05 dB) and removal is faster, as less is painted.
+Times are from one run each on a machine doing other work, so read them as a trend only.
+
+Matching with the first guess as it is (no editing): `first_guess_matches_fixed_set_and_is_offered`
+(puw-app session test, needs `PUW_MODELS_DIR`) confirms the representative's guess as the set area,
+then `match_all` finds the mark on 8 of 8 fixed photos (was 1 of 8 in the Windows walkthrough).
+Saved and offered again for the same photos, `suggest_saved` answers in 0.1 s with that watermark.
+
+### Stray parts far from the mark (`template.rs`)
+
+A piece of a template (components grouped at 2 % of the long side) with less than `CARRY_FRAC`
+(0.1) of the largest piece's pixels is not searched for: `find` places the other pieces and
+carries it along at its saved offset from the largest piece (same scale). `saved_score` scores
+only the searched pieces, `main_bbox` gives their box (the saved watermark's picture uses it).
+The smallest real part of a multi-piece mark in the tests (the ring logo beside the fixed
+text) holds about 18 % of the text's pixels; a dot of the default 24 px brush about 2 %. Test
+`stray_dot_is_carried_along`: random/00's mark plus a 25 px dot 300 px away gives the same
+status and confidence as the mark alone on all 11 other photos, the dot lands at its offset, and
+the main box is the mark's. Saved templates of earlier versions get this too (it is decided when
+matching).
+
 ## App timings (Plan 2)
 
 Measured with `cargo test -p puw-app --release --test timings -- --ignored --nocapture` (needs
