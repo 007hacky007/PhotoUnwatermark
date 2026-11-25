@@ -3,6 +3,7 @@
 
 mod commands;
 mod protocol;
+mod window;
 
 use tauri::{Emitter, Manager, RunEvent};
 
@@ -40,6 +41,40 @@ fn mac_menu(app: &tauri::AppHandle) -> tauri::Result<tauri::menu::Menu<tauri::Wr
     Ok(menu)
 }
 
+/// Shrinks the main window to the screen it opens on (keeping the usual size where it fits)
+/// and centres it, so its bottom never sits under the taskbar. Nothing changes when the screen
+/// cannot be read.
+fn fit_main_window(app: &tauri::App) {
+    use tauri::{LogicalSize, PhysicalPosition};
+    let Some(win) = app.get_webview_window("main") else {
+        return;
+    };
+    let Ok(Some(monitor)) = win.current_monitor() else {
+        return;
+    };
+    let area = monitor.work_area();
+    let frame = match (win.outer_size(), win.inner_size()) {
+        (Ok(o), Ok(i)) => (
+            o.width.saturating_sub(i.width),
+            o.height.saturating_sub(i.height),
+        ),
+        _ => (0, 0),
+    };
+    let f = window::fit(
+        (
+            area.position.x,
+            area.position.y,
+            area.size.width,
+            area.size.height,
+        ),
+        frame,
+        monitor.scale_factor(),
+    );
+    let _ = win.set_min_size(Some(LogicalSize::new(f.min.0, f.min.1)));
+    let _ = win.set_size(LogicalSize::new(f.size.0, f.size.1));
+    let _ = win.set_position(PhysicalPosition::new(f.position.0, f.position.1));
+}
+
 fn main() {
     // Read while the process still has one thread: later reads can fail on macOS and Linux.
     let startup_offset = time::UtcOffset::current_local_offset().ok();
@@ -55,6 +90,7 @@ fn main() {
     builder
         .setup(move |app| {
             app.manage(commands::Shell::open(startup_offset)?);
+            fit_main_window(app);
             Ok(())
         })
         .register_asynchronous_uri_scheme_protocol("puw", protocol::handle)
