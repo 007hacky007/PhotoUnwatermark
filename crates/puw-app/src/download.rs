@@ -279,6 +279,8 @@ fn fetch(
         }
         Err(_) => 0,
     };
+    // Shown before the part is read again, which takes a few seconds for hundreds of MB.
+    progress.emit(base + have, asset.name);
     if have > 0 {
         let mut f = File::open(&part).map_err(disk)?;
         let mut buf = vec![0u8; CHUNK];
@@ -293,7 +295,6 @@ fn fetch(
             }
         }
     }
-    progress.emit(base + have, asset.name);
 
     if have < asset.bytes {
         have = transfer(

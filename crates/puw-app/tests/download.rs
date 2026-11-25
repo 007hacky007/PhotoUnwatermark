@@ -330,6 +330,33 @@ fn resumes_partial_download() {
     assert!(!t.path().join("a.bin.part").exists());
 }
 
+/// A resumed download says how much is already there before it reads the part again, so the
+/// display never starts from 0 MB.
+#[test]
+fn resume_reports_the_part_before_reading_it() {
+    let a = data(400_000, 7);
+    let s = Server::start(vec![("a.bin", a.clone())]);
+    let assets = [asset(&s, "a.bin", &a)];
+    let t = tempfile::tempdir().unwrap();
+    std::fs::write(t.path().join("a.bin.part"), &a[..150_000]).unwrap();
+    // Cancelled while the part is read: the one report that went out is the part's size.
+    let seen = std::sync::Mutex::new(Vec::new());
+    let cancel = AtomicBool::new(false);
+    let r = download_with_backoff(
+        t.path(),
+        &assets,
+        &|p: DownloadProgress| {
+            seen.lock().unwrap().push(p.done_bytes);
+            cancel.store(true, Ordering::SeqCst);
+        },
+        &cancel,
+        &[NONE],
+    );
+    assert!(matches!(r, Err(DownloadError::Cancelled)), "{r:?}");
+    assert_eq!(*seen.lock().unwrap(), [150_000]);
+    assert!(s.requests().is_empty());
+}
+
 #[test]
 fn retries_within_one_call() {
     let a = data(100_000, 4);
