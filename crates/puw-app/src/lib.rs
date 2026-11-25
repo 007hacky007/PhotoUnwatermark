@@ -1,6 +1,7 @@
 //! App logic for PhotoUnwatermark, free of any UI toolkit.
 
 pub mod core;
+pub mod device;
 pub mod download;
 pub mod estimate;
 mod image_cache;
@@ -17,6 +18,7 @@ pub use crate::core::{
     AppCore, AreaStatus, DetectOutcome, Done, Failed, MatchSummary, OutputCheck, PREVIEW_LONG_SIDE,
     PhotoState, RemoveReport, SavedInfo, Suggestion, default_watermark_name,
 };
+pub use device::{DeviceFix, DeviceState, DeviceStatus, Platform, device_status};
 pub use estimate::{Eta, load_fraction};
 pub use jobs::{Events, LoadPurpose, ProgressEvent};
 pub use messages::{AppError, UserError, user_message};

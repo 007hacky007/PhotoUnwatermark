@@ -14,6 +14,7 @@ vi.mock('../lib/api', () => ({
   useSaved: vi.fn(),
   imageUrl: vi.fn((route: string, id: number) => `puw://${route}/${id}`),
   onDragDrop: vi.fn(),
+  listSaved: vi.fn(),
   choosePhotos: vi.fn(),
   chooseFolder: vi.fn(),
 }));
@@ -68,6 +69,14 @@ describe('Add photos', () => {
     vi.mocked(api.imageUrl).mockImplementation((route, id) => `puw://${route}/${id}`);
     onDragDrop.mockResolvedValue(() => {});
     suggestSaved.mockResolvedValue(null);
+  });
+
+  it('savedWatermarksEntry', async () => {
+    const { wizard } = await start();
+    vi.mocked(api.listSaved).mockResolvedValueOnce([]);
+    await fireEvent.click(screen.getByRole('button', { name: copy.addPhotos.savedWatermarks }));
+    expect(wizard.screen).toBe('saved');
+    expect(await screen.findByText(copy.saved.empty)).toBeTruthy();
   });
 
   it('primaryDisabledWithoutPhotos', async () => {

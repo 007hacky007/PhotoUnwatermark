@@ -38,6 +38,7 @@ use puw_core::{
 };
 use serde::Serialize;
 
+use crate::device::{self, DeviceFix, DeviceStatus, Platform};
 use crate::download::{self, model_assets};
 use crate::image_cache::ImageCache;
 use crate::images::{self, area_from_edit};
@@ -155,9 +156,44 @@ impl AppCore {
             changed
         };
         if gpu_changed {
-            *lock(&self.engine) = None;
-            lock(&self.announced).clear();
+            self.drop_engine();
         }
+        Ok(())
+    }
+
+    /// Drops the engine; the models load again when next needed (a running job keeps its own).
+    fn drop_engine(&self) {
+        *lock(&self.engine) = None;
+        lock(&self.announced).clear();
+    }
+
+    /// Where the loaded models run, for the device chip. Creates no engine.
+    pub fn device_status(&self) -> DeviceStatus {
+        let report = lock(&self.engine).as_ref().map(|e| e.report());
+        device::device_status(
+            report.as_ref(),
+            lock(&self.settings).prefer_gpu,
+            Platform::current(),
+        )
+    }
+
+    /// Applies a fix from the "why?" dialog: the models load again when next needed, with the
+    /// processor or the graphics card as chosen. [`DeviceFix::DownloadHelper`] does nothing yet
+    /// (it is never offered before the helper download exists).
+    pub fn device_fix(&self, fix: DeviceFix) -> Result<()> {
+        let prefer_gpu = match fix {
+            DeviceFix::TryAgain => None,
+            DeviceFix::UseProcessor => Some(false),
+            DeviceFix::UseGraphicsCard => Some(true),
+            DeviceFix::DownloadHelper { .. } => return Ok(()),
+        };
+        if let Some(prefer_gpu) = prefer_gpu {
+            self.set_settings(Settings {
+                prefer_gpu,
+                ..self.settings()
+            })?;
+        }
+        self.drop_engine();
         Ok(())
     }
 
@@ -192,8 +228,7 @@ impl AppCore {
     /// [`AppError::Busy`] while a job runs, and no job can start until it is done.
     pub fn remove_downloaded_data(&self) -> Result<()> {
         let _job = self.jobs.start()?;
-        *lock(&self.engine) = None;
-        lock(&self.announced).clear();
+        self.drop_engine();
         download::remove_downloaded_data(&self.dirs)?;
         self.dirs.ensure()
     }
@@ -614,6 +649,32 @@ mod tests {
         assert!(!s.prefer_gpu);
         assert_eq!(s.load_seconds[&ModelKind::Face], 0.5);
         assert_eq!(Settings::load(&core.dirs.settings), s);
+    }
+
+    #[test]
+    fn device_fix_drops_the_engine_and_sets_the_choice() {
+        let t = tempfile::tempdir().unwrap();
+        let core = AppCore::new(DataDirs::at(t.path())).unwrap();
+        assert_eq!(core.device_status().state, crate::DeviceState::NotStarted);
+        let models = crate::download::model_assets();
+        for a in &models {
+            std::fs::write(core.dirs.models.join(a.name), b"x").unwrap();
+        }
+        let first = core.engine().unwrap();
+        core.device_fix(DeviceFix::TryAgain).unwrap();
+        assert!(!Arc::ptr_eq(&first, &core.engine().unwrap()));
+        assert!(core.settings().prefer_gpu);
+
+        core.device_fix(DeviceFix::UseProcessor).unwrap();
+        assert!(!core.settings().prefer_gpu);
+        assert!(!Settings::load(&core.dirs.settings).prefer_gpu);
+        let second = core.engine().unwrap();
+        core.device_fix(DeviceFix::UseProcessor).unwrap();
+        assert!(!Arc::ptr_eq(&second, &core.engine().unwrap()));
+
+        core.device_fix(DeviceFix::UseGraphicsCard).unwrap();
+        assert!(core.settings().prefer_gpu);
+        assert_eq!(core.device_status().state, crate::DeviceState::NotStarted);
     }
 
     #[test]

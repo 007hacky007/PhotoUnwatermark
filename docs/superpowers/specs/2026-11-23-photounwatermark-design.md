@@ -164,9 +164,9 @@ why. A small status chip is visible on the Remove step (step 4), on the step-2 p
 the actual reason (GPU helper not downloaded, download failed, helper failed to load with the error, graphics card
 not supported, GPU run failed and fell back mid-way) and, when a fix exists, a button for it: "Download GPU helper
 (N MB)", "Try again", or "Use processor anyway". A fallback from GPU to CPU during a run is announced in the progress
-screen, never silent. On macOS the chip reflects whether the CoreML path is actually used for the models (not only
-whether it was requested): Macs use Core ML for every model unless it fails, and a model that falls back runs on the
-processor and is shown as such (see `docs/notes/coreml.md`).
+screen, never silent. The chip's wording depends on the platform: Windows shows "Using graphics card (fast)" when
+DirectML runs the models, Apple silicon Macs show "Using Neural Engine (fast)" when Core ML runs them, and Intel Macs
+use the processor; a model that falls back runs on the processor and is shown as such (see `docs/notes/coreml.md`).
 
 **Model loading (owner's decision, 2026-11-24):** loading the models is slow (about 30 s for all of them on a Mac
 the first time, while Core ML prepares them; see `docs/notes/model-loading.md`), so it never happens at app start

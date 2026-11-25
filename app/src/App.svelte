@@ -4,7 +4,10 @@
   import ProgressLine from './lib/components/ProgressLine.svelte';
   import { copy } from './lib/copy';
   import { wizard as appWizard, type Wizard } from './lib/wizard.svelte';
+  import About from './screens/About.svelte';
   import AddPhotos from './screens/AddPhotos.svelte';
+  import SavedWatermarks from './screens/SavedWatermarks.svelte';
+  import Settings from './screens/Settings.svelte';
   import Welcome from './screens/Welcome.svelte';
 
   let { wizard = appWizard }: { wizard?: Wizard } = $props();
@@ -52,10 +55,13 @@
       </section>
     {/if}
     {#if wizard.screen === 'settings'}
-      <section class="page">
-        <h1>{copy.settings.title}</h1>
-        <button type="button" onclick={() => wizard.back()}>{copy.common.back}</button>
-      </section>
+      <Settings {wizard} />
+    {/if}
+    {#if wizard.screen === 'saved'}
+      <SavedWatermarks {wizard} />
+    {/if}
+    {#if wizard.screen === 'about'}
+      <About {wizard} />
     {/if}
   </main>
 </div>

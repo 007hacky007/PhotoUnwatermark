@@ -23,6 +23,8 @@ describe('wizard', () => {
     expect(w.step).toBeNull();
     w.go('saved');
     expect(w.step).toBeNull();
+    w.go('about');
+    expect(w.step).toBeNull();
   });
 
   it('backKeepsState', () => {

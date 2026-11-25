@@ -3,7 +3,16 @@
 
 import type { DetectOutcome } from './types';
 
-export type Screen = 'welcome' | 'add' | 'check' | 'checkAll' | 'remove' | 'done' | 'saved' | 'settings';
+export type Screen =
+  | 'welcome'
+  | 'add'
+  | 'check'
+  | 'checkAll'
+  | 'remove'
+  | 'done'
+  | 'saved'
+  | 'settings'
+  | 'about';
 
 /** The wizard step of each screen (1-5), or null for screens outside the steps. */
 const STEPS: Record<Screen, number | null> = {
@@ -15,6 +24,7 @@ const STEPS: Record<Screen, number | null> = {
   done: 5,
   saved: null,
   settings: null,
+  about: null,
 };
 
 export class Wizard {

@@ -118,6 +118,13 @@ button.primary:hover:not(:disabled) {
   background: var(--accent-hover);
 }
 
+button.danger {
+  border-color: var(--danger);
+  background: var(--danger);
+  color: var(--on-accent);
+  font-weight: 600;
+}
+
 button.quiet {
   border-color: transparent;
   background: transparent;

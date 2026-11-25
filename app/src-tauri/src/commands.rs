@@ -10,8 +10,8 @@ use std::time::{Duration, Instant};
 use puw_app::download::{self, DownloadProgress};
 use puw_app::photos::{AddResult, PhotoId, PhotoInfo};
 use puw_app::{
-    AppCore, AppError, DataDirs, DetectOutcome, MatchSummary, OutputCheck, PhotoState,
-    ProgressEvent, RemoveReport, SavedInfo, Settings, Suggestion, UserError,
+    AppCore, AppError, DataDirs, DetectOutcome, DeviceFix, DeviceStatus, MatchSummary, OutputCheck,
+    PhotoState, ProgressEvent, RemoveReport, SavedInfo, Settings, Suggestion, UserError,
 };
 use serde::Serialize;
 use tauri::ipc::{Channel, InvokeBody, Request, Response};
@@ -455,6 +455,19 @@ pub async fn get_settings(shell: State<'_, Shell>) -> Res<Settings> {
 pub async fn set_settings(shell: State<'_, Shell>, settings: Settings) -> Res<()> {
     let core = shell.core.clone();
     blocking(move || core.set_settings(settings)).await
+}
+
+/// Where the loaded models run, for the device chip.
+#[tauri::command]
+pub async fn device_status(shell: State<'_, Shell>) -> Res<DeviceStatus> {
+    Ok(shell.core.device_status())
+}
+
+/// Applies a fix from the "why?" dialog; the models load again when next needed.
+#[tauri::command]
+pub async fn device_fix(shell: State<'_, Shell>, fix: DeviceFix) -> Res<()> {
+    let core = shell.core.clone();
+    blocking(move || core.device_fix(fix)).await
 }
 
 #[cfg(test)]

@@ -5,10 +5,13 @@
 import { Channel, convertFileSrc, invoke } from '@tauri-apps/api/core';
 import { getCurrentWebview } from '@tauri-apps/api/webview';
 import { open } from '@tauri-apps/plugin-dialog';
+import { openUrl } from '@tauri-apps/plugin-opener';
 import type {
   AddResult,
   AppStatus,
   DetectOutcome,
+  DeviceFix,
+  DeviceStatus,
   DownloadProgress,
   EditSize,
   ImageRoute,
@@ -164,3 +167,18 @@ export const deleteSaved = (id: string) => invoke<void>('delete_saved', { id });
 export const getSettings = () => invoke<Settings>('get_settings');
 
 export const setSettings = (settings: Settings) => invoke<void>('set_settings', { settings });
+
+// Processing device
+
+export const deviceStatus = () => invoke<DeviceStatus>('device_status');
+
+/** Applies a fix from the "why?" dialog; the models load again when next needed. */
+export const deviceFix = (fix: DeviceFix) => invoke<void>('device_fix', { fix });
+
+// Links
+
+/** Where new versions are published (the opener only allows pages of the app's repository). */
+export const RELEASES_URL = 'https://github.com/007hacky007/PhotoUnwatermark/releases';
+
+/** Opens the releases page in the browser. */
+export const openReleasesPage = () => openUrl(RELEASES_URL);

@@ -50,6 +50,8 @@ fn main() {
             commands::delete_saved,
             commands::get_settings,
             commands::set_settings,
+            commands::device_status,
+            commands::device_fix,
         ])
         .run(tauri::generate_context!())
         .expect("error while running PhotoUnwatermark");

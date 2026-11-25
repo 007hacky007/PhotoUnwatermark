@@ -184,6 +184,7 @@
     {/if}
 
     <footer>
+      <button type="button" onclick={() => wizard.go('saved')}>{copy.addPhotos.savedWatermarks}</button>
       <button
         type="button"
         class="primary"
@@ -274,6 +275,8 @@
   }
   footer {
     display: flex;
-    justify-content: flex-end;
+    flex-wrap: wrap;
+    justify-content: space-between;
+    gap: var(--space-2);
   }
 </style>

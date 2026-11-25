@@ -138,3 +138,18 @@ export interface Settings {
 
 /** The pictures the `puw` protocol serves. */
 export type ImageRoute = 'thumb' | 'grid' | 'edit' | 'preview' | 'original' | 'result' | 'saved';
+
+/** What the device chip shows: graphics card, processor, or nothing loaded yet. */
+export type DeviceState = 'gpu' | 'cpu' | 'notStarted';
+
+/** A button the "why?" dialog offers. */
+export type DeviceFix = 'tryAgain' | 'useProcessor' | 'useGraphicsCard' | { downloadHelper: { bytes: number } };
+
+export interface DeviceStatus {
+  state: DeviceState;
+  /** The sentence behind "why?", when there is one. */
+  reason: string | null;
+  /** The raw text for "Show details". */
+  details: string | null;
+  fixes: DeviceFix[];
+}
