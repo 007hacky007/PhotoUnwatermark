@@ -1,13 +1,15 @@
 //! ONNX Runtime sessions for the three models, and an honest report of where each one runs.
 //!
-//! With `prefer_gpu` on Windows, every model is first loaded with the DirectML execution
-//! provider. ONNX Runtime's own session log is captured while the model loads and read for how
-//! many graph nodes the provider took. The report says `Gpu` only when that log shows the
+//! Models load one at a time, on first use (see [`Engine`]). With `prefer_gpu` on Windows, each
+//! model is first loaded with the DirectML execution provider. ONNX Runtime's own session log is
+//! captured while the model loads and read for how many graph nodes the provider took. The report says `Gpu` only when that log shows the
 //! provider took every node; anything else is reported as `Cpu` with the real reason, never a
 //! guess. macOS never uses Core ML (see [`MAC_GPU_REASON`] and `docs/notes/coreml.md`).
 
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, Mutex, OnceLock, PoisonError};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::{Arc, Mutex, MutexGuard, OnceLock, PoisonError};
+use std::time::Instant;
 
 use ort::environment::Environment;
 use ort::ep::ExecutionProviderDispatch;
@@ -15,6 +17,7 @@ use ort::logging::LogLevel;
 use ort::session::Session;
 use ort::session::builder::SessionBuilder;
 use ort::value::TensorRef;
+use serde::{Deserialize, Serialize};
 
 use crate::{Error, Result};
 
@@ -83,6 +86,9 @@ pub enum CpuReason {
     /// A GPU path exists but was measured to be worse than the processor on this platform; the
     /// text states the measured facts.
     GpuNotBeneficial(String),
+    /// The model ran on the GPU, but a run failed; the text is the error. The model was then
+    /// loaded again for the processor and the run retried there.
+    RunFailed(String),
 }
 
 /// Why macOS runs every model on the processor. Measured with Core ML through ONNX Runtime 1.31
@@ -92,76 +98,182 @@ pub enum CpuReason {
 pub const MAC_GPU_REASON: &str = "On Macs the graphics path (Core ML) gave different results and was slower than the \
      processor in our tests";
 
-/// Backend of each model.
+/// Where each loaded model runs; `None` for a model that is not loaded yet.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct DeviceReport {
-    pub segmenter: Backend,
-    pub lama: Backend,
-    pub face: Backend,
+    pub segmenter: Option<Backend>,
+    pub lama: Option<Backend>,
+    pub face: Option<Backend>,
 }
 
-/// The three loaded models.
+/// One of the three models.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum ModelKind {
+    Segmenter,
+    Lama,
+    Face,
+}
+
+impl ModelKind {
+    fn label(self) -> &'static str {
+        match self {
+            ModelKind::Segmenter => "segmenter",
+            ModelKind::Lama => "lama",
+            ModelKind::Face => "face",
+        }
+    }
+}
+
+impl ModelPaths {
+    fn get(&self, kind: ModelKind) -> &Path {
+        match kind {
+            ModelKind::Segmenter => &self.segmenter,
+            ModelKind::Lama => &self.lama,
+            ModelKind::Face => &self.face,
+        }
+    }
+}
+
+/// How the engine loads its models.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct EngineOptions {
+    /// Try the platform's GPU provider first, falling back to the processor on any failure (see
+    /// [`Backend`]).
+    pub prefer_gpu: bool,
+    /// A folder with GPU runtime libraries (`DirectML.dll` on Windows); it is added to the DLL
+    /// search path before DirectML is used and ignored on other platforms.
+    pub gpu_helper_dir: Option<PathBuf>,
+    /// Threads ONNX Runtime may use within one model run; `None` keeps its default (one per
+    /// physical core).
+    pub intra_threads: Option<usize>,
+}
+
+/// The three models, each loaded on first use and kept until the engine is dropped.
+///
+/// All methods take `&self` and may be called from several threads. Callers asking for a model
+/// that is being loaded wait for that one load. A model running on the GPU whose run fails is
+/// loaded again for the processor and the run is retried once there; its backend then reports
+/// [`CpuReason::RunFailed`].
 pub struct Engine {
-    segmenter: Model,
-    lama: Model,
-    face: Model,
-    report: DeviceReport,
+    paths: ModelPaths,
+    opts: EngineOptions,
+    /// The GPU provider, or why there is none; resolved on the first load.
+    gpu: OnceLock<std::result::Result<GpuProvider, CpuReason>>,
+    /// Indexed by `ModelKind as usize`.
+    slots: [Slot; 3],
+}
+
+/// One model's place in the engine.
+#[derive(Default)]
+struct Slot {
+    /// Held for the whole of a load, so concurrent callers wait for one load.
+    loading: Mutex<()>,
+    /// The loaded model. Locked only briefly, so asking for a backend never waits for a load.
+    current: Mutex<Option<Loaded>>,
+    /// Sessions created for this model (tests check that a model loads once).
+    loads: AtomicUsize,
+}
+
+impl Slot {
+    fn get(&self) -> Option<Loaded> {
+        lock(&self.current).clone()
+    }
+
+    fn set(&self, loaded: Loaded) {
+        *lock(&self.current) = Some(loaded);
+    }
+}
+
+#[derive(Clone)]
+struct Loaded {
+    model: Arc<Model>,
+    backend: Backend,
+}
+
+fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
+    mutex.lock().unwrap_or_else(PoisonError::into_inner)
 }
 
 impl Engine {
-    /// Loads all three models. With `prefer_gpu` each model tries the platform's GPU provider and
-    /// falls back to the processor on any failure (see [`DeviceReport`]). `gpu_helper_dir` is a
-    /// folder with GPU runtime libraries (`DirectML.dll` on Windows); it is added to the DLL search
-    /// path before DirectML is used and ignored on other platforms.
-    ///
-    /// Errors only when a model cannot be loaded even for the processor.
-    pub fn new(
-        paths: &ModelPaths,
-        prefer_gpu: bool,
-        gpu_helper_dir: Option<&Path>,
-    ) -> Result<Engine> {
-        let env = environment()?;
-        let gpu = if prefer_gpu {
-            platform::gpu_provider(gpu_helper_dir)
-        } else {
-            Err(CpuReason::NotRequested)
-        };
-        let (segmenter, seg) = Model::load(env, "segmenter", &paths.segmenter, &gpu)?;
-        let (lama, lama_backend) = Model::load(env, "lama", &paths.lama, &gpu)?;
-        let (face, face_backend) = Model::load(env, "face", &paths.face, &gpu)?;
+    /// An engine for the models at `paths`. Loads nothing: each model is loaded by [`Engine::load`]
+    /// or on its first run. Never fails today; the `Result` leaves room for checks of `opts`.
+    pub fn new(paths: &ModelPaths, opts: EngineOptions) -> Result<Engine> {
         Ok(Engine {
-            segmenter,
-            lama,
-            face,
-            report: DeviceReport {
-                segmenter: seg,
-                lama: lama_backend,
-                face: face_backend,
-            },
+            paths: paths.clone(),
+            opts,
+            gpu: OnceLock::new(),
+            slots: Default::default(),
         })
     }
 
-    /// Where each model runs.
-    pub fn report(&self) -> &DeviceReport {
-        &self.report
+    /// Loads `kind` unless it is already loaded, and returns where it runs. With `prefer_gpu` the
+    /// model tries the platform's GPU provider and falls back to the processor on any failure.
+    ///
+    /// Errors only when the model cannot be loaded even for the processor.
+    pub fn load(&self, kind: ModelKind) -> Result<Backend> {
+        Ok(self.loaded(kind)?.backend)
+    }
+
+    /// Where `kind` runs, or `None` when it is not loaded.
+    pub fn backend(&self, kind: ModelKind) -> Option<Backend> {
+        self.slot(kind).get().map(|l| l.backend)
+    }
+
+    /// Where each loaded model runs.
+    pub fn report(&self) -> DeviceReport {
+        DeviceReport {
+            segmenter: self.backend(ModelKind::Segmenter),
+            lama: self.backend(ModelKind::Lama),
+            face: self.backend(ModelKind::Face),
+        }
+    }
+
+    /// Sessions created so far for `kind`: 1 after the first load, one more for each fallback to
+    /// the processor after a failed GPU run.
+    ///
+    /// Public only for the integration tests; not part of the stable API.
+    #[doc(hidden)]
+    pub fn load_count(&self, kind: ModelKind) -> usize {
+        self.slot(kind).loads.load(Ordering::SeqCst)
+    }
+
+    /// Loads `kind` if needed, then reports it as running on a GPU and makes its next run fail, so
+    /// the fallback after a failed GPU run can be tested on any machine.
+    ///
+    /// Public only for the integration tests; not part of the stable API.
+    #[doc(hidden)]
+    pub fn simulate_gpu_failure(&self, kind: ModelKind) -> Result<()> {
+        let slot = self.slot(kind);
+        let Loaded { model, .. } = self.loaded(kind)?;
+        let _guard = lock(&slot.loading);
+        model.fail_next_run.store(true, Ordering::SeqCst);
+        slot.set(Loaded {
+            model,
+            backend: Backend::Gpu {
+                name: "simulated".to_string(),
+            },
+        });
+        Ok(())
     }
 
     /// Segmenter on one 512x512 tile: `nchw` is ImageNet-normalised planar RGB
-    /// (`3 * 512 * 512` values); returns the `512 * 512` watermark probabilities in 0..1.
+    /// (`3 * 512 * 512` values); returns the `512 * 512` watermark probabilities in 0..1. Loads
+    /// the segmenter on first use.
     ///
     /// Public only for the integration tests; not part of the stable API.
     #[doc(hidden)]
     pub fn run_segmenter(&self, nchw: &[f32]) -> Result<Vec<f32>> {
-        Ok(self.segmenter.run(&[nchw])?.swap_remove(0))
+        Ok(self.run(ModelKind::Segmenter, &[nchw])?.swap_remove(0))
     }
 
     /// LaMa on one 512x512 tile: `img` is planar RGB in 0..1 (`3 * 512 * 512` values), `mask` is
-    /// `512 * 512` values with 1 = hole. Returns planar RGB in 0..255.
+    /// `512 * 512` values with 1 = hole. Returns planar RGB in 0..255. Loads LaMa on first use.
     ///
     /// Public only for the integration tests; not part of the stable API.
     #[doc(hidden)]
     pub fn run_lama(&self, img: &[f32], mask: &[f32]) -> Result<Vec<f32>> {
-        Ok(self.lama.run(&[img, mask])?.swap_remove(0))
+        Ok(self.run(ModelKind::Lama, &[img, mask])?.swap_remove(0))
     }
 
     /// YuNet face detector. The model (2023mar) has a fixed input, so `h` and `w` must both be
@@ -169,19 +281,122 @@ impl Engine {
     /// the photo letterboxed into the square. Returns the raw outputs in graph order:
     /// `cls_8, cls_16, cls_32, obj_8, obj_16, obj_32, bbox_8, bbox_16, bbox_32, kps_8, kps_16,
     /// kps_32` (per anchor: 1, 1, 4 and 10 values; 6400, 1600 and 400 anchors for strides 8, 16
-    /// and 32).
+    /// and 32). Loads the face model on first use.
     ///
     /// Public only for the integration tests; not part of the stable API.
     #[doc(hidden)]
     pub fn run_face(&self, nchw: &[f32], h: u32, w: u32) -> Result<Vec<Vec<f32>>> {
-        let shape = &self.face.inputs[0].1;
+        let Loaded { model, .. } = self.loaded(ModelKind::Face)?;
+        let shape = match model.inputs.first() {
+            Some((_, shape)) if shape.len() == 4 => shape,
+            _ => {
+                return Err(Error::Model(
+                    "face model does not take one NCHW image".to_string(),
+                ));
+            }
+        };
         if shape[2..] != [i64::from(h), i64::from(w)] {
             return Err(Error::Model(format!(
                 "face model takes {}x{} input, got {w}x{h}",
                 shape[3], shape[2]
             )));
         }
-        self.face.run(&[nchw])
+        drop(model);
+        self.run(ModelKind::Face, &[nchw])
+    }
+
+    fn slot(&self, kind: ModelKind) -> &Slot {
+        &self.slots[kind as usize]
+    }
+
+    /// The loaded `kind`, loading it first if needed.
+    fn loaded(&self, kind: ModelKind) -> Result<Loaded> {
+        let slot = self.slot(kind);
+        if let Some(loaded) = slot.get() {
+            return Ok(loaded);
+        }
+        let _guard = lock(&slot.loading);
+        if let Some(loaded) = slot.get() {
+            return Ok(loaded);
+        }
+        let env = environment()?;
+        let gpu = self.gpu.get_or_init(|| {
+            if self.opts.prefer_gpu {
+                platform::gpu_provider(self.opts.gpu_helper_dir.as_deref())
+            } else {
+                Err(CpuReason::NotRequested)
+            }
+        });
+        let start = Instant::now();
+        let (model, backend) = Model::load(
+            env,
+            kind.label(),
+            self.paths.get(kind),
+            gpu,
+            self.opts.intra_threads,
+        )?;
+        slot.loads.fetch_add(1, Ordering::SeqCst);
+        tracing::info!(
+            model = kind.label(),
+            ?backend,
+            seconds = start.elapsed().as_secs_f64(),
+            "model loaded"
+        );
+        let loaded = Loaded {
+            model: Arc::new(model),
+            backend,
+        };
+        slot.set(loaded.clone());
+        Ok(loaded)
+    }
+
+    /// Runs `kind` on `data`, loading it first if needed. A failed run on the GPU is retried once
+    /// on the processor (see [`Engine`]).
+    fn run(&self, kind: ModelKind, data: &[&[f32]]) -> Result<Vec<Vec<f32>>> {
+        let Loaded { model, backend } = self.loaded(kind)?;
+        // Bad input is the caller's error, not a reason to leave the GPU.
+        model.check(data)?;
+        let err = match model.run(data) {
+            Ok(outputs) => return Ok(outputs),
+            Err(err) => err,
+        };
+        if !matches!(backend, Backend::Gpu { .. }) {
+            return Err(err);
+        }
+        let cpu = self.fall_back(kind, &model, &err)?;
+        drop(model);
+        cpu.run(data)
+    }
+
+    /// Replaces the GPU model `failed` with a processor session after its run failed with `err`,
+    /// unless another thread already replaced it, and returns the replacement.
+    fn fall_back(&self, kind: ModelKind, failed: &Arc<Model>, err: &Error) -> Result<Arc<Model>> {
+        let slot = self.slot(kind);
+        let _guard = lock(&slot.loading);
+        if let Some(current) = slot.get()
+            && !Arc::ptr_eq(&current.model, failed)
+        {
+            return Ok(current.model);
+        }
+        let why = match err {
+            Error::Model(text) => text.clone(),
+            other => other.to_string(),
+        };
+        tracing::warn!(model = kind.label(), error = %why, "GPU run failed, switching to the processor");
+        let (model, backend) = Model::load_cpu(
+            environment()?,
+            kind.label(),
+            self.paths.get(kind),
+            CpuReason::RunFailed(why),
+            self.opts.intra_threads,
+        )?;
+        slot.loads.fetch_add(1, Ordering::SeqCst);
+        let model = Arc::new(model);
+        slot.set(Loaded {
+            model: Arc::clone(&model),
+            backend,
+        });
+        Ok(model)
     }
 }
 
@@ -224,6 +439,8 @@ struct Model {
     session: Mutex<Session>,
     /// Input names and fixed shapes, in graph order.
     inputs: Vec<(String, Vec<i64>)>,
+    /// Set by [`Engine::simulate_gpu_failure`]: the next run fails.
+    fail_next_run: AtomicBool,
 }
 
 impl Model {
@@ -232,14 +449,15 @@ impl Model {
         label: &'static str,
         path: &Path,
         gpu: &std::result::Result<GpuProvider, CpuReason>,
+        threads: Option<usize>,
     ) -> Result<(Model, Backend)> {
         let provider = match gpu {
             Ok(provider) => provider,
-            Err(reason) => return Self::load_cpu(env, label, path, reason.clone()),
+            Err(reason) => return Self::load_cpu(env, label, path, reason.clone(), threads),
         };
         // Probe: load once with verbose logging and graph fusion off, and read the placement.
         let log = SessionLog::new();
-        let mut probe = builder(env, label, Some(&log))?;
+        let mut probe = builder(env, label, Some(&log), threads)?;
         for (key, value) in provider.probe_config {
             probe = probe
                 .with_config_entry(*key, *value)
@@ -247,7 +465,7 @@ impl Model {
         }
         let probe = match Self::commit_with(probe, provider, label, path) {
             Ok(session) => session,
-            Err(reason) => return Self::load_cpu(env, label, path, reason),
+            Err(reason) => return Self::load_cpu(env, label, path, reason, threads),
         };
         drop(probe);
         match classify(
@@ -256,13 +474,14 @@ impl Model {
             label,
         ) {
             Ok(()) => {}
-            Err(reason) => return Self::load_cpu(env, label, path, reason),
+            Err(reason) => return Self::load_cpu(env, label, path, reason, threads),
         }
         // The real session keeps the provider's defaults (graph fusion on).
-        let session = match Self::commit_with(builder(env, label, None)?, provider, label, path) {
-            Ok(session) => session,
-            Err(reason) => return Self::load_cpu(env, label, path, reason),
-        };
+        let session =
+            match Self::commit_with(builder(env, label, None, threads)?, provider, label, path) {
+                Ok(session) => session,
+                Err(reason) => return Self::load_cpu(env, label, path, reason, threads),
+            };
         let backend = Backend::Gpu {
             name: provider.name.to_string(),
         };
@@ -300,8 +519,9 @@ impl Model {
         label: &'static str,
         path: &Path,
         reason: CpuReason,
+        threads: Option<usize>,
     ) -> Result<(Model, Backend)> {
-        let session = builder(env, label, None)?
+        let session = builder(env, label, None, threads)?
             .commit_from_file(path)
             .map_err(|e| model_err(&format!("could not load {}", path.display()), e))?;
         Ok((Self::from_session(label, session)?, Backend::Cpu { reason }))
@@ -327,12 +547,12 @@ impl Model {
             label,
             session: Mutex::new(session),
             inputs,
+            fail_next_run: AtomicBool::new(false),
         })
     }
 
-    /// Runs the model on `data` (one slice per input, graph order); returns every output in graph
-    /// order.
-    fn run(&self, data: &[&[f32]]) -> Result<Vec<Vec<f32>>> {
+    /// Checks that `data` has one slice of the right length per input.
+    fn check(&self, data: &[&[f32]]) -> Result<()> {
         let label = self.label;
         if data.len() != self.inputs.len() {
             return Err(Error::Model(format!(
@@ -341,7 +561,6 @@ impl Model {
                 data.len()
             )));
         }
-        let mut values = Vec::with_capacity(data.len());
         for ((name, shape), values_in) in self.inputs.iter().zip(data) {
             let expected: i64 = shape.iter().product();
             if values_in.len() as i64 != expected {
@@ -350,6 +569,20 @@ impl Model {
                     values_in.len()
                 )));
             }
+        }
+        Ok(())
+    }
+
+    /// Runs the model on `data` (one slice per input, graph order); returns every output in graph
+    /// order.
+    fn run(&self, data: &[&[f32]]) -> Result<Vec<Vec<f32>>> {
+        let label = self.label;
+        self.check(data)?;
+        if self.fail_next_run.swap(false, Ordering::SeqCst) {
+            return Err(Error::Model(format!("{label}: simulated GPU failure")));
+        }
+        let mut values = Vec::with_capacity(data.len());
+        for ((name, shape), values_in) in self.inputs.iter().zip(data) {
             let tensor = TensorRef::from_array_view((shape.clone(), *values_in))
                 .map_err(|e| model_err(label, e))?;
             values.push((name.as_str(), tensor));
@@ -369,7 +602,13 @@ impl Model {
 
 /// Session builder with the crate's logging: ONNX Runtime messages go to `tracing`, and with a
 /// `log` the session logs verbosely so its placement messages can be read after loading.
-fn builder(env: &Environment, label: &str, log: Option<&SessionLog>) -> Result<SessionBuilder> {
+/// `threads` sets the threads used within one run.
+fn builder(
+    env: &Environment,
+    label: &str,
+    log: Option<&SessionLog>,
+    threads: Option<usize>,
+) -> Result<SessionBuilder> {
     let err = |e: ort::Error| model_err("could not configure ONNX Runtime", e);
     let level = if log.is_some() {
         LogLevel::Verbose
@@ -377,8 +616,13 @@ fn builder(env: &Environment, label: &str, log: Option<&SessionLog>) -> Result<S
         LogLevel::Warning
     };
     let lines = log.map(|l| Arc::clone(&l.lines));
-    Session::builder(env)
-        .map_err(err)?
+    let mut builder = Session::builder(env).map_err(err)?;
+    if let Some(threads) = threads {
+        builder = builder
+            .with_intra_threads(threads)
+            .map_err(|e| err(e.into()))?;
+    }
+    builder
         .with_log_id(format!("puw-{label}"))
         .map_err(|e| err(e.into()))?
         .with_log_level(level)

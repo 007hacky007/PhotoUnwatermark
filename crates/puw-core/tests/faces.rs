@@ -6,7 +6,7 @@ use std::sync::OnceLock;
 
 use image::Luma;
 use imageproc::rect::Rect;
-use puw_core::engine::{Engine, ModelPaths};
+use puw_core::engine::{Engine, EngineOptions, ModelPaths};
 use puw_core::faces::{Face, detect_faces, detect_faces_near, drop_eye_components, guard};
 use puw_core::mask::Mask;
 
@@ -19,7 +19,7 @@ fn engine() -> Option<&'static Engine> {
                 return None;
             };
             let paths = ModelPaths::from_dir(&dir).expect("model files present");
-            Some(Engine::new(&paths, false, None).expect("engine loads"))
+            Some(Engine::new(&paths, EngineOptions::default()).expect("engine loads"))
         })
         .as_ref()
 }

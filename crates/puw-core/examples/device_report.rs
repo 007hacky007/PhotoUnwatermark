@@ -6,7 +6,7 @@
 use std::path::PathBuf;
 use std::time::Instant;
 
-use puw_core::engine::{Engine, ModelPaths};
+use puw_core::engine::{Engine, EngineOptions, ModelKind, ModelPaths};
 
 fn main() {
     let mut prefer_gpu = true;
@@ -26,13 +26,21 @@ fn main() {
     };
 
     let paths = ModelPaths::from_dir(&models).unwrap_or_else(|e| fail(e));
-    let start = Instant::now();
-    let engine = Engine::new(&paths, prefer_gpu, helper.as_deref()).unwrap_or_else(|e| fail(e));
-    println!("loaded in {:.1?}", start.elapsed());
-    let report = engine.report();
-    println!("segmenter: {:?}", report.segmenter);
-    println!("lama:      {:?}", report.lama);
-    println!("face:      {:?}", report.face);
+    let engine = Engine::new(
+        &paths,
+        EngineOptions {
+            prefer_gpu,
+            gpu_helper_dir: helper,
+            ..EngineOptions::default()
+        },
+    )
+    .unwrap_or_else(|e| fail(e));
+    for kind in [ModelKind::Segmenter, ModelKind::Lama, ModelKind::Face] {
+        let start = Instant::now();
+        let backend = engine.load(kind).unwrap_or_else(|e| fail(e));
+        let name = format!("{kind:?}:").to_lowercase();
+        println!("{name:<10} {backend:?} (loaded in {:.1?})", start.elapsed());
+    }
 
     let start = Instant::now();
     let prob = engine

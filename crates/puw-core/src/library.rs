@@ -55,6 +55,10 @@ fn invalid(msg: &str) -> Error {
     Error::Image(msg.to_string())
 }
 
+fn invalid_input(msg: &str) -> Error {
+    Error::InvalidInput(msg.to_string())
+}
+
 fn not_found() -> Error {
     Error::Io(std::io::Error::new(
         std::io::ErrorKind::NotFound,
@@ -66,14 +70,14 @@ fn not_found() -> Error {
 fn check_id(id: &str) -> Result<()> {
     match Uuid::try_parse(id) {
         Ok(u) if u.hyphenated().to_string() == id => Ok(()),
-        _ => Err(invalid("invalid watermark id")),
+        _ => Err(invalid_input("invalid watermark id")),
     }
 }
 
 fn clean_name(name: &str) -> Result<String> {
     let n = name.trim();
     if n.is_empty() {
-        Err(invalid("empty name"))
+        Err(invalid_input("empty name"))
     } else {
         Ok(n.to_string())
     }

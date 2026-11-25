@@ -13,7 +13,7 @@ pub mod template;
 pub mod tiles;
 
 pub use detect::{Guess, GuessOptions};
-pub use engine::{Backend, CpuReason, DeviceReport, Engine, ModelPaths};
+pub use engine::{Backend, CpuReason, DeviceReport, Engine, EngineOptions, ModelKind, ModelPaths};
 pub use error::{Error, Result};
 pub use image_io::{LoadedPhoto, load, output_dir_for};
 pub use inpaint::{Progress, WORK_LONG_SIDE};

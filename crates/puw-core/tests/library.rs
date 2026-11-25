@@ -64,7 +64,10 @@ fn save_list_rename_delete() {
 
     lib.rename(&w.id, " Studio 2 ").unwrap();
     assert_eq!(lib.list().unwrap()[0].name, "Studio 2");
-    assert!(lib.rename(&w.id, "   ").is_err());
+    assert!(matches!(
+        lib.rename(&w.id, "   "),
+        Err(Error::InvalidInput(_))
+    ));
     assert_eq!(lib.list().unwrap()[0].name, "Studio 2");
 
     let unknown = "11111111-2222-4333-8444-555555555555";
@@ -137,7 +140,10 @@ fn ids_cannot_escape_dir() {
     let outside = tmp.path().join("x.json");
     std::fs::write(&outside, b"keep").unwrap();
 
-    assert!(lib.rename("../x", "name").is_err());
+    assert!(matches!(
+        lib.rename("../x", "name"),
+        Err(Error::InvalidInput(_))
+    ));
     assert!(lib.delete("../x").is_err());
     assert!(
         lib.save(&entry("n", "2026-01-01T00:00:00Z", "../x", &t))

@@ -19,8 +19,9 @@ use puw_core::mask;
 use puw_core::pipeline::MIN_BATCH_PHOTOS;
 use puw_core::template::{FOUND, UNSURE};
 use puw_core::{
-    Engine, Guess, GuessOptions, LoadedPhoto, Mask, MatchStatus, ModelPaths, Progress, SetLayers,
-    WORK_LONG_SIDE, build_set_layers, build_template, find, guess_photo, load, remove_one,
+    Engine, EngineOptions, Guess, GuessOptions, LoadedPhoto, Mask, MatchStatus, ModelKind,
+    ModelPaths, Progress, SetLayers, WORK_LONG_SIDE, build_set_layers, build_template, find,
+    guess_photo, load, remove_one,
 };
 
 type BoxResult<T> = Result<T, Box<dyn std::error::Error>>;
@@ -164,9 +165,19 @@ fn open_engine(models: Option<PathBuf>, gpu: bool) -> BoxResult<Engine> {
         .or_else(|| std::env::var_os("PUW_MODELS_DIR").map(PathBuf::from))
         .unwrap_or_else(|| PathBuf::from("models"));
     let paths = ModelPaths::from_dir(&dir)?;
+    let engine = Engine::new(
+        &paths,
+        EngineOptions {
+            prefer_gpu: gpu,
+            ..EngineOptions::default()
+        },
+    )?;
+    // Load everything up front so the timings below never include a model load.
     let t = Instant::now();
-    let engine = Engine::new(&paths, gpu, None)?;
-    println!("engine created in {:.2} s", t.elapsed().as_secs_f64());
+    for kind in [ModelKind::Segmenter, ModelKind::Lama, ModelKind::Face] {
+        engine.load(kind)?;
+    }
+    println!("models loaded in {:.2} s", t.elapsed().as_secs_f64());
     let r = engine.report();
     println!(
         "devices: segmenter {:?}, lama {:?}, face {:?}",

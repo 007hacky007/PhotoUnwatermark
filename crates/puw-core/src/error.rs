@@ -7,6 +7,9 @@ pub enum Error {
     Io(#[from] std::io::Error),
     #[error("image error: {0}")]
     Image(String),
+    /// A value passed in by the caller is not acceptable (an empty name, a malformed id).
+    #[error("invalid input: {0}")]
+    InvalidInput(String),
     #[error("model error: {0}")]
     Model(String),
     #[error("the images do not all have the same size")]
