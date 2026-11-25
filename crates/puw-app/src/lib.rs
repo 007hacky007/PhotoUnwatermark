@@ -7,12 +7,16 @@ mod image_cache;
 pub mod images;
 pub mod jobs;
 pub mod messages;
+pub mod output;
 pub mod paths;
 pub mod photos;
 mod session;
 pub mod settings;
 
-pub use crate::core::{AppCore, AreaStatus, DetectOutcome, MatchSummary, PhotoState, Suggestion};
+pub use crate::core::{
+    AppCore, AreaStatus, DetectOutcome, Done, Failed, MatchSummary, OutputCheck, PREVIEW_LONG_SIDE,
+    PhotoState, RemoveReport, SavedInfo, Suggestion, default_watermark_name,
+};
 pub use estimate::{Eta, load_fraction};
 pub use jobs::{Events, LoadPurpose, ProgressEvent};
 pub use messages::{AppError, UserError, user_message};

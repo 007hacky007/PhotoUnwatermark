@@ -167,6 +167,17 @@ pub(crate) struct PhotoData {
     pub included: bool,
     /// Opened in the editor (or saved there) since its result came.
     pub reviewed: bool,
+    /// The last preview, JPEG at edit size.
+    pub preview: Option<Arc<Vec<u8>>>,
+    /// The file the last removal run saved for this photo.
+    pub result: Option<PathBuf>,
+}
+
+/// The photo the set's watermark area was confirmed on, and that area.
+#[derive(Debug, Clone)]
+pub(crate) struct Confirmed {
+    pub path: PathBuf,
+    pub area: Arc<Area>,
 }
 
 /// A photo waiting for matching: id, file and upright size.
@@ -181,7 +192,12 @@ pub(crate) struct Session {
     pub layers_from: HashSet<PhotoId>,
     /// What the confirmed step-2 area looks like, used to find it on the other photos.
     pub template: Option<Arc<WatermarkTemplate>>,
+    /// Where `template` was learned (kept when that photo is removed from the list).
+    pub confirmed: Option<Confirmed>,
     pub data: HashMap<PhotoId, PhotoData>,
+    /// The folder the person chose for the results of this set, when the usual one cannot
+    /// be written.
+    pub output_override: Option<PathBuf>,
 }
 
 impl Session {
@@ -285,9 +301,14 @@ impl Session {
                 d.reviewed = false;
             }
         }
+        let area = Arc::new(Area::from_mask(area));
+        self.confirmed = self.photos.get(id).map(|e| Confirmed {
+            path: e.path.clone(),
+            area: area.clone(),
+        });
         let matched = Matched {
             status: MatchStatus::Found,
-            area: Arc::new(Area::from_mask(area)),
+            area,
         };
         self.set_match(id, matched);
         if let Some(d) = self.data.get_mut(&id) {
@@ -333,7 +354,9 @@ impl Session {
         self.layers = None;
         self.layers_from.clear();
         self.template = None;
+        self.confirmed = None;
         self.data.clear();
+        self.output_override = None;
     }
 }
 

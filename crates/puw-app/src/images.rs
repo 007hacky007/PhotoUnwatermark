@@ -36,7 +36,8 @@ fn fit_long_side(w: u32, h: u32, long: u32) -> (u32, u32) {
     (scale(w), scale(h))
 }
 
-fn shrink(img: &RgbImage, long: u32) -> RgbImage {
+/// `img` with its long side capped at `long` (never enlarged).
+pub(crate) fn shrink(img: &RgbImage, long: u32) -> RgbImage {
     let (w, h) = fit_long_side(img.width(), img.height(), long);
     if (w, h) == img.dimensions() {
         img.clone()

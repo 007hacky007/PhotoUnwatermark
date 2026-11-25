@@ -14,13 +14,16 @@
 //! into `AppCore` (to cancel, say) cannot deadlock either.
 //!
 //! A long call (detection, model loading, the saved-watermark search, matching, adding, removing
-//! or clearing photos, confirming the set area) holds the job slot from start to end, so only one
-//! runs at a time and another one gets [`AppError::Busy`]. It locks the session to copy its
-//! inputs, works without it, and locks it again to store the results (matching stores each
-//! photo's result as soon as it is ready). Because the photo list changes only inside the job
-//! slot, the photos a job read are still there when it stores the results. Everything else (the
-//! photo list, areas, drafts, photo states and edits, images, settings) answers while a job runs;
-//! a match result never replaces an area the person saved for that photo in the meantime.
+//! or clearing photos, confirming the set area, the preview, the removal run, saving the
+//! watermark) holds the job slot from start to end, so only one runs at a time and another one
+//! gets [`AppError::Busy`]. It locks the session to copy its inputs, works without it, and locks
+//! it again to store the results (matching stores each photo's result as soon as it is ready,
+//! and so does the removal run). Because the photo list changes only inside the job slot, the
+//! photos a job read are still there when it stores the results. Everything else (the photo
+//! list, areas, drafts, photo states and edits, images, settings, the saved-watermark list)
+//! answers while a job runs; a match result never replaces an area the person saved for that
+//! photo in the meantime, and the removal run works with the photos and areas it copied when
+//! it started.
 
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
@@ -43,8 +46,12 @@ use crate::photos::{AddResult, PhotoId, PhotoInfo};
 use crate::session::{Draft, Session};
 use crate::{AppError, DataDirs, OutputRule, Result, Settings, load_fraction};
 
+mod remove;
+mod saved;
 mod step3;
 
+pub use remove::{Done, Failed, OutputCheck, PREVIEW_LONG_SIDE, RemoveReport};
+pub use saved::{SavedInfo, default_watermark_name};
 pub use step3::{AreaStatus, MatchSummary, PhotoState};
 
 /// Load speed assumed for a model that was never loaded on this computer.

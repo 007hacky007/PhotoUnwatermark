@@ -55,6 +55,20 @@ pub struct PhotoState {
     /// Its current area is not empty.
     pub has_area: bool,
 }
+
+impl PhotoState {
+    /// Not looked for yet, or ticked while unsure and not opened.
+    pub(crate) fn blocks_removal(&self) -> bool {
+        self.status == AreaStatus::Pending
+            || (self.status == AreaStatus::Unsure && self.included && !self.reviewed)
+    }
+
+    /// Ticked with an area.
+    pub(crate) fn is_to_remove(&self) -> bool {
+        self.included && self.has_area
+    }
+}
+
 impl AppCore {
     /// Finds the set's watermark on every photo that has neither a result nor an area of its
     /// own, reporting [`ProgressEvent::Matching`] (starting with `done: 0`). The set is read
@@ -199,10 +213,7 @@ impl AppCore {
     pub fn removal_blockers(&self) -> Vec<PhotoId> {
         self.photo_states()
             .into_iter()
-            .filter(|st| {
-                st.status == AreaStatus::Pending
-                    || (st.status == AreaStatus::Unsure && st.included && !st.reviewed)
-            })
+            .filter(PhotoState::blocks_removal)
             .map(|st| st.id)
             .collect()
     }
@@ -211,7 +222,7 @@ impl AppCore {
     pub fn to_remove(&self) -> Vec<PhotoId> {
         self.photo_states()
             .into_iter()
-            .filter(|st| st.included && st.has_area)
+            .filter(PhotoState::is_to_remove)
             .map(|st| st.id)
             .collect()
     }
