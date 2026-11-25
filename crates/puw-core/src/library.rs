@@ -10,6 +10,7 @@ use image::RgbImage;
 use serde::{Deserialize, Serialize};
 use std::io::Write;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, Ordering};
 use time::OffsetDateTime;
 use time::format_description::well_known::Rfc3339;
 use uuid::Uuid;
@@ -171,6 +172,16 @@ impl Library {
     /// Look for a saved watermark in the first few `sample` photos. A watermark qualifies if at
     /// least half of the photos tried are `Found`; the best mean confidence wins.
     pub fn suggest(&self, sample: &[&RgbImage]) -> Result<Option<(String, f32)>> {
+        self.suggest_until(sample, &AtomicBool::new(false))
+    }
+
+    /// [`Library::suggest`] that stops with [`Error::Cancelled`] once `stop` is set (checked
+    /// before each photo is searched).
+    pub fn suggest_until(
+        &self,
+        sample: &[&RgbImage],
+        stop: &AtomicBool,
+    ) -> Result<Option<(String, f32)>> {
         let photos = &sample[..sample.len().min(SUGGEST_PHOTOS)];
         if photos.is_empty() {
             return Ok(None);
@@ -178,7 +189,7 @@ impl Library {
         let need = photos.len().div_ceil(2);
         let mut best: Option<(String, f32)> = None;
         for w in self.list()? {
-            let (found, mean) = score(&w.template, photos);
+            let (found, mean) = score(&w.template, photos, stop)?;
             if found >= need && best.as_ref().is_none_or(|(_, b)| mean > *b) {
                 best = Some((w.id, mean));
             }
@@ -188,13 +199,16 @@ impl Library {
 }
 
 /// Number of `Found` photos and the mean confidence over all photos.
-fn score(t: &WatermarkTemplate, photos: &[&RgbImage]) -> (usize, f32) {
+fn score(t: &WatermarkTemplate, photos: &[&RgbImage], stop: &AtomicBool) -> Result<(usize, f32)> {
     let mut found = 0;
     let mut sum = 0.0;
     for img in photos {
+        if stop.load(Ordering::Relaxed) {
+            return Err(Error::Cancelled);
+        }
         let r = find(t, img);
         found += (r.status == MatchStatus::Found) as usize;
         sum += r.confidence;
     }
-    (found, sum / photos.len() as f32)
+    Ok((found, sum / photos.len() as f32))
 }

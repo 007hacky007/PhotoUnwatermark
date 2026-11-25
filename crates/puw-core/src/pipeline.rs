@@ -302,11 +302,92 @@ pub fn match_photo(t: &WatermarkTemplate, img: &RgbImage, layers: &SetLayers) ->
     }
 }
 
+/// How near, as a share of the photo's long side, the detector must come to a pixel of the
+/// batch layer to count as seeing it, and a detector component to the layer to count as part
+/// of the mark it holds: the distance at which components join one piece of a mark in
+/// [`filter_layer`] and in the template (2 %, 30 px at 1536). The layer is the median edge of
+/// the set, the detector's area is the mark's fill grown a little, and the two can lie that
+/// far apart around a thick stroke.
+const LAYER_NEAR_FRAC: f32 = 0.02;
+/// Share of the batch layer the detector must see for the layer to be taken as the mark
+/// itself, so that only detector components near it are kept. Synthetic sets: 1.0 on every
+/// photo of the fixed set (its layer is the mark); 0.0-1.0, mostly below 0.6, where the layer
+/// holds static scene edges and the marks move (random, styles).
+const LAYER_SEEN: f64 = 0.9;
+/// Otherwise detector components are grouped like the pieces of a template (boxes closer than
+/// [`LAYER_NEAR_FRAC`] of the long side) and a group with less than this share of the largest
+/// group's pixels is dropped as a speck. Tiled text is many groups of about the same size, so
+/// it stays. Components near the batch layer are kept whatever their size.
+const SPECK_FRAC: f64 = 0.1;
+
+/// The parts of the detector's `guess` that are the mark, without the specks it also finds on
+/// fur, foliage and stars. See [`LAYER_NEAR_FRAC`], [`LAYER_SEEN`] and [`SPECK_FRAC`]:
+/// - with a non-empty batch `layer` (same size) that the detector sees almost all of, only the
+///   components near the layer are kept;
+/// - otherwise the components near the layer (if any) and every group of at least
+///   [`SPECK_FRAC`] of the largest group are kept.
+fn keep_mark_parts(guess: &Mask, layer: Option<&Mask>) -> Mask {
+    let (w, h) = guess.dimensions();
+    let comps = mask::components(guess);
+    if comps.len() <= 1 {
+        return guess.clone();
+    }
+    let long = w.max(h) as f32;
+    let near = (LAYER_NEAR_FRAC * long).round() as u32;
+    let layer = layer.filter(|l| l.dimensions() == (w, h) && !is_empty(l));
+    let mut keep = vec![false; comps.len()];
+    let mut seen = false;
+    if let Some(l) = layer {
+        let around = mask::dilate(l, near);
+        for (k, c) in keep.iter_mut().zip(&comps) {
+            let (ox, oy) = (c.bbox.left() as u32, c.bbox.top() as u32);
+            *k = c
+                .mask
+                .enumerate_pixels()
+                .any(|(x, y, p)| p.0[0] != 0 && around.get_pixel(ox + x, oy + y).0[0] != 0);
+        }
+        drop(around);
+        let reach = mask::dilate(guess, near);
+        let (mut all, mut hit) = (0u64, 0u64);
+        for (p, r) in l.as_raw().iter().zip(reach.as_raw()) {
+            if *p != 0 {
+                all += 1;
+                hit += (*r != 0) as u64;
+            }
+        }
+        seen = hit as f64 >= LAYER_SEEN * all as f64;
+    }
+    if !seen {
+        let groups = mask::group_near(&comps, LAYER_NEAR_FRAC * long);
+        let sizes: Vec<u64> = groups
+            .iter()
+            .map(|g| g.iter().map(|&i| u64::from(comps[i].pixels)).sum())
+            .collect();
+        let most = sizes.iter().copied().max().unwrap_or(0);
+        for (g, &size) in groups.iter().zip(&sizes) {
+            if size as f64 >= SPECK_FRAC * most as f64 {
+                g.iter().for_each(|&i| keep[i] = true);
+            }
+        }
+    }
+    let mut out = Mask::new(w, h);
+    for c in comps.iter().zip(&keep).filter(|(_, k)| **k).map(|(c, _)| c) {
+        let (ox, oy) = (c.bbox.left() as u32, c.bbox.top() as u32);
+        for (x, y, p) in c.mask.enumerate_pixels() {
+            if p.0[0] != 0 {
+                out.put_pixel(ox + x, oy + y, *p);
+            }
+        }
+    }
+    out
+}
+
 /// Automatic first guess for one photo.
 ///
-/// [`guess_single`], then the face guard ([`detect_faces_near`]), the union with the batch
-/// layer of the photo's size from `layers` (if any) and growth by [`mask::grow_for`] with
-/// `opts.grow_frac`. The guard runs before growth ([`drop_eye_components`]) and after it
+/// [`guess_single`] with its specks dropped ([`keep_mark_parts`], which keeps only what is near
+/// the batch layer when the layer is the mark), then the face guard ([`detect_faces_near`]),
+/// the union with the batch layer of the photo's size from `layers` (if any) and growth by
+/// [`mask::grow_for`] with `opts.grow_frac`. The guard runs before growth ([`drop_eye_components`]) and after it
 /// ([`guard`]), so growth never fills an eye, and the batch layer is the only thing it keeps
 /// in an eye.
 ///
@@ -322,6 +403,10 @@ pub fn guess_photo(
     let (w, h) = img.dimensions();
     let layer = layers.get(w, h);
     let single = guess_single(engine, img, opts)?;
+    let single = Guess {
+        mask: keep_mark_parts(&single.mask, layer),
+        ..single
+    };
     let near = match layer {
         Some(l) => mask::union(&single.mask, l),
         None => single.mask.clone(),
@@ -442,6 +527,98 @@ mod tests {
             })
             .map(|(x, y, _)| (x, y))
             .collect()
+    }
+
+    /// Sets the pixels of the rectangle `x0..x1` x `y0..y1`.
+    fn rect(m: &mut Mask, x0: u32, y0: u32, x1: u32, y1: u32) {
+        for y in y0..y1 {
+            for x in x0..x1 {
+                m.put_pixel(x, y, Luma([255]));
+            }
+        }
+    }
+
+    fn set_at(m: &Mask, x: u32, y: u32) -> bool {
+        m.get_pixel(x, y).0[0] != 0
+    }
+
+    /// 1000 x 600 (near = 20 px): a mark of 6 letters at y 400..430 and specks all over.
+    fn mark_and_specks() -> (Mask, Mask) {
+        let mut guess = Mask::new(1000, 600);
+        for k in 0..6 {
+            rect(&mut guess, 300 + 40 * k, 400, 330 + 40 * k, 430);
+        }
+        // Specks: far from the mark, each a few pixels, and one big blob of scene.
+        for (x, y) in [(50, 50), (900, 80), (120, 300), (700, 200), (950, 550)] {
+            rect(&mut guess, x, y, x + 4, y + 4);
+        }
+        let mut layer = Mask::new(1000, 600);
+        for k in 0..6 {
+            // The layer holds the letters' edges, a little off the detector's fill.
+            rect(&mut layer, 302 + 40 * k, 398, 328 + 40 * k, 400);
+        }
+        (guess, layer)
+    }
+
+    #[test]
+    fn a_layer_the_detector_sees_keeps_only_what_is_near_it() {
+        let (mut guess, layer) = mark_and_specks();
+        // A large blob far away goes too: the layer says where the mark is.
+        rect(&mut guess, 600, 20, 700, 60);
+        // A part 14 px above the layer, touching neither it nor the mark, is within reach.
+        rect(&mut guess, 300, 380, 320, 384);
+        let kept = keep_mark_parts(&guess, Some(&layer));
+        assert!(
+            set_at(&kept, 310, 410) && set_at(&kept, 510, 410),
+            "mark lost"
+        );
+        assert!(set_at(&kept, 305, 382), "near part lost");
+        for (x, y) in [(51, 51), (901, 81), (650, 40), (951, 551)] {
+            assert!(!set_at(&kept, x, y), "speck at {x},{y} kept");
+        }
+    }
+
+    #[test]
+    fn a_layer_of_scene_keeps_large_parts_and_drops_specks() {
+        let (guess, _) = mark_and_specks();
+        // A layer far from anything the detector found (a static scene edge).
+        let mut layer = Mask::new(1000, 600);
+        rect(&mut layer, 10, 580, 400, 584);
+        let kept = keep_mark_parts(&guess, Some(&layer));
+        assert!(
+            set_at(&kept, 310, 410) && set_at(&kept, 510, 410),
+            "mark lost"
+        );
+        for (x, y) in [(51, 51), (901, 81), (121, 301)] {
+            assert!(!set_at(&kept, x, y), "speck at {x},{y} kept");
+        }
+        // Without any layer it is the same.
+        assert_eq!(keep_mark_parts(&guess, None), kept);
+        // An empty layer counts as none.
+        assert_eq!(keep_mark_parts(&guess, Some(&Mask::new(1000, 600))), kept);
+    }
+
+    #[test]
+    fn tiled_marks_survive_without_a_layer() {
+        let mut guess = Mask::new(1200, 900);
+        // 12 tiles of text of slightly different sizes, far apart.
+        for (i, (tx, ty)) in (0..4)
+            .flat_map(|c| (0..3).map(move |r| (40 + 290 * c, 60 + 290 * r)))
+            .enumerate()
+        {
+            for k in 0..4 {
+                let x = tx + 30 * k;
+                rect(&mut guess, x, ty, x + 20, ty + 25 + (i as u32 % 5));
+            }
+        }
+        rect(&mut guess, 1180, 880, 1183, 883);
+        let kept = keep_mark_parts(&guess, None);
+        let tiles = (0..4)
+            .flat_map(|c| (0..3).map(move |r| (45 + 290 * c, 65 + 290 * r)))
+            .filter(|&(x, y)| set_at(&kept, x, y))
+            .count();
+        assert_eq!(tiles, 12);
+        assert!(!set_at(&kept, 1181, 881));
     }
 
     #[test]

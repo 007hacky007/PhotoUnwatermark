@@ -168,6 +168,11 @@ fn suggest_matches_fixed_set() {
     assert_eq!(id, w.id);
     assert!(conf >= puw_core::template::FOUND, "conf {conf}");
     assert_eq!(lib.suggest(&[]).unwrap(), None, "empty sample");
+    let stop = std::sync::atomic::AtomicBool::new(true);
+    assert!(matches!(
+        lib.suggest_until(&sample, &stop),
+        Err(puw_core::Error::Cancelled)
+    ));
 }
 
 #[test]

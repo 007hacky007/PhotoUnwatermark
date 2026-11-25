@@ -90,6 +90,11 @@ enum Cmd {
         /// `set-<k>-layer.png`.
         #[arg(long)]
         overlay: Option<PathBuf>,
+        /// Guess every photo, not only the representative sample. With a synthetic set (its
+        /// mask/ folder), every guess also prints its recall of the true mark and the mark's
+        /// own coverage.
+        #[arg(long)]
+        all: bool,
     },
     /// Template-matching scores: a confirmed mark as template, searched in the other photos.
     MatchSweep {
@@ -146,15 +151,21 @@ fn run_cli(cli: Cli) -> BoxResult<()> {
             }
             None => layers_report(&real_sets()?, true),
         },
-        Cmd::Guess { source, overlay } => {
-            let sets = match source.set {
+        Cmd::Guess {
+            source,
+            overlay,
+            all,
+        } => {
+            let (sets, truth) = match source.set {
                 Some(dir) => {
                     let marked = dir.join("marked");
-                    vec![photo_files(if marked.is_dir() { &marked } else { &dir })?]
+                    let masks = dir.join("mask");
+                    let set = photo_files(if marked.is_dir() { &marked } else { &dir })?;
+                    (vec![set], masks.is_dir().then_some(masks))
                 }
-                None => real_sets()?,
+                None => (real_sets()?, None),
             };
-            guess_report(&engine()?, &sets, overlay.as_deref())
+            guess_report(&engine()?, &sets, overlay.as_deref(), all, truth.as_deref())
         }
         Cmd::MatchSweep {
             source,
@@ -587,8 +598,15 @@ fn layers_report(sets: &[Vec<PathBuf>], real: bool) -> BoxResult<()> {
 
 /// `guess`: the first guesses of each set, aggregate numbers only (photos are named by their
 /// position in the set).
-fn guess_report(engine: &Engine, sets: &[Vec<PathBuf>], overlay: Option<&Path>) -> BoxResult<()> {
+fn guess_report(
+    engine: &Engine,
+    sets: &[Vec<PathBuf>],
+    overlay: Option<&Path>,
+    all: bool,
+    truth: Option<&Path>,
+) -> BoxResult<()> {
     let opts = GuessOptions::default();
+    let (mut recalls, mut covs, mut true_covs) = (Vec::new(), Vec::new(), Vec::new());
     for (k, files) in sets.iter().enumerate() {
         let k = k + 1;
         let t = Instant::now();
@@ -605,17 +623,37 @@ fn guess_report(engine: &Engine, sets: &[Vec<PathBuf>], overlay: Option<&Path>) 
                 mask::components(l).len()
             );
         }
-        let sample = representative_sample(files.len());
+        let sample = if all {
+            (0..files.len()).collect()
+        } else {
+            representative_sample(files.len())
+        };
         let t = Instant::now();
         let mut photos = Vec::new();
         let mut guesses = Vec::new();
         for &i in &sample {
             let photo = load_real(&files[i..=i], k)?.remove(0);
             let g = guess_photo(engine, &photo, &layers, &opts)?;
+            let cov = 100.0 * f64::from(mask::coverage(&g.mask));
+            covs.push(cov);
+            let gt = match (truth, files[i].file_name()) {
+                (Some(dir), Some(name)) if dir.join(name).is_file() => {
+                    Some(image::open(dir.join(name))?.to_luma8())
+                }
+                _ => None,
+            };
+            let extra = match gt.as_ref().and_then(|gt| Some((recall(&g.mask, gt)?, gt))) {
+                Some((r, gt)) => {
+                    let tc = 100.0 * f64::from(mask::coverage(gt));
+                    recalls.push(r);
+                    true_covs.push(tc);
+                    format!(", recall {r:.3}, mark coverage {tc:.2} %")
+                }
+                None => String::new(),
+            };
             println!(
-                "  photo {}: coverage {:.2} %, confidence {:.3}",
+                "  photo {}: coverage {cov:.2} %, confidence {:.3}{extra}",
                 i + 1,
-                100.0 * mask::coverage(&g.mask),
                 g.confidence
             );
             photos.push(photo);
@@ -637,6 +675,11 @@ fn guess_report(engine: &Engine, sets: &[Vec<PathBuf>], overlay: Option<&Path>) 
                 l.save(dir.join(format!("set-{k}-layer.png")))?;
             }
         }
+    }
+    println!("guess coverage %:    {}", summary(&covs, 2));
+    if !recalls.is_empty() {
+        println!("recall:              {}", summary(&recalls, 3));
+        println!("mark coverage %:     {}", summary(&true_covs, 2));
     }
     Ok(())
 }
