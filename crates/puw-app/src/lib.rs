@@ -3,6 +3,7 @@
 pub mod core;
 pub mod download;
 pub mod estimate;
+mod image_cache;
 pub mod images;
 pub mod jobs;
 pub mod messages;

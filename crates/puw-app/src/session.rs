@@ -70,10 +70,12 @@ impl Session {
         d.guess.clone().map(Area::Mask)
     }
 
-    /// Replaces every step-2 guess with `guesses`.
+    /// Replaces every step-2 guess with `guesses` and drops every draft, so a draft drawn on
+    /// an earlier guess can never stand in for the area shown now.
     pub fn set_guesses(&mut self, guesses: Vec<(PhotoId, Mask)>) {
         for d in self.data.values_mut() {
             d.guess = None;
+            d.draft = None;
         }
         for (id, mask) in guesses {
             self.data.entry(id).or_default().guess = Some(Arc::new(mask));

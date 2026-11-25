@@ -3,7 +3,7 @@
 //! # Locking
 //!
 //! `AppCore` has these locks, each held only for a few field reads or writes:
-//! the job slot, `settings`, `engine`, `session`, `thumbs` and `edits`. No lock is held while a
+//! the job slot, `settings`, `engine`, `session` and the two image caches (`image_cache`). No lock is held while a
 //! photo is read, a model loads or runs, an image is encoded, or progress is reported. The only
 //! nesting is `engine` -> `settings` (reading `prefer_gpu` while the engine is created); nothing
 //! takes them the other way round, so the locks cannot deadlock.
@@ -16,7 +16,6 @@
 //! results. Everything else (the photo list, areas, drafts, images, settings) answers while a job
 //! runs.
 
-use std::collections::VecDeque;
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 use std::time::Instant;
@@ -31,7 +30,8 @@ use puw_core::{
 use serde::Serialize;
 
 use crate::download::model_assets;
-use crate::images::{self, THUMB_LONG_SIDE, area_from_edit, area_to_edit, jpeg};
+use crate::image_cache::ImageCache;
+use crate::images::{self, area_from_edit, area_to_edit};
 use crate::jobs::{Events, Job, JobSlot, LoadPurpose, ProgressEvent, with_ticker};
 use crate::photos::{AddResult, PhotoId, PhotoInfo};
 use crate::session::{Draft, Session};
@@ -41,12 +41,6 @@ use crate::{AppError, DataDirs, OutputRule, Result, Settings, load_fraction};
 const LOAD_BYTES_PER_SECOND: f32 = 20_000_000.0;
 /// Photos a saved watermark is tried on before it is offered.
 const SUGGEST_PHOTOS: usize = 5;
-/// Thumbnails kept in memory.
-const THUMB_CACHE: usize = 512;
-/// Edit images kept in memory.
-const EDIT_CACHE: usize = 4;
-const THUMB_QUALITY: u8 = 85;
-const EDIT_QUALITY: u8 = 90;
 
 /// The photos the step-2 editor can show, and the one it opens first.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
@@ -64,9 +58,6 @@ pub struct Suggestion {
     pub name: String,
 }
 
-/// The photos of a sample, and what was found on each one that could be read.
-type Looked<T> = (Vec<PhotoId>, Vec<(PhotoId, T)>);
-
 /// The app's session: settings, engine, photos, areas and cached images.
 pub struct AppCore {
     dirs: DataDirs,
@@ -74,8 +65,7 @@ pub struct AppCore {
     settings: Mutex<Settings>,
     engine: Mutex<Option<Arc<Engine>>>,
     session: Mutex<Session>,
-    thumbs: Mutex<JpegCache>,
-    edits: Mutex<JpegCache>,
+    images: ImageCache,
 }
 
 fn lock<T>(m: &Mutex<T>) -> MutexGuard<'_, T> {
@@ -121,8 +111,7 @@ impl AppCore {
             settings: Mutex::new(settings),
             engine: Mutex::new(None),
             session: Mutex::new(Session::default()),
-            thumbs: Mutex::new(JpegCache::new(THUMB_CACHE)),
-            edits: Mutex::new(JpegCache::new(EDIT_CACHE)),
+            images: ImageCache::new(),
         })
     }
 
@@ -200,8 +189,7 @@ impl AppCore {
     pub fn remove_photo(&self, id: PhotoId) -> Result<()> {
         let _job = self.jobs.start()?;
         self.session().remove(id);
-        lock(&self.thumbs).remove(id);
-        lock(&self.edits).remove(id);
+        self.images.remove(id);
         Ok(())
     }
 
@@ -209,8 +197,7 @@ impl AppCore {
     pub fn clear_photos(&self) -> Result<()> {
         let _job = self.jobs.start()?;
         self.session().clear();
-        lock(&self.thumbs).clear();
-        lock(&self.edits).clear();
+        self.images.clear();
         Ok(())
     }
 
@@ -343,8 +330,9 @@ impl AppCore {
         }))
     }
 
-    /// Finds the watermark on a few photos ([`representative_sample`]) after loading the
-    /// detection models and reading the set. The guesses become those photos' areas.
+    /// Finds the watermark on a few photos ([`representative_sample`], leaving out any that
+    /// cannot be read) after loading the detection models and reading the set. The guesses
+    /// become those photos' areas; every step-2 guess and draft from before is dropped.
     pub fn detect(&self, ev: Events) -> Result<DetectOutcome> {
         let job = self.jobs.start()?;
         let (ids, paths) = self.photo_files();
@@ -365,19 +353,18 @@ impl AppCore {
         let layers = build_set_layers(&paths, &progress)?;
 
         let opts = GuessOptions::default();
-        let (sample, guessed) = self.look_at_sample(&job, &ids, &paths, ev, |photo| {
+        let looked = self.look_at_sample(&job, &ids, &paths, ev, |photo| {
             guess_photo(&engine, photo, &layers, &opts)
         })?;
-        let (guessed, guesses): (Vec<PhotoId>, Vec<Guess>) = guessed.into_iter().unzip();
-        let representative = guessed
-            .get(pick_representative(&guesses))
-            .map_or(sample[0], |id| *id);
+        let (sample, guesses): (Vec<PhotoId>, Vec<Guess>) = looked.into_iter().unzip();
+        let representative = sample[pick_representative(&guesses)];
 
         let mut s = self.session();
         s.layers = Some(Arc::new(layers));
         s.set_guesses(
-            guessed
-                .into_iter()
+            sample
+                .iter()
+                .copied()
                 .zip(guesses.into_iter().map(|g| g.mask))
                 .collect(),
         );
@@ -388,7 +375,8 @@ impl AppCore {
     }
 
     /// Looks for saved watermark `id` on the same photos [`AppCore::detect`] would use, without
-    /// any model. The best `Found` photo comes first, else the first photo.
+    /// any model. The best `Found` photo comes first, else the first photo. Like `detect`, it
+    /// replaces every step-2 guess and drops every draft.
     pub fn use_saved(&self, id: &str, ev: Events) -> Result<DetectOutcome> {
         let job = self.jobs.start()?;
         let saved = Library::open(&self.dirs.watermarks)?
@@ -400,9 +388,10 @@ impl AppCore {
         if ids.is_empty() {
             return Err(not_found("no photos to look at"));
         }
-        let (sample, results) = self.look_at_sample(&job, &ids, &paths, ev, |p| {
+        let results = self.look_at_sample(&job, &ids, &paths, ev, |p| {
             Ok(find(&saved.template, &p.rgb))
         })?;
+        let sample: Vec<PhotoId> = results.iter().map(|(id, _)| *id).collect();
         let representative = results
             .iter()
             .filter(|(_, r)| r.status == MatchStatus::Found)
@@ -418,7 +407,8 @@ impl AppCore {
     }
 
     /// Runs `look` on each photo of the [`representative_sample`], one at a time, reporting
-    /// [`ProgressEvent::Looking`]. A photo that cannot be read is left out, unless none can.
+    /// [`ProgressEvent::Looking`]. A photo that cannot be read is left out; when none can be
+    /// read, the first one's error is returned. Never empty.
     fn look_at_sample<T>(
         &self,
         job: &Job,
@@ -426,7 +416,7 @@ impl AppCore {
         paths: &[PathBuf],
         ev: Events,
         look: impl Fn(&puw_core::LoadedPhoto) -> puw_core::Result<T>,
-    ) -> Result<Looked<T>> {
+    ) -> Result<Vec<(PhotoId, T)>> {
         let picks = representative_sample(ids.len());
         let total = picks.len() as u32;
         ev(ProgressEvent::Looking { done: 0, total });
@@ -443,10 +433,10 @@ impl AppCore {
                 total,
             });
         }
-        if let (true, Some(e)) = (found.is_empty(), unreadable) {
-            return Err(e.into());
+        match unreadable {
+            Some(e) if found.is_empty() => Err(e.into()),
+            _ => Ok(found),
         }
-        Ok((picks.iter().map(|&i| ids[i]).collect(), found))
     }
 
     /// Size of the image the area of photo `id` is drawn on.
@@ -535,97 +525,20 @@ impl AppCore {
         self.session().template.clone()
     }
 
-    /// Small JPEG of photo `id` (long side [`THUMB_LONG_SIDE`]).
+    /// Small JPEG of photo `id` (long side [`images::THUMB_LONG_SIDE`]), kept in memory.
     pub fn thumb_image(&self, id: PhotoId) -> Result<Vec<u8>> {
-        self.cached(&self.thumbs, id, |path| {
-            Ok(jpeg(
-                &images::thumbnail(path, THUMB_LONG_SIDE)?,
-                THUMB_QUALITY,
-            ))
-        })
+        self.images.thumb(id, &self.photo_path(id)?)
     }
 
-    /// JPEG of photo `id` at edit size, the image the area is drawn on.
+    /// JPEG of photo `id` at edit size, the image the area is drawn on, kept in memory.
     pub fn edit_image(&self, id: PhotoId) -> Result<Vec<u8>> {
-        self.cached(&self.edits, id, |path| {
-            Ok(jpeg(&images::edit_image(&load(path)?), EDIT_QUALITY))
-        })
-    }
-
-    fn cached(
-        &self,
-        cache: &Mutex<JpegCache>,
-        id: PhotoId,
-        make: impl FnOnce(&std::path::Path) -> Result<Vec<u8>>,
-    ) -> Result<Vec<u8>> {
-        let path = self.photo_path(id)?;
-        if let Some(hit) = lock(cache).get(id) {
-            return Ok(hit.to_vec());
-        }
-        let bytes = Arc::new(make(&path)?);
-        lock(cache).put(id, bytes.clone());
-        Ok(bytes.to_vec())
-    }
-}
-
-/// The most recently used JPEGs, by photo.
-struct JpegCache {
-    cap: usize,
-    items: VecDeque<(PhotoId, Arc<Vec<u8>>)>,
-}
-
-impl JpegCache {
-    fn new(cap: usize) -> JpegCache {
-        JpegCache {
-            cap,
-            items: VecDeque::new(),
-        }
-    }
-
-    fn get(&mut self, id: PhotoId) -> Option<Arc<Vec<u8>>> {
-        let i = self.items.iter().position(|(k, _)| *k == id)?;
-        let item = self.items.remove(i)?;
-        let bytes = item.1.clone();
-        self.items.push_back(item);
-        Some(bytes)
-    }
-
-    fn put(&mut self, id: PhotoId, bytes: Arc<Vec<u8>>) {
-        self.remove(id);
-        self.items.push_back((id, bytes));
-        while self.items.len() > self.cap {
-            self.items.pop_front();
-        }
-    }
-
-    fn remove(&mut self, id: PhotoId) {
-        self.items.retain(|(k, _)| *k != id);
-    }
-
-    fn clear(&mut self) {
-        self.items.clear();
+        self.images.edit(id, &self.photo_path(id)?)
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn cache_keeps_most_recently_used() {
-        let mut c = JpegCache::new(2);
-        let b = |v: u8| Arc::new(vec![v]);
-        c.put(1, b(1));
-        c.put(2, b(2));
-        assert!(c.get(1).is_some());
-        c.put(3, b(3));
-        assert!(c.get(2).is_none());
-        assert_eq!(c.get(1).unwrap().as_slice(), &[1]);
-        assert_eq!(c.get(3).unwrap().as_slice(), &[3]);
-        c.put(3, b(4));
-        assert_eq!(c.items.len(), 2);
-        assert_eq!(c.get(3).unwrap().as_slice(), &[4]);
-    }
 
     #[test]
     fn spread_is_even() {

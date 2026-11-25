@@ -260,6 +260,27 @@ fn cancel_detect() {
     assert_eq!(out.sample.len(), 3);
 }
 
+/// Saves "Studio", learned from the ground truth of the fixed set's first photo.
+fn save_fixed_watermark(dirs: &DataDirs) -> SavedWatermark {
+    let marked = image::open(fixed().join("marked/00.png"))
+        .unwrap()
+        .to_rgb8();
+    let t = build_template(&marked, &ground_truth("00.png"));
+    let w = SavedWatermark::new("Studio", t, jpeg(&RgbImage::new(4, 4), 80));
+    Library::open(&dirs.watermarks).unwrap().save(&w).unwrap();
+    w
+}
+
+/// The fixed set's marked photos copied into a folder of their own, so files can be spoiled.
+fn copy_fixed() -> tempfile::TempDir {
+    let dir = tempfile::tempdir().unwrap();
+    for e in std::fs::read_dir(fixed().join("marked")).unwrap() {
+        let p = e.unwrap().path();
+        std::fs::copy(&p, dir.path().join(p.file_name().unwrap())).unwrap();
+    }
+    dir
+}
+
 #[test]
 fn use_saved_skips_models() {
     // Without PUW_MODELS_DIR the models folder is empty, so loading any model would fail.
@@ -267,12 +288,7 @@ fn use_saved_skips_models() {
     add_fixed(&f.core);
     assert_eq!(f.core.suggest_saved().unwrap(), None);
 
-    let marked = image::open(fixed().join("marked/00.png"))
-        .unwrap()
-        .to_rgb8();
-    let t = build_template(&marked, &ground_truth("00.png"));
-    let w = SavedWatermark::new("Studio", t, jpeg(&RgbImage::new(4, 4), 80));
-    Library::open(&f.dirs.watermarks).unwrap().save(&w).unwrap();
+    let w = save_fixed_watermark(&f.dirs);
 
     assert_eq!(
         f.core.suggest_saved().unwrap(),
@@ -348,7 +364,10 @@ fn confirm_builds_template() {
         .iter()
         .map(|&v| if v != 0 { 255 } else { 0 })
         .collect();
-    assert_eq!(f.core.area(0).unwrap(), binary);
+    assert!(
+        f.core.area(0).unwrap() == binary,
+        "the confirmed area is not the draft"
+    );
 
     // Confirming another photo replaces the set area and clears the earlier result.
     let gt2 = ground_truth(&name_of(&f.core, 2));
@@ -482,4 +501,78 @@ fn images_served_during_job() {
         assert!(!job.is_finished(), "the job was still running");
         job.join().unwrap().unwrap();
     });
+}
+
+#[test]
+fn new_guesses_drop_stale_drafts() {
+    let f = fixture(None);
+    add_fixed(&f.core);
+    let w = save_fixed_watermark(&f.dirs);
+    // A draft on photo 1 (in the sample), far from the watermark.
+    let mut draft = vec![0u8; 1536 * 1024];
+    for y in 0..100 {
+        draft[y * 1536..y * 1536 + 100].fill(255);
+    }
+    f.core.put_draft(1, 1536, 1024, draft).unwrap();
+
+    let out = f.core.use_saved(&w.id, &noop).unwrap();
+    assert!(out.sample.contains(&1));
+    let shown = f.core.area(1).unwrap();
+    assert!(shown.iter().any(|&v| v != 0));
+    assert!(shown[..100].iter().all(|&v| v == 0));
+
+    // Accepting what is shown, without a new draft, confirms the new guess.
+    f.core.confirm_set_area(1).unwrap();
+    assert!(
+        f.core.area(1).unwrap() == shown,
+        "the confirmed area is not the one shown"
+    );
+    let t = f.core.confirmed_template().unwrap();
+    let other = image::open(fixed().join("marked/05.png"))
+        .unwrap()
+        .to_rgb8();
+    assert_eq!(find(&t, &other).status, MatchStatus::Found);
+}
+
+#[test]
+fn unreadable_sample_photo_is_left_out() {
+    let f = fixture(None);
+    let photos = copy_fixed();
+    f.core.add_paths(&[photos.path().to_path_buf()]).unwrap();
+    let w = save_fixed_watermark(&f.dirs);
+    // The sample of 8 photos is 1, 4 and 6; photo 4 can no longer be read.
+    std::fs::write(photos.path().join("04.png"), b"not a photo").unwrap();
+
+    let rec = Recorder::default();
+    let out = f.core.use_saved(&w.id, &|e| rec.push(e)).unwrap();
+    assert_eq!(out.sample, vec![1, 6]);
+    assert!(out.sample.contains(&out.representative));
+    assert!(
+        rec.events()
+            .contains(&ProgressEvent::Looking { done: 3, total: 3 })
+    );
+    assert!(f.core.area(4).unwrap().iter().all(|&v| v == 0));
+
+    // With no readable photo in the sample the search fails with a plain sentence.
+    for name in ["01.png", "06.png"] {
+        std::fs::remove_file(photos.path().join(name)).unwrap();
+    }
+    let err = f.core.use_saved(&w.id, &noop).unwrap_err();
+    let m = user_message(&err);
+    assert!(
+        m == "The photo could not be opened. The file may be damaged."
+            || m == "The photo could not be found. It may have been moved or deleted.",
+        "{m}"
+    );
+}
+
+#[test]
+fn detect_leaves_out_unreadable_photo() {
+    let Some(f) = model_fixture() else { return };
+    let photos = copy_fixed();
+    f.core.add_paths(&[photos.path().to_path_buf()]).unwrap();
+    std::fs::write(photos.path().join("04.png"), b"not a photo").unwrap();
+    let out = f.core.detect(&noop).unwrap();
+    assert_eq!(out.sample, vec![1, 6]);
+    assert!(out.sample.contains(&out.representative));
 }
