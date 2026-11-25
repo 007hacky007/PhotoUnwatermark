@@ -261,7 +261,7 @@ fn removes_into_output_folder() {
     for d in &report.done {
         assert_eq!(
             Path::new(&d.output).parent().unwrap(),
-            fs::canonicalize(&out).unwrap()
+            puw_app::photos::real_path(&out).unwrap()
         );
     }
     assert_eq!(bytes_of(&paths), before, "an original changed");
@@ -500,7 +500,7 @@ fn unwritable_source_asks_for_folder() {
     assert!(!check.ok);
     assert_eq!(
         check.unwritable,
-        [fs::canonicalize(&card)
+        [puw_app::photos::real_path(&card)
             .unwrap()
             .to_string_lossy()
             .into_owned()]
