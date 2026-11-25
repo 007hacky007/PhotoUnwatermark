@@ -14,6 +14,33 @@ use crate::messages::{AppError, user_message};
 
 pub type PhotoId = u32;
 
+/// Why a photo in the list cannot be used: it was found, when it was read, to be gone or
+/// impossible to open (its header read fine when it was added).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub enum Problem {
+    /// The file is no longer there (moved or deleted after it was added).
+    Gone,
+    /// The file is there but cannot be opened (damaged, cut short, not readable).
+    Damaged,
+}
+
+impl Problem {
+    /// The problem a failed read of a photo shows, or `None` for an error that says nothing
+    /// about the file (stopped, a model that failed, ...).
+    pub fn of(e: &AppError) -> Option<Problem> {
+        match e {
+            AppError::Core(Error::Io(io)) if io.kind() == std::io::ErrorKind::NotFound => {
+                Some(Problem::Gone)
+            }
+            AppError::Core(
+                Error::Io(_) | Error::Image(_) | Error::Incomplete(_) | Error::UnsupportedFormat(_),
+            ) => Some(Problem::Damaged),
+            _ => None,
+        }
+    }
+}
+
 /// What the interface shows about a photo. Width and height are the upright size.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -23,6 +50,8 @@ pub struct PhotoInfo {
     pub folder: String,
     pub width: u32,
     pub height: u32,
+    /// Set once reading the photo failed; such a photo is never worked on.
+    pub problem: Option<Problem>,
 }
 
 #[derive(Debug, Clone)]
@@ -271,6 +300,7 @@ impl PhotoList {
                         folder: path.parent().map(file_name).unwrap_or_default(),
                         width,
                         height,
+                        problem: None,
                     };
                     self.next_id += 1;
                     result.added.push(info.clone());
@@ -287,6 +317,13 @@ impl PhotoList {
 
     pub fn remove(&mut self, id: PhotoId) {
         self.entries.retain(|e| e.info.id != id);
+    }
+
+    /// Notes that photo `id` turned out to be gone or impossible to open.
+    pub fn set_problem(&mut self, id: PhotoId, problem: Problem) {
+        if let Some(e) = self.entries.iter_mut().find(|e| e.info.id == id) {
+            e.info.problem = Some(problem);
+        }
     }
 
     pub fn clear(&mut self) {

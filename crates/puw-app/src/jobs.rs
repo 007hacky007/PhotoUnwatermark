@@ -1,8 +1,15 @@
 //! Long jobs: one at a time, each with its own cancel flag, and the progress events they send.
+//!
+//! The interface gives each job it starts a ticket (a number) and cancels by ticket, so a stop
+//! meant for one job never reaches the next one. A job started while a cancelled one is still
+//! finishing (a model load cannot be interrupted, say) waits for it instead of failing with
+//! [`AppError::Busy`]; only a job that runs on, not cancelled, makes the next one busy.
 
+use std::cell::Cell;
+use std::collections::VecDeque;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{self, RecvTimeoutError};
-use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
+use std::sync::{Arc, Condvar, Mutex, MutexGuard, PoisonError};
 use std::time::{Duration, Instant};
 
 use puw_core::Error;
@@ -66,10 +73,47 @@ fn lock<T>(m: &Mutex<T>) -> MutexGuard<'_, T> {
     m.lock().unwrap_or_else(PoisonError::into_inner)
 }
 
-/// The one place a long job may run. The lock is held only to start, cancel or end a job.
+thread_local! {
+    /// The ticket of the call running on this thread, see [`with_ticket`].
+    static TICKET: Cell<Option<u64>> = const { Cell::new(None) };
+}
+
+/// Runs `f` (an [`crate::AppCore`] call) as the job with `ticket`: a job it starts can be
+/// cancelled by that ticket ([`crate::AppCore::cancel_ticket`]).
+pub fn with_ticket<T>(ticket: Option<u64>, f: impl FnOnce() -> T) -> T {
+    struct Reset(Option<u64>);
+    impl Drop for Reset {
+        fn drop(&mut self) {
+            TICKET.with(|t| t.set(self.0));
+        }
+    }
+    let _reset = Reset(TICKET.with(|t| t.replace(ticket)));
+    f()
+}
+
+/// Tickets cancelled before their job started that are remembered.
+const EARLY_CANCELS: usize = 32;
+
+#[derive(Debug)]
+struct Running {
+    cancel: Arc<AtomicBool>,
+    ticket: Option<u64>,
+}
+
+#[derive(Debug, Default)]
+struct SlotState {
+    current: Option<Running>,
+    /// Tickets cancelled when no job of theirs ran: a job that starts with one of them stops
+    /// at once (its cancel overtook it).
+    early: VecDeque<u64>,
+}
+
+/// The one place a long job may run. The lock is held only to start, cancel or end a job (and
+/// while waiting for a cancelled one to end).
 #[derive(Debug, Default)]
 pub(crate) struct JobSlot {
-    current: Mutex<Option<Arc<AtomicBool>>>,
+    state: Mutex<SlotState>,
+    ended: Condvar,
 }
 
 /// A running job; the slot is free again when this is dropped.
@@ -79,21 +123,58 @@ pub(crate) struct Job<'a> {
 }
 
 impl JobSlot {
-    /// Starts a job, or fails with [`AppError::Busy`] while another one runs.
+    /// Starts a job with the ticket of this call ([`with_ticket`]). While a cancelled job is
+    /// still finishing it waits for that job's end; while one runs that was not cancelled it
+    /// fails with [`AppError::Busy`]. A ticket that was cancelled before its job started gives
+    /// [`Error::Cancelled`].
     pub fn start(&self) -> Result<Job<'_>> {
-        let mut current = lock(&self.current);
-        if current.is_some() {
-            return Err(AppError::Busy);
+        let ticket = TICKET.with(Cell::get);
+        let mut state = lock(&self.state);
+        loop {
+            if let Some(t) = ticket
+                && let Some(i) = state.early.iter().position(|&e| e == t)
+            {
+                state.early.remove(i);
+                return Err(Error::Cancelled.into());
+            }
+            match &state.current {
+                None => break,
+                Some(r) if r.cancel.load(Ordering::Relaxed) => {
+                    state = self
+                        .ended
+                        .wait(state)
+                        .unwrap_or_else(PoisonError::into_inner);
+                }
+                Some(_) => return Err(AppError::Busy),
+            }
         }
         let cancel = Arc::new(AtomicBool::new(false));
-        *current = Some(cancel.clone());
+        state.current = Some(Running {
+            cancel: cancel.clone(),
+            ticket,
+        });
         Ok(Job { slot: self, cancel })
     }
 
-    /// Asks the running job, if any, to stop.
+    /// Asks the running job, whatever it is, to stop.
     pub fn cancel(&self) {
-        if let Some(flag) = lock(&self.current).as_ref() {
-            flag.store(true, Ordering::Relaxed);
+        if let Some(r) = lock(&self.state).current.as_ref() {
+            r.cancel.store(true, Ordering::Relaxed);
+        }
+    }
+
+    /// Asks the job with `ticket` to stop: the running one when it has that ticket, else the
+    /// job with that ticket when it starts later. Any other job runs on.
+    pub fn cancel_ticket(&self, ticket: u64) {
+        let mut state = lock(&self.state);
+        match &state.current {
+            Some(r) if r.ticket == Some(ticket) => r.cancel.store(true, Ordering::Relaxed),
+            _ => {
+                if state.early.len() == EARLY_CANCELS {
+                    state.early.pop_front();
+                }
+                state.early.push_back(ticket);
+            }
         }
     }
 }
@@ -114,7 +195,8 @@ impl Job<'_> {
 
 impl Drop for Job<'_> {
     fn drop(&mut self) {
-        *lock(&self.slot.current) = None;
+        lock(&self.slot.state).current = None;
+        self.slot.ended.notify_all();
     }
 }
 
@@ -161,6 +243,48 @@ mod tests {
         slot.cancel();
         assert!(matches!(job.check(), Err(AppError::Core(Error::Cancelled))));
         drop(job);
+        assert!(slot.start().unwrap().check().is_ok());
+    }
+
+    #[test]
+    fn a_cancelled_job_is_waited_for_not_busy() {
+        let slot = Arc::new(JobSlot::default());
+        let job = slot.start().unwrap();
+        slot.cancel();
+        let (tx, rx) = mpsc::channel();
+        std::thread::scope(|s| {
+            s.spawn(|| {
+                let next = slot.start().map(|_| ());
+                tx.send(next.is_ok()).unwrap();
+            });
+            // The new job waits while the cancelled one finishes.
+            assert!(rx.recv_timeout(Duration::from_millis(200)).is_err());
+            drop(job);
+            assert!(rx.recv_timeout(Duration::from_secs(5)).unwrap());
+        });
+    }
+
+    #[test]
+    fn cancel_by_ticket_reaches_only_that_job() {
+        let slot = JobSlot::default();
+        // Job 1 ran and ended; its late cancel must not stop job 2.
+        drop(with_ticket(Some(1), || slot.start()).unwrap());
+        let two = with_ticket(Some(2), || slot.start()).unwrap();
+        slot.cancel_ticket(1);
+        assert!(two.check().is_ok());
+        slot.cancel_ticket(2);
+        assert!(matches!(two.check(), Err(AppError::Core(Error::Cancelled))));
+        drop(two);
+        // A cancel that overtakes its job's start stops it at once, and only it.
+        slot.cancel_ticket(4);
+        let three = with_ticket(Some(3), || slot.start()).unwrap();
+        assert!(three.check().is_ok());
+        drop(three);
+        assert!(matches!(
+            with_ticket(Some(4), || slot.start()),
+            Err(AppError::Core(Error::Cancelled))
+        ));
+        // The ticket only counts for the call it wraps.
         assert!(slot.start().unwrap().check().is_ok());
     }
 

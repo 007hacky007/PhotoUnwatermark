@@ -15,6 +15,7 @@ use std::time::{Duration, Instant};
 
 use image::{GrayImage, Rgb, RgbImage};
 use puw_app::images::{GRID_LONG_SIDE, jpeg, thumbnail};
+use puw_app::photos::Problem;
 use puw_app::{
     AppCore, AppError, AreaStatus, DataDirs, LoadPurpose, MatchSummary, PhotoState, ProgressEvent,
     Settings, Suggestion, user_message,
@@ -178,6 +179,50 @@ fn detect_fixed_set() {
     );
     eprintln!("representative {rep} covers {share:.3} of its watermark");
     assert!(share >= 0.8, "covers {share:.3}");
+}
+
+/// The first guess, confirmed as it is (no editing), is found on every photo of the fixed set,
+/// and once saved it is offered for the same photos, quickly.
+#[test]
+fn first_guess_matches_fixed_set_and_is_offered() {
+    let Some(f) = model_fixture() else { return };
+    add_fixed(&f.core);
+    let out = f.core.detect(&noop).unwrap();
+    f.core.confirm_set_area(out.representative).unwrap();
+    let sum = f.core.match_all(&noop).unwrap();
+    eprintln!("first guess as the set area: {sum:?}");
+    assert_eq!(sum.found, 8, "{sum:?}");
+
+    let id = f.core.save_watermark("From the guess").unwrap();
+    f.core.clear_photos().unwrap();
+    add_fixed(&f.core);
+    let start = Instant::now();
+    let offer = f.core.suggest_saved().unwrap();
+    let secs = start.elapsed().as_secs_f32();
+    eprintln!("saved-watermark offer in {secs:.1} s");
+    assert_eq!(offer.map(|s| s.id), Some(id));
+    assert!(secs < 30.0, "{secs:.1} s");
+}
+
+/// Model files that are gone are missing app data (download again), not a photo problem.
+#[test]
+fn missing_models_are_missing_data() {
+    let f = fixture(None);
+    add_fixed(&f.core);
+    let err = f.core.detect(&noop).unwrap_err();
+    assert!(matches!(err, AppError::MissingModels(_)), "{err:?}");
+    let u = puw_app::UserError::from(err);
+    assert!(u.missing_data);
+    assert!(!u.message.contains("photo"), "{}", u.message);
+
+    // A file deleted after the engine was made is reported the same way.
+    for a in puw_app::download::model_assets() {
+        std::fs::write(f.dirs.models.join(a.name), b"x").unwrap();
+    }
+    f.core.engine().unwrap();
+    std::fs::remove_file(f.dirs.models.join("segmenter.onnx")).unwrap();
+    let err = f.core.detect(&noop).unwrap_err();
+    assert!(matches!(err, AppError::MissingModels(_)), "{err:?}");
 }
 
 #[test]
@@ -569,6 +614,46 @@ fn unreadable_sample_photo_is_left_out() {
     );
 }
 
+/// A photo cut short after it was added, and one deleted: both are "cannot be read" (with
+/// why), never ticked, never counted as not found, and they do not hold up removal.
+#[test]
+fn unreadable_photos_get_their_own_state() {
+    let f = fixture(None);
+    let photos = copy_fixed();
+    f.core.add_paths(&[photos.path().to_path_buf()]).unwrap();
+    let bytes = std::fs::read(photos.path().join("02.png")).unwrap();
+    std::fs::write(photos.path().join("02.png"), &bytes[..bytes.len() / 3]).unwrap();
+    std::fs::remove_file(photos.path().join("05.png")).unwrap();
+    // The thumbnail of the cut-short photo fails and says so.
+    assert!(f.core.thumb_image(2).is_err());
+    let problem = |id: u32| {
+        f.core
+            .photos()
+            .into_iter()
+            .find(|p| p.id == id)
+            .unwrap()
+            .problem
+    };
+    assert_eq!(problem(2), Some(Problem::Damaged));
+    assert_eq!(problem(5), None);
+
+    confirm_truth(&f.core, "fixed", "00", 0);
+    let sum = f.core.match_all(&noop).unwrap();
+    assert_eq!(problem(2), Some(Problem::Damaged));
+    assert_eq!(problem(5), Some(Problem::Gone));
+    for id in [2, 5] {
+        let st = state(&f.core, id);
+        assert_eq!(st.status, AreaStatus::Unreadable);
+        assert!(!st.included && !st.has_area);
+        assert!(f.core.set_included(id, true).is_err());
+    }
+    assert_eq!(sum.found + sum.unsure + sum.not_found, 6, "{sum:?}");
+    assert_eq!(sum.total, 8);
+    assert!(!f.core.removal_blockers().contains(&2));
+    assert!(!f.core.removal_blockers().contains(&5));
+    assert!(!f.core.to_remove().contains(&2));
+}
+
 #[test]
 fn detect_leaves_out_unreadable_photo() {
     let Some(f) = model_fixture() else { return };
@@ -788,7 +873,12 @@ fn unsure_blocks_until_opened_or_unticked() {
     assert!(f.core.removal_blockers().is_empty());
     assert_eq!(f.core.to_remove(), vec![five, ten]);
 
-    // Confirming the set area again starts over: the photo needs a look again.
+    // Confirming a changed set area starts over: the photo needs a look again. (The same
+    // area again changes nothing, see `unchanged_reconfirm_keeps_step3`.)
+    let (w, h) = f.core.edit_size(five).unwrap();
+    let mut changed = f.core.area(five).unwrap();
+    changed[0] = 255;
+    f.core.put_draft(five, w, h, changed).unwrap();
     f.core.confirm_set_area(five).unwrap();
     assert_eq!(state(&f.core, ten).status, AreaStatus::Pending);
     f.core.match_all(&noop).unwrap();
@@ -926,6 +1016,63 @@ fn reconfirm_clears_matches_keeps_edits() {
     assert_eq!(matching(&rec.events()).last(), Some(&(1, 1)));
     assert_eq!(state(&f.core, ids[0]).status, AreaStatus::Found);
     assert!(f.core.area(ids[1]).unwrap() == own);
+}
+
+/// Back from step 3 and "Looks right" again with the area unchanged: nothing in step 3 is
+/// lost (matches, unticks, looks) and nothing is matched again.
+#[test]
+fn unchanged_reconfirm_keeps_step3() {
+    let f = fixture(None);
+    let ids = add_synth(&f.core, "random", &["00", "01", "04"]);
+    confirm_truth(&f.core, "random", "00", ids[0]);
+    f.core.match_all(&noop).unwrap();
+    f.core.set_included(ids[1], false).unwrap();
+    f.core.open_photo(ids[2]).unwrap();
+    let before = f.core.photo_states();
+    let template = f.core.confirmed_template().unwrap();
+
+    // The editor sends the same area again (the app's own area of the photo, at edit size).
+    let (w, h) = f.core.edit_size(ids[0]).unwrap();
+    let same = f.core.area(ids[0]).unwrap();
+    f.core.put_draft(ids[0], w, h, same.clone()).unwrap();
+    f.core.confirm_set_area(ids[0]).unwrap();
+    assert_eq!(f.core.photo_states(), before);
+    assert!(Arc::ptr_eq(
+        &template,
+        &f.core.confirmed_template().unwrap()
+    ));
+    let rec = Recorder::default();
+    f.core.match_all(&|e| rec.push(e)).unwrap();
+    assert_eq!(matching(&rec.events()), [(0, 0)], "matched again");
+
+    // Without a draft (the area as the app has it) it is the same.
+    f.core.confirm_set_area(ids[0]).unwrap();
+    assert_eq!(f.core.photo_states(), before);
+
+    // A changed area is a new set watermark: step 3 starts over.
+    let mut changed = same;
+    changed[0] = 255;
+    f.core.put_draft(ids[0], w, h, changed).unwrap();
+    f.core.confirm_set_area(ids[0]).unwrap();
+    assert_eq!(state(&f.core, ids[1]).status, AreaStatus::Pending);
+}
+
+/// Leaving the single-photo editor without saving drops its draft, so a later save never uses it.
+#[test]
+fn dropped_draft_is_gone() {
+    let f = fixture(None);
+    let ids = add_synth(&f.core, "random", &["00", "01"]);
+    confirm_truth(&f.core, "random", "00", ids[0]);
+    f.core.match_all(&noop).unwrap();
+    let before = f.core.area(ids[1]).unwrap();
+    let (w, h) = f.core.edit_size(ids[1]).unwrap();
+    f.core
+        .put_draft(ids[1], w, h, rect_area(w, h, 5, 5, 50, 50))
+        .unwrap();
+    f.core.drop_draft(ids[1]);
+    // Saving without a draft keeps the area the photo had.
+    f.core.save_photo_area(ids[1]).unwrap();
+    assert!(f.core.area(ids[1]).unwrap() == before);
 }
 
 #[test]

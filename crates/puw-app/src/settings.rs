@@ -64,6 +64,31 @@ impl Default for Settings {
     }
 }
 
+/// Whether `name` can be the name of the folder made next to the originals on every system:
+/// not empty, not `.` or `..`, no path separator, none of the characters Windows forbids
+/// (`< > : " | ? *` and control characters), no space or dot at the end and not a name
+/// Windows keeps for devices (`CON`, `NUL`, `COM1`, ... also with an extension).
+pub fn valid_folder_name(name: &str) -> bool {
+    if name.is_empty() || name == "." || name == ".." || name.ends_with(['.', ' ']) {
+        return false;
+    }
+    if name.chars().any(|c| {
+        c.is_control() || matches!(c, '/' | '\\' | '<' | '>' | ':' | '"' | '|' | '?' | '*')
+    }) {
+        return false;
+    }
+    let stem = name
+        .split('.')
+        .next()
+        .unwrap_or("")
+        .trim_end()
+        .to_ascii_uppercase();
+    let numbered = |p: &str| {
+        stem.len() == 4 && stem.starts_with(p) && matches!(stem.as_bytes()[3], b'1'..=b'9')
+    };
+    !(matches!(stem.as_str(), "CON" | "PRN" | "AUX" | "NUL") || numbered("COM") || numbered("LPT"))
+}
+
 impl Settings {
     /// Read settings; a missing or unreadable file gives the defaults.
     pub fn load(path: &Path) -> Settings {
@@ -180,6 +205,44 @@ mod tests {
                 .save(&t.path().join("no/such/settings.json"))
                 .is_err()
         );
+    }
+
+    #[test]
+    fn folder_names() {
+        for ok in [
+            "Without watermark",
+            "Out",
+            "a.b",
+            "2026-11",
+            ".hidden",
+            "Fotky bez znaku",
+        ] {
+            assert!(valid_folder_name(ok), "{ok}");
+        }
+        for bad in [
+            "",
+            ".",
+            "..",
+            "a/b",
+            "a\\b",
+            "x:",
+            "a*",
+            "q?",
+            "<x>",
+            "\"q\"",
+            "p|q",
+            "end.",
+            "end ",
+            "CON",
+            "con.txt",
+            "NUL",
+            "COM1",
+            "lpt9.x",
+            "tab\there",
+        ] {
+            assert!(!valid_folder_name(bad), "{bad:?}");
+        }
+        assert!(valid_folder_name("COM0") && valid_folder_name("CONSOLE"));
     }
 
     #[test]

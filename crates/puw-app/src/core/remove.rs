@@ -15,7 +15,7 @@ use super::{AppCore, lock, no_photo, not_found};
 use crate::images::{self, jpeg};
 use crate::jobs::{Events, LoadPurpose, ProgressEvent};
 use crate::output::{output_dirs, remove_stale_partials};
-use crate::photos::PhotoId;
+use crate::photos::{PhotoId, Problem};
 use crate::session::Area;
 use crate::{AppError, Eta, OutputRule, Result, user_message};
 
@@ -211,7 +211,10 @@ impl AppCore {
     /// saves the results in the output folders (the originals are never written).
     ///
     /// The photos and their areas are taken when the run starts; changes made in step 3 while
-    /// it runs count from the next run on. Refuses with [`AppError::NotReady`] while
+    /// it runs count from the next run on. A photo an earlier run finished with the same area
+    /// (and whose result is still there) is not done again: it is listed in
+    /// [`RemoveReport::done`] with that result, so starting again after a stop or a failure
+    /// only works on the unfinished photos. Refuses with [`AppError::NotReady`] while
     /// [`AppCore::removal_blockers`] is not empty, with [`AppError::NothingToRemove`] when no
     /// photo is ticked, and with [`AppError::NoWritableOutput`] when an output folder cannot be
     /// written, in each case before any photo is read. Then deletes the half-written files
@@ -226,29 +229,48 @@ impl AppCore {
     /// [`ProgressEvent::FellBackToProcessor`] is sent once, with the error text.
     pub fn remove(&self, ev: Events) -> Result<RemoveReport> {
         let job = self.jobs.start()?;
-        let (blocked, todo) = {
+        let (blocked, todo, finished) = {
             let s = self.session();
             let states = s.states();
+            let mut finished = Vec::new();
             let todo: Vec<Todo> = states
                 .iter()
                 .filter(|st| st.is_to_remove())
                 .filter_map(|st| {
                     let e = s.photos.get(st.id)?;
+                    let area = s.area(st.id)?;
+                    if let Some(d) = s.data.get(&st.id)
+                        && let (Some(out), Some(done_area)) = (&d.result, &d.result_area)
+                        && Arc::ptr_eq(done_area, &area)
+                        && out.is_file()
+                    {
+                        finished.push(Done {
+                            id: st.id,
+                            output: out.to_string_lossy().into_owned(),
+                        });
+                        return None;
+                    }
                     Some(Todo {
                         id: st.id,
                         path: e.path.clone(),
                         name: e.info.name.clone(),
-                        area: s.area(st.id)?,
+                        area,
                     })
                 })
                 .collect();
-            (states.iter().any(|st| st.blocks_removal()), todo)
+            (states.iter().any(|st| st.blocks_removal()), todo, finished)
         };
         if blocked {
             return Err(AppError::NotReady);
         }
-        if todo.is_empty() {
+        if todo.is_empty() && finished.is_empty() {
             return Err(AppError::NothingToRemove);
+        }
+        if todo.is_empty() {
+            return Ok(RemoveReport {
+                done: finished,
+                ..RemoveReport::default()
+            });
         }
         let paths: Vec<PathBuf> = todo.iter().map(|t| t.path.clone()).collect();
         let dirs =
@@ -260,7 +282,10 @@ impl AppCore {
             remove_stale_partials(dir);
         }
 
-        let mut report = RemoveReport::default();
+        let mut report = RemoveReport {
+            done: finished,
+            ..RemoveReport::default()
+        };
         let engine = match self.ensure_models_in(&job, &[ModelKind::Lama], LoadPurpose::Remover, ev)
         {
             Err(e) if is_cancelled(&e) => {
@@ -296,9 +321,14 @@ impl AppCore {
                 cancel: job.flag(),
             };
             let out_dir = t.path.parent().and_then(|p| dirs.get(p));
-            let photo = load(&t.path);
+            let photo = load(&t.path).map_err(AppError::from);
             let loaded = photo.is_ok();
-            let result = photo.map_err(AppError::from).and_then(|photo| {
+            if let Err(e) = &photo
+                && let Some(p) = Problem::of(e)
+            {
+                self.session().photos.set_problem(t.id, p);
+            }
+            let result = photo.and_then(|photo| {
                 let out_dir = out_dir.ok_or(AppError::NoWritableOutput)?;
                 let (w, h) = photo.rgb.dimensions();
                 let area = mask::binarize(&t.area.resized(w, h));
@@ -316,6 +346,7 @@ impl AppCore {
                 Ok(saved) => {
                     if let Some(d) = self.session().data.get_mut(&t.id) {
                         d.result = Some(saved.clone());
+                        d.result_area = Some(t.area.clone());
                     }
                     report.done.push(Done {
                         id: t.id,

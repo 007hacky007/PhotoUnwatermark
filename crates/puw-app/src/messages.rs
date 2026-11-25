@@ -20,13 +20,22 @@ pub enum AppError {
     Busy,
     #[error(transparent)]
     Download(#[from] DownloadError),
+    /// The name chosen for the output folder cannot be a folder name.
+    #[error("bad folder name")]
+    BadFolderName,
+    /// A downloaded model file is gone; the download has to run again.
+    #[error("model file missing: {0}")]
+    MissingModels(String),
 }
 
 /// What the interface shows: a short message and the raw text for "Show details".
 #[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
 pub struct UserError {
     pub message: String,
     pub details: String,
+    /// Files the app downloaded are missing: the interface offers the download again.
+    pub missing_data: bool,
 }
 
 impl From<AppError> for UserError {
@@ -34,6 +43,7 @@ impl From<AppError> for UserError {
         UserError {
             message: user_message(&err),
             details: err.to_string(),
+            missing_data: matches!(err, AppError::MissingModels(_)),
         }
     }
 }
@@ -53,6 +63,12 @@ pub fn user_message(err: &AppError) -> String {
         }
         AppError::Busy => "The app is still working on your photos. Please wait until it finishes.",
         AppError::Download(e) => return download_message(e),
+        AppError::BadFolderName => {
+            "A folder cannot have that name. Use a name without / \\ : * ? \" < > | that does not end with a dot or a space."
+        }
+        AppError::MissingModels(_) => {
+            "Some of the files the app downloaded are missing. Download them again to carry on."
+        }
     };
     text.to_string()
 }
@@ -134,6 +150,8 @@ mod tests {
             AppError::NothingToRemove,
             AppError::NotReady,
             AppError::Busy,
+            AppError::MissingModels("x".into()),
+            AppError::BadFolderName,
             DownloadError::Network("x".into()).into(),
             DownloadError::Verify { name: "x".into() }.into(),
             DownloadError::Disk("x".into()).into(),
@@ -202,5 +220,16 @@ mod tests {
         let u: UserError = AppError::Core(Error::Model("boom".into())).into();
         assert!(u.details.contains("boom"));
         assert!(!u.message.contains("boom"));
+        assert!(!u.missing_data);
+    }
+
+    #[test]
+    fn missing_models_are_not_a_photo_problem() {
+        let u: UserError = AppError::MissingModels("lama.onnx".into()).into();
+        assert!(u.missing_data);
+        assert!(!u.message.to_lowercase().contains("photo"), "{}", u.message);
+        assert!(u.message.contains("Download them again"));
+        let json = serde_json::to_string(&u).unwrap();
+        assert!(json.contains(r#""missingData":true"#), "{json}");
     }
 }

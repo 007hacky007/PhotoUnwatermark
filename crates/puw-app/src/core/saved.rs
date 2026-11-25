@@ -5,6 +5,7 @@ use std::io::Cursor;
 
 use image::{ImageFormat, imageops};
 use puw_core::mask;
+use puw_core::template::main_bbox;
 use puw_core::{Library, SavedWatermark, load};
 use serde::Serialize;
 use time::Date;
@@ -42,8 +43,8 @@ pub fn default_watermark_name(today: Date) -> String {
 
 impl AppCore {
     /// Saves the set's confirmed watermark under `name` (trimmed; an empty name is refused)
-    /// and returns its id. Its picture is the confirmed photo around the watermark area (plus
-    /// 10 % on each side) with the area tinted, at most 256 px long, as PNG. Fails with
+    /// and returns its id. Its picture is the confirmed photo around the watermark (the parts
+    /// matching looks for, see [`main_bbox`], plus 10 % on each side) with the area tinted, at most 256 px long, as PNG. Fails with
     /// [`AppError::NothingToRemove`] before a set area is confirmed.
     pub fn save_watermark(&self, name: &str) -> Result<String> {
         let _job = self.jobs.start()?;
@@ -57,13 +58,26 @@ impl AppCore {
         let rgb = load(&confirmed.path)?.rgb;
         let (w, h) = rgb.dimensions();
         let area = confirmed.area.resized(w, h);
-        let rect = mask::bbox(&area).ok_or(AppError::NothingToRemove)?;
+        // The picture shows the watermark itself, without a stray dot far from it.
+        // (left, top, width, height) in photo pixels.
+        let (rx, ry, rw, rh) = match main_bbox(&template) {
+            Some([x, y, bw, bh]) => {
+                let px = |v: f32, n: u32| ((v * n as f32).round().max(0.0) as u32).min(n - 1);
+                let (x0, y0) = (px(x, w), px(y, h));
+                let (x1, y1) = (px(x + bw, w).max(x0 + 1), px(y + bh, h).max(y0 + 1));
+                (x0, y0, x1 - x0, y1 - y0)
+            }
+            None => {
+                let r = mask::bbox(&area).ok_or(AppError::NothingToRemove)?;
+                (r.left() as u32, r.top() as u32, r.width(), r.height())
+            }
+        };
         let margin = |v: u32| (v as f32 * SAVED_THUMB_MARGIN).round() as u32;
-        let (mx, my) = (margin(rect.width()), margin(rect.height()));
-        let x0 = (rect.left() as u32).saturating_sub(mx);
-        let y0 = (rect.top() as u32).saturating_sub(my);
-        let x1 = (rect.left() as u32 + rect.width() + mx).min(w);
-        let y1 = (rect.top() as u32 + rect.height() + my).min(h);
+        let (mx, my) = (margin(rw), margin(rh));
+        let x0 = rx.saturating_sub(mx);
+        let y0 = ry.saturating_sub(my);
+        let x1 = (rx + rw + mx).min(w);
+        let y1 = (ry + rh + my).min(h);
         let crop = imageops::crop_imm(&rgb, x0, y0, x1 - x0, y1 - y0).to_image();
         let crop_area = imageops::crop_imm(&area, x0, y0, x1 - x0, y1 - y0).to_image();
         drop((rgb, area));

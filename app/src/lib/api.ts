@@ -41,15 +41,31 @@ export function imageUrl(route: ImageRoute, id: PhotoId | string, version?: numb
   return version === undefined ? url : `${url}?v=${version}`;
 }
 
+// Long jobs. Each one gets a ticket, and a stop names the ticket, so it reaches the job it was
+// meant for and never one started after it. The app runs one long job at a time, and a job
+// started while a stopped one is still finishing waits for it.
+
+let tickets = 0;
+let latest = 0;
+
+/** A ticket for a long job that is about to start; it becomes the one `cancelJob` stops. */
+function ticket(): number {
+  latest = ++tickets;
+  return latest;
+}
+
+/**
+ * Asks the long job started last (or the download) to stop; that job's own call then
+ * rejects. A job started after this call is never stopped by it.
+ */
+export const cancelJob = () => invoke<void>('cancel_job', { job: latest });
+
 // Start and download
 
 export const appStatus = () => invoke<AppStatus>('app_status');
 
 export const downloadModels = (onEvent: (p: DownloadProgress) => void) =>
-  invoke<void>('download_models', { onEvent: channel(onEvent) });
-
-/** Asks the running job (or the download) to stop; the job's own call then rejects. */
-export const cancelJob = () => invoke<void>('cancel_job');
+  invoke<void>('download_models', { onEvent: channel(onEvent), job: ticket() });
 
 export const removeDownloadedData = () => invoke<void>('remove_downloaded_data');
 
@@ -88,21 +104,22 @@ export async function chooseFolder(): Promise<string | null> {
   return open({ multiple: false, directory: true });
 }
 
-export const addPaths = (paths: string[]) => invoke<AddResult>('add_paths', { paths });
+export const addPaths = (paths: string[]) => invoke<AddResult>('add_paths', { paths, job: ticket() });
 
-export const removePhoto = (id: PhotoId) => invoke<void>('remove_photo', { id });
+export const removePhoto = (id: PhotoId) => invoke<void>('remove_photo', { id, job: ticket() });
 
 export const clearPhotos = () => invoke<void>('clear_photos');
 
 export const listPhotos = () => invoke<PhotoInfo[]>('list_photos');
 
-export const suggestSaved = () => invoke<Suggestion | null>('suggest_saved');
+/** Looks for a saved watermark on the photos; `cancelJob` (before another job starts) stops it. */
+export const suggestSaved = () => invoke<Suggestion | null>('suggest_saved', { job: ticket() });
 
 export const detect = (onEvent: (e: ProgressEvent) => void) =>
-  invoke<DetectOutcome>('detect', { onEvent: channel(onEvent) });
+  invoke<DetectOutcome>('detect', { onEvent: channel(onEvent), job: ticket() });
 
 export const useSaved = (id: string, onEvent: (e: ProgressEvent) => void) =>
-  invoke<DetectOutcome>('use_saved', { id, onEvent: channel(onEvent) });
+  invoke<DetectOutcome>('use_saved', { id, onEvent: channel(onEvent), job: ticket() });
 
 // Step 2: the watermark area
 
@@ -119,15 +136,15 @@ export const putDraft = (id: PhotoId, width: number, height: number, area: Uint8
     headers: { 'x-photo-id': String(id), 'x-width': String(width), 'x-height': String(height) },
   });
 
-export const confirmSetArea = (id: PhotoId) => invoke<void>('confirm_set_area', { id });
+export const confirmSetArea = (id: PhotoId) => invoke<void>('confirm_set_area', { id, job: ticket() });
 
 export const preview = (id: PhotoId, onEvent: (e: ProgressEvent) => void) =>
-  invoke<void>('preview', { id, onEvent: channel(onEvent) });
+  invoke<void>('preview', { id, onEvent: channel(onEvent), job: ticket() });
 
 // Step 3: all photos
 
 export const matchAll = (onEvent: (e: ProgressEvent) => void) =>
-  invoke<MatchSummary>('match_all', { onEvent: channel(onEvent) });
+  invoke<MatchSummary>('match_all', { onEvent: channel(onEvent), job: ticket() });
 
 export const photoStates = () => invoke<PhotoState[]>('photo_states');
 
@@ -149,7 +166,7 @@ export const setOutputOverride = (path: string | null) =>
   invoke<void>('set_output_override', { path });
 
 export const remove = (onEvent: (e: ProgressEvent) => void) =>
-  invoke<RemoveReport>('remove', { onEvent: channel(onEvent) });
+  invoke<RemoveReport>('remove', { onEvent: channel(onEvent), job: ticket() });
 
 /** Shows the file in the system's file manager (Finder, Explorer), in its folder. */
 export const revealItemInDir = (path: string) => reveal(path);

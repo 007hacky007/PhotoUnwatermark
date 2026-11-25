@@ -73,6 +73,7 @@ fn main() {
             commands::edit_size,
             commands::get_area,
             commands::put_draft,
+            commands::drop_draft,
             commands::confirm_set_area,
             commands::match_all,
             commands::photo_states,

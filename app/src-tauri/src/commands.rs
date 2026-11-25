@@ -12,6 +12,7 @@ use puw_app::photos::{AddResult, PhotoId, PhotoInfo};
 use puw_app::{
     AppCore, AppError, DataDirs, DetectOutcome, DeviceFix, DeviceStatus, MatchSummary, OutputCheck,
     PhotoState, ProgressEvent, RemoveReport, SavedInfo, Settings, Suggestion, UserError,
+    with_ticket,
 };
 use serde::Serialize;
 use tauri::ipc::{Channel, InvokeBody, Request, Response};
@@ -28,8 +29,8 @@ type Res<T> = Result<T, UserError>;
 pub struct Shell {
     pub core: Arc<AppCore>,
     dirs: DataDirs,
-    /// Cancel flag of the running model download, if one runs.
-    download: Mutex<Option<Arc<AtomicBool>>>,
+    /// Cancel flag and ticket of the running model download, if one runs.
+    download: Mutex<Option<(Arc<AtomicBool>, Option<u64>)>>,
     /// The local time offset read at start-up, while the process had one thread.
     startup_offset: Option<UtcOffset>,
     /// True while `remove` runs; quitting then asks first.
@@ -54,7 +55,7 @@ impl Shell {
         self.removing.load(Ordering::SeqCst)
     }
 
-    fn download_slot(&self) -> MutexGuard<'_, Option<Arc<AtomicBool>>> {
+    fn download_slot(&self) -> MutexGuard<'_, Option<(Arc<AtomicBool>, Option<u64>)>> {
         self.download.lock().unwrap_or_else(PoisonError::into_inner)
     }
 }
@@ -63,13 +64,13 @@ impl Shell {
 struct DownloadRun<'a>(&'a Shell);
 
 impl DownloadRun<'_> {
-    fn start(shell: &Shell) -> Res<(DownloadRun<'_>, Arc<AtomicBool>)> {
+    fn start(shell: &Shell, ticket: Option<u64>) -> Res<(DownloadRun<'_>, Arc<AtomicBool>)> {
         let mut slot = shell.download_slot();
         if slot.is_some() {
             return Err(AppError::Busy.into());
         }
         let cancel = Arc::new(AtomicBool::new(false));
-        *slot = Some(cancel.clone());
+        *slot = Some((cancel.clone(), ticket));
         Ok((DownloadRun(shell), cancel))
     }
 }
@@ -109,6 +110,7 @@ fn internal(details: impl Into<String>) -> UserError {
     UserError {
         message: "Something went wrong inside the app. Please try again.".into(),
         details: details.into(),
+        missing_data: false,
     }
 }
 
@@ -122,6 +124,16 @@ where
         Ok(result) => result.map_err(UserError::from),
         Err(e) => Err(internal(e.to_string())),
     }
+}
+
+/// Runs the long job `f` on a blocking worker thread under the interface's `ticket`, so
+/// `cancel_job` with that ticket stops this job and no other.
+async fn job<T, F>(ticket: Option<u64>, f: F) -> Res<T>
+where
+    T: Send + 'static,
+    F: FnOnce() -> puw_app::Result<T> + Send + 'static,
+{
+    blocking(move || with_ticket(ticket, f)).await
 }
 
 /// Sends a job's progress to the interface. A closed channel (the window went away) is ignored.
@@ -200,8 +212,9 @@ pub async fn app_status(app: AppHandle, shell: State<'_, Shell>) -> Res<AppStatu
 pub async fn download_models(
     shell: State<'_, Shell>,
     on_event: Channel<DownloadProgress>,
+    job: Option<u64>,
 ) -> Res<()> {
-    let (_run, cancel) = DownloadRun::start(&shell)?;
+    let (_run, cancel) = DownloadRun::start(&shell, job)?;
     let models = shell.dirs.models.clone();
     blocking(move || {
         let throttle = Throttle::new(DOWNLOAD_EVENT_GAP);
@@ -219,11 +232,17 @@ pub async fn download_models(
     .await
 }
 
-/// Asks the running job or download to stop.
+/// Asks the job (or download) started with ticket `job` to stop; without a ticket, whatever
+/// runs.
 #[tauri::command]
-pub async fn cancel_job(shell: State<'_, Shell>) -> Res<()> {
-    shell.core.cancel();
-    if let Some(flag) = shell.download_slot().as_ref() {
+pub async fn cancel_job(shell: State<'_, Shell>, job: Option<u64>) -> Res<()> {
+    match job {
+        Some(t) => shell.core.cancel_ticket(t),
+        None => shell.core.cancel(),
+    }
+    if let Some((flag, ticket)) = shell.download_slot().as_ref()
+        && (job.is_none() || *ticket == job)
+    {
         flag.store(true, Ordering::Relaxed);
     }
     Ok(())
@@ -233,21 +252,25 @@ pub async fn cancel_job(shell: State<'_, Shell>) -> Res<()> {
 /// download or any other job runs.
 #[tauri::command]
 pub async fn remove_downloaded_data(shell: State<'_, Shell>) -> Res<()> {
-    let (_run, _) = DownloadRun::start(&shell)?;
+    let (_run, _) = DownloadRun::start(&shell, None)?;
     let core = shell.core.clone();
     blocking(move || core.remove_downloaded_data()).await
 }
 
 #[tauri::command]
-pub async fn add_paths(shell: State<'_, Shell>, paths: Vec<PathBuf>) -> Res<AddResult> {
+pub async fn add_paths(
+    shell: State<'_, Shell>,
+    paths: Vec<PathBuf>,
+    job: Option<u64>,
+) -> Res<AddResult> {
     let core = shell.core.clone();
-    blocking(move || core.add_paths(&paths)).await
+    self::job(job, move || core.add_paths(&paths)).await
 }
 
 #[tauri::command]
-pub async fn remove_photo(shell: State<'_, Shell>, id: PhotoId) -> Res<()> {
+pub async fn remove_photo(shell: State<'_, Shell>, id: PhotoId, job: Option<u64>) -> Res<()> {
     let core = shell.core.clone();
-    blocking(move || core.remove_photo(id)).await
+    self::job(job, move || core.remove_photo(id)).await
 }
 
 #[tauri::command]
@@ -262,18 +285,19 @@ pub async fn list_photos(shell: State<'_, Shell>) -> Res<Vec<PhotoInfo>> {
 }
 
 #[tauri::command]
-pub async fn suggest_saved(shell: State<'_, Shell>) -> Res<Option<Suggestion>> {
+pub async fn suggest_saved(shell: State<'_, Shell>, job: Option<u64>) -> Res<Option<Suggestion>> {
     let core = shell.core.clone();
-    blocking(move || core.suggest_saved()).await
+    self::job(job, move || core.suggest_saved()).await
 }
 
 #[tauri::command]
 pub async fn detect(
     shell: State<'_, Shell>,
     on_event: Channel<ProgressEvent>,
+    job: Option<u64>,
 ) -> Res<DetectOutcome> {
     let core = shell.core.clone();
-    blocking(move || core.detect(&sender(&on_event))).await
+    self::job(job, move || core.detect(&sender(&on_event))).await
 }
 
 #[tauri::command]
@@ -281,9 +305,10 @@ pub async fn use_saved(
     shell: State<'_, Shell>,
     id: String,
     on_event: Channel<ProgressEvent>,
+    job: Option<u64>,
 ) -> Res<DetectOutcome> {
     let core = shell.core.clone();
-    blocking(move || core.use_saved(&id, &sender(&on_event))).await
+    self::job(job, move || core.use_saved(&id, &sender(&on_event))).await
 }
 
 /// Size of the image the area is drawn on.
@@ -354,19 +379,27 @@ pub async fn put_draft(shell: State<'_, Shell>, request: Request<'_>) -> Res<()>
     blocking(move || core.put_draft(h.id, h.width, h.height, bytes)).await
 }
 
+/// Forgets the area the editor sent for a photo that was left without saving.
 #[tauri::command]
-pub async fn confirm_set_area(shell: State<'_, Shell>, id: PhotoId) -> Res<()> {
+pub async fn drop_draft(shell: State<'_, Shell>, id: PhotoId) -> Res<()> {
+    shell.core.drop_draft(id);
+    Ok(())
+}
+
+#[tauri::command]
+pub async fn confirm_set_area(shell: State<'_, Shell>, id: PhotoId, job: Option<u64>) -> Res<()> {
     let core = shell.core.clone();
-    blocking(move || core.confirm_set_area(id)).await
+    self::job(job, move || core.confirm_set_area(id)).await
 }
 
 #[tauri::command]
 pub async fn match_all(
     shell: State<'_, Shell>,
     on_event: Channel<ProgressEvent>,
+    job: Option<u64>,
 ) -> Res<MatchSummary> {
     let core = shell.core.clone();
-    blocking(move || core.match_all(&sender(&on_event))).await
+    self::job(job, move || core.match_all(&sender(&on_event))).await
 }
 
 #[tauri::command]
@@ -400,9 +433,10 @@ pub async fn preview(
     shell: State<'_, Shell>,
     id: PhotoId,
     on_event: Channel<ProgressEvent>,
+    job: Option<u64>,
 ) -> Res<()> {
     let core = shell.core.clone();
-    blocking(move || core.preview(id, &sender(&on_event))).await
+    self::job(job, move || core.preview(id, &sender(&on_event))).await
 }
 
 #[tauri::command]
@@ -421,10 +455,11 @@ pub async fn set_output_override(shell: State<'_, Shell>, path: Option<PathBuf>)
 pub async fn remove(
     shell: State<'_, Shell>,
     on_event: Channel<ProgressEvent>,
+    job: Option<u64>,
 ) -> Res<RemoveReport> {
     let core = shell.core.clone();
     let _run = RemovalRun::start(&shell.removing);
-    blocking(move || core.remove(&sender(&on_event))).await
+    self::job(job, move || core.remove(&sender(&on_event))).await
 }
 
 /// Saves the set's watermark and returns its id.

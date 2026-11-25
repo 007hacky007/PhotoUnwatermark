@@ -21,7 +21,7 @@ pub(crate) struct Draft {
 /// A binary area of a photo, kept as its bounding box and one bit per pixel inside it, so a
 /// watermark-sized area of a 36 MP photo takes kilobytes, not the 36 MB of a full-size [`Mask`].
 /// An empty area keeps no pixels at all. Expanded only when needed ([`Area::resized`]).
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct Area {
     /// Size of the photo (upright pixels).
     w: u32,
@@ -169,8 +169,9 @@ pub(crate) struct PhotoData {
     pub reviewed: bool,
     /// The last preview, JPEG at edit size.
     pub preview: Option<Arc<Vec<u8>>>,
-    /// The file the last removal run saved for this photo.
+    /// The file the last removal run saved for this photo, and the area it removed.
     pub result: Option<PathBuf>,
+    pub result_area: Option<Arc<Area>>,
 }
 
 /// The photo the set's watermark area was confirmed on, and that area.
@@ -214,12 +215,24 @@ impl Session {
         d.guess.clone()
     }
 
+    /// The photo's current area is not empty, and the photo can be read.
     pub fn has_area(&self, id: PhotoId) -> bool {
-        self.area(id).is_some_and(|a| !a.is_empty())
+        !self.unreadable(id) && self.area(id).is_some_and(|a| !a.is_empty())
     }
 
-    /// `Edited` with an own area, else the match status, else `Pending`.
+    /// Reading photo `id` failed (it is gone or cannot be opened).
+    pub fn unreadable(&self, id: PhotoId) -> bool {
+        self.photos
+            .get(id)
+            .is_some_and(|e| e.info.problem.is_some())
+    }
+
+    /// `Unreadable` for a photo that cannot be read, else `Edited` with an own area, else the
+    /// match status, else `Pending`.
     pub fn status(&self, id: PhotoId) -> AreaStatus {
+        if self.unreadable(id) {
+            return AreaStatus::Unreadable;
+        }
         let Some(d) = self.data.get(&id) else {
             return AreaStatus::Pending;
         };
@@ -286,6 +299,18 @@ impl Session {
         d.matched = Some(m);
     }
 
+    /// True when photo `id` is the one the set's watermark was confirmed on, with this very
+    /// `area` (full size), and the photo has no area of its own since.
+    pub fn is_confirmed(&self, id: PhotoId, area: &Area) -> bool {
+        let (Some(c), Some(e)) = (&self.confirmed, self.photos.get(id)) else {
+            return false;
+        };
+        self.template.is_some()
+            && c.path == e.path
+            && *c.area == *area
+            && self.data.get(&id).is_some_and(|d| d.own.is_none())
+    }
+
     /// Makes `area` (full size, binary) of photo `id` the set's watermark: earlier results of
     /// photos without their own area are cleared (they wait for matching again, unticked and
     /// not reviewed), and this photo counts as found with it, replacing any own area it had.
@@ -335,7 +360,7 @@ impl Session {
                 PhotoState {
                     id: i.id,
                     status: self.status(i.id),
-                    included: d.is_some_and(|d| d.included),
+                    included: d.is_some_and(|d| d.included) && i.problem.is_none(),
                     reviewed: d.is_some_and(|d| d.reviewed),
                     has_area: self.has_area(i.id),
                 }

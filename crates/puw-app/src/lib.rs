@@ -20,7 +20,7 @@ pub use crate::core::{
 };
 pub use device::{DeviceFix, DeviceState, DeviceStatus, Platform, device_status};
 pub use estimate::{Eta, load_fraction};
-pub use jobs::{Events, LoadPurpose, ProgressEvent};
+pub use jobs::{Events, LoadPurpose, ProgressEvent, with_ticket};
 pub use messages::{AppError, UserError, user_message};
 pub use paths::DataDirs;
 pub use settings::{Detail, OutputRule, Settings};

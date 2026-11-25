@@ -11,7 +11,7 @@ use serde::Serialize;
 use super::{AppCore, lock, no_photo};
 use crate::images::{area_from_edit, jpeg, overlay};
 use crate::jobs::{Events, Job, ProgressEvent};
-use crate::photos::PhotoId;
+use crate::photos::{PhotoId, Problem};
 use crate::session::{Area, Matched, Unmatched};
 use crate::{AppError, Result};
 
@@ -40,6 +40,9 @@ pub enum AreaStatus {
     Edited,
     /// Not looked for yet (no set area, or added after matching).
     Pending,
+    /// The photo cannot be read (gone or damaged): never ticked, opened or counted as found
+    /// or not found. [`crate::photos::PhotoInfo::problem`] says why.
+    Unreadable,
 }
 
 /// One photo as step 3 shows it.
@@ -78,8 +81,9 @@ impl AppCore {
     ///
     /// Photos are matched in parallel on at most half the cores; each worker reads, matches
     /// and drops one photo before the next. Every result is stored as soon as it is ready, so a
-    /// cancelled run keeps the photos it finished. A photo that cannot be read counts as not
-    /// found. Fails with [`AppError::NothingToRemove`] before a set area is confirmed.
+    /// cancelled run keeps the photos it finished. A photo that cannot be read becomes
+    /// [`AreaStatus::Unreadable`]. Fails with [`AppError::NothingToRemove`] before a set area is
+    /// confirmed.
     pub fn match_all(&self, ev: Events) -> Result<MatchSummary> {
         let job = self.jobs.start()?;
         let (template, layers, todo) = {
@@ -115,15 +119,25 @@ impl AppCore {
         ev(ProgressEvent::Matching { done: 0, total });
         let one = |(id, path, (w, h)): &Unmatched| -> Result<()> {
             job.check()?;
-            let matched = match load(path) {
-                Ok(photo) => Matched::new(&match_photo(template, &photo.rgb, layers)),
+            match load(path) {
+                Ok(photo) => {
+                    let matched = Matched::new(&match_photo(template, &photo.rgb, layers));
+                    self.session().set_match(*id, matched);
+                }
                 // Nothing can be removed from a photo that cannot be read.
-                Err(_) => Matched {
-                    status: MatchStatus::NotFound,
-                    area: Arc::new(Area::empty(*w, *h)),
-                },
-            };
-            self.session().set_match(*id, matched);
+                Err(e) => {
+                    let mut s = self.session();
+                    s.set_match(
+                        *id,
+                        Matched {
+                            status: MatchStatus::NotFound,
+                            area: Arc::new(Area::empty(*w, *h)),
+                        },
+                    );
+                    let problem = Problem::of(&e.into()).unwrap_or(Problem::Damaged);
+                    s.photos.set_problem(*id, problem);
+                }
+            }
             let mut done = lock(&done);
             *done += 1;
             ev(ProgressEvent::Matching { done: *done, total });
@@ -154,7 +168,7 @@ impl AppCore {
                 AreaStatus::Edited if st.has_area => sum.found += 1,
                 AreaStatus::Unsure => sum.unsure += 1,
                 AreaStatus::NotFound | AreaStatus::Edited => sum.not_found += 1,
-                AreaStatus::Pending => {}
+                AreaStatus::Pending | AreaStatus::Unreadable => {}
             }
         }
         sum
@@ -236,7 +250,7 @@ impl AppCore {
             let path = s.photos.get(id).ok_or_else(|| no_photo(id))?.path.clone();
             (path, s.area(id))
         };
-        let thumb = self.images.grid(id, &path)?;
+        let thumb = self.noting_problem(id, self.images.grid(id, &path))?;
         Ok(match area {
             Some(a) if !a.is_empty() => jpeg(
                 &overlay(&thumb, &a.resized(thumb.width(), thumb.height())),

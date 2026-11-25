@@ -43,9 +43,9 @@ use crate::download::{self, model_assets};
 use crate::image_cache::ImageCache;
 use crate::images::{self, area_from_edit};
 use crate::jobs::{Events, Job, JobSlot, LoadPurpose, ProgressEvent, with_ticker};
-use crate::photos::{AddResult, PhotoId, PhotoInfo};
-use crate::session::{Draft, Session};
-use crate::{AppError, DataDirs, Result, Settings, load_fraction};
+use crate::photos::{AddResult, PhotoId, PhotoInfo, Problem};
+use crate::session::{Area, Draft, Session};
+use crate::{AppError, DataDirs, OutputRule, Result, Settings, load_fraction};
 
 mod remove;
 mod saved;
@@ -144,6 +144,11 @@ impl AppCore {
     /// Saves new settings. The measured load times stay as they are. A change of `prefer_gpu`
     /// drops the engine; the models load again when next needed (a running job keeps its own).
     pub fn set_settings(&self, new: Settings) -> Result<()> {
+        if let OutputRule::NextToOriginals { folder_name } = &new.output
+            && !crate::settings::valid_folder_name(folder_name)
+        {
+            return Err(AppError::BadFolderName);
+        }
         let gpu_changed = {
             let mut current = lock(&self.settings);
             let new = Settings {
@@ -179,8 +184,11 @@ impl AppCore {
 
     /// Applies a fix from the "why?" dialog: the models load again when next needed, with the
     /// processor or the graphics card as chosen. [`DeviceFix::DownloadHelper`] does nothing yet
-    /// (it is never offered before the helper download exists).
+    /// (it is never offered before the helper download exists). Refused with
+    /// [`AppError::Busy`] while a job runs, so the models of a running job stay where the chip
+    /// says they are.
     pub fn device_fix(&self, fix: DeviceFix) -> Result<()> {
+        let _job = self.jobs.start()?;
         let prefer_gpu = match fix {
             DeviceFix::TryAgain => None,
             DeviceFix::UseProcessor => Some(false),
@@ -210,10 +218,9 @@ impl AppCore {
             intra_threads: Some(threads.saturating_sub(1).max(1)),
             cache_dir: Some(self.dirs.cache.clone()),
         };
-        let e = Arc::new(Engine::new(
-            &ModelPaths::from_dir(&self.dirs.models)?,
-            opts,
-        )?);
+        let paths = ModelPaths::from_dir(&self.dirs.models)
+            .map_err(|e| AppError::MissingModels(e.to_string()))?;
+        let e = Arc::new(Engine::new(&paths, opts)?);
         *engine = Some(e.clone());
         Ok(e)
     }
@@ -221,6 +228,12 @@ impl AppCore {
     /// Asks the running job, if any, to stop.
     pub fn cancel(&self) {
         self.jobs.cancel();
+    }
+
+    /// Asks the job started with `ticket` ([`crate::jobs::with_ticket`]) to stop, and no other:
+    /// the running one when it is that job, else that job as soon as it starts.
+    pub fn cancel_ticket(&self, ticket: u64) {
+        self.jobs.cancel_ticket(ticket);
     }
 
     /// Deletes the downloaded models, the saved watermarks and the model cache (the settings
@@ -333,6 +346,12 @@ impl AppCore {
         let mut base = 0.0;
         for (&kind, &secs) in missing.iter().zip(&expected) {
             job.check()?;
+            // A file deleted since the engine was made is missing data, not a photo problem.
+            let file = self.dirs.models.join(model_file(kind));
+            if !file.is_file() {
+                self.drop_engine();
+                return Err(AppError::MissingModels(file.display().to_string()));
+            }
             let start = Instant::now();
             with_ticker(&|t| emit(load_fraction(base + t, total)), || {
                 engine.load(kind)
@@ -383,7 +402,7 @@ impl AppCore {
             }
         }
         let refs: Vec<&RgbImage> = imgs.iter().collect();
-        let Some((id, _)) = library.suggest(&refs)? else {
+        let Some((id, _)) = library.suggest_until(&refs, job.flag())? else {
             return Ok(None);
         };
         Ok(saved.into_iter().find(|w| w.id == id).map(|w| Suggestion {
@@ -495,7 +514,13 @@ impl AppCore {
             job.check()?;
             match load(&paths[i]) {
                 Ok(photo) => found.push((ids[i], look(&photo)?)),
-                Err(e) => unreadable = unreadable.or(Some(e)),
+                Err(e) => {
+                    let e = AppError::from(e);
+                    if let Some(p) = Problem::of(&e) {
+                        self.session().photos.set_problem(ids[i], p);
+                    }
+                    unreadable = unreadable.or(Some(e));
+                }
             }
             ev(ProgressEvent::Looking {
                 done: done as u32 + 1,
@@ -503,7 +528,7 @@ impl AppCore {
             });
         }
         match unreadable {
-            Some(e) if found.is_empty() => Err(e.into()),
+            Some(e) if found.is_empty() => Err(e),
             _ => Ok(found),
         }
     }
@@ -547,9 +572,17 @@ impl AppCore {
         Ok(())
     }
 
+    /// Forgets the draft of photo `id` (the editor was left without saving it).
+    pub fn drop_draft(&self, id: PhotoId) {
+        if let Some(d) = self.session().data.get_mut(&id) {
+            d.draft = None;
+        }
+    }
+
     /// Makes the draft of photo `id` (or, without one, its current area) the set's watermark
     /// area and learns what it looks like. Fails with [`AppError::NothingToRemove`] when the
-    /// area is empty.
+    /// area is empty. Confirming the area that is already the set's watermark, on the same
+    /// photo, changes nothing (step 3 keeps its results).
     pub fn confirm_set_area(&self, id: PhotoId) -> Result<()> {
         let _job = self.jobs.start()?;
         let (path, (w, h), draft, current) = {
@@ -570,6 +603,17 @@ impl AppCore {
         };
         if mask::is_empty(&area) {
             return Err(AppError::NothingToRemove);
+        }
+        // The same area confirmed again (step 3, Back, "Looks right" unchanged): nothing to
+        // learn, and every match, tick and look in step 3 stays as it is.
+        if area.dimensions() == (w, h) {
+            let mut s = self.session();
+            if s.is_confirmed(id, &Area::from_mask(&area)) {
+                if let Some(d) = s.data.get_mut(&id) {
+                    d.draft = None;
+                }
+                return Ok(());
+            }
         }
         let photo = load(&path)?;
         let area = if area.dimensions() == photo.rgb.dimensions() {
@@ -594,14 +638,28 @@ impl AppCore {
         self.session().template.clone()
     }
 
-    /// Small JPEG of photo `id` (long side [`images::THUMB_LONG_SIDE`]), kept in memory.
+    /// Small JPEG of photo `id` (long side [`images::THUMB_LONG_SIDE`]), kept in memory. A
+    /// photo that cannot be read gets its [`crate::photos::Problem`].
     pub fn thumb_image(&self, id: PhotoId) -> Result<Vec<u8>> {
-        self.images.thumb(id, &self.photo_path(id)?)
+        let path = self.photo_path(id)?;
+        self.noting_problem(id, self.images.thumb(id, &path))
     }
 
-    /// JPEG of photo `id` at edit size, the image the area is drawn on, kept in memory.
+    /// JPEG of photo `id` at edit size, the image the area is drawn on, kept in memory. A
+    /// photo that cannot be read gets its [`crate::photos::Problem`].
     pub fn edit_image(&self, id: PhotoId) -> Result<Vec<u8>> {
-        self.images.edit(id, &self.photo_path(id)?)
+        let path = self.photo_path(id)?;
+        self.noting_problem(id, self.images.edit(id, &path))
+    }
+
+    /// `result`, after noting the photo's problem when it is a failed read of photo `id`.
+    fn noting_problem<T>(&self, id: PhotoId, result: Result<T>) -> Result<T> {
+        if let Err(e) = &result
+            && let Some(p) = Problem::of(e)
+        {
+            self.session().photos.set_problem(id, p);
+        }
+        result
     }
 }
 
@@ -627,6 +685,22 @@ mod tests {
             Settings::load(&core.dirs.settings).load_seconds[&ModelKind::Segmenter],
             3.5
         );
+    }
+
+    #[test]
+    fn bad_folder_names_are_refused() {
+        let t = tempfile::tempdir().unwrap();
+        let core = AppCore::new(DataDirs::at(t.path())).unwrap();
+        for name in ["", "..", "a/b", "x:y"] {
+            let s = Settings {
+                output: OutputRule::NextToOriginals {
+                    folder_name: name.into(),
+                },
+                ..Settings::default()
+            };
+            assert!(matches!(core.set_settings(s), Err(AppError::BadFolderName)));
+        }
+        assert_eq!(core.settings().output, OutputRule::default());
     }
 
     #[test]
@@ -669,6 +743,18 @@ mod tests {
         core.device_fix(DeviceFix::UseGraphicsCard).unwrap();
         assert!(core.settings().prefer_gpu);
         assert_eq!(core.device_status().state, crate::DeviceState::NotStarted);
+
+        // Not while a job runs: the engine and the choice stay.
+        let third = core.engine().unwrap();
+        {
+            let _job = core.jobs.start().unwrap();
+            assert!(matches!(
+                core.device_fix(DeviceFix::UseProcessor),
+                Err(AppError::Busy)
+            ));
+        }
+        assert!(core.settings().prefer_gpu);
+        assert!(Arc::ptr_eq(&third, &core.engine().unwrap()));
     }
 
     #[test]

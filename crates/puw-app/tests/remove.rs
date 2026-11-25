@@ -636,10 +636,25 @@ fn cancel_discards_current_keeps_completed() {
     // Only the finished photo is in the output folder, and no half-written file is left.
     assert_eq!(names_in(&tmp.path().join("photos").join(OUT)), ["00.png"]);
 
-    // The next run is not cancelled.
-    let again = f.core.remove(&|_| {}).unwrap();
+    // The next run is not cancelled, and does only the unfinished photos: the finished one is
+    // listed with its result, not saved twice.
+    let rec = Recorder::default();
+    let again = f.core.remove(&|e| rec.push(e)).unwrap();
     assert!(!again.cancelled);
     assert_eq!(again.done.len(), 3);
+    assert!(
+        removing(&rec.events())
+            .iter()
+            .all(|(_, _, p, _)| *p != ids[0])
+    );
+    assert_eq!(
+        names_in(&tmp.path().join("photos").join(OUT)),
+        ["00.png", "01.png", "02.png"]
+    );
+    // With everything finished, a new run saves nothing new.
+    let third = f.core.remove(&|_| {}).unwrap();
+    assert_eq!(third.done, again.done);
+    assert_eq!(names_in(&tmp.path().join("photos").join(OUT)).len(), 3);
 }
 
 #[test]
@@ -860,6 +875,37 @@ fn save_watermark_roundtrip() {
     assert!(f.core.list_saved().unwrap().is_empty());
     assert!(f.core.delete_saved(&saved).is_err());
     assert!(f.core.saved_thumbnail(&saved).is_err());
+}
+
+/// A stray brush dot far from the watermark does not stretch the saved picture over the photo.
+#[test]
+fn saved_picture_leaves_out_a_stray_dot() {
+    let f = fixture(None);
+    let tmp = tempfile::tempdir().unwrap();
+    let paths = copy_fixed(tmp.path(), 1);
+    let id = add(&f.core, &paths)[0];
+    let mut gt = truth("00.png");
+    for y in 30..54 {
+        for x in 30..54 {
+            gt.put_pixel(x, y, image::Luma([255]));
+        }
+    }
+    f.core
+        .put_draft(id, gt.width(), gt.height(), gt.into_raw())
+        .unwrap();
+    f.core.confirm_set_area(id).unwrap();
+    let saved = f.core.save_watermark("Dot").unwrap();
+    let png = f.core.saved_thumbnail(&saved).unwrap();
+    let (tw, th) = image::load_from_memory(&png)
+        .unwrap()
+        .to_rgb8()
+        .dimensions();
+    // The same picture as without the dot: 393x78 plus 10 % on each side.
+    assert_eq!(tw, 256);
+    assert!(
+        (th as i32 - (256.0 * 94.0 / 471.0) as i32).abs() <= 2,
+        "{tw}x{th}"
+    );
 }
 
 /// One 300x200 photo with an area, ready for removal.
