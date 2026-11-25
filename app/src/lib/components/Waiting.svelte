@@ -7,9 +7,11 @@
     fraction: number | null;
     detail?: string;
     onCancel?: () => void;
+    /** The cancel button's text; "Cancel" when left out. */
+    cancelLabel?: string;
   };
 
-  let { sentence, fraction, detail, onCancel }: Props = $props();
+  let { sentence, fraction, detail, onCancel, cancelLabel }: Props = $props();
 
   const id = $props.id();
   const percent = $derived(fraction === null ? null : Math.round(Math.min(1, Math.max(0, fraction)) * 100));
@@ -32,7 +34,7 @@
     <p class="detail">{detail}</p>
   {/if}
   {#if onCancel}
-    <button type="button" onclick={onCancel}>{copy.common.cancel}</button>
+    <button type="button" onclick={onCancel}>{cancelLabel ?? copy.common.cancel}</button>
   {/if}
 </div>
 

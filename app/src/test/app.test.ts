@@ -1,6 +1,13 @@
 import { fireEvent, render, screen } from '@testing-library/svelte';
 import { tick } from 'svelte';
-import { describe, expect, it } from 'vitest';
+import { describe, expect, it, vi } from 'vitest';
+
+vi.mock('../lib/api', () => ({
+  appStatus: vi.fn(() => new Promise(() => {})),
+  downloadModels: vi.fn(),
+  cancelJob: vi.fn(),
+}));
+
 import App from '../App.svelte';
 import { copy } from '../lib/copy';
 import { createWizard } from '../lib/wizard.svelte';

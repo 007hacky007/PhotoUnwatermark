@@ -1,6 +1,9 @@
 // Every sentence, label and button text the app shows. Keep to plain words: no jargon
 // (see src/test/plainText.ts), hyphen-minus only; the arrow → and "..." are fine.
 
+/** The whole model download, in megabytes (1 MB = 1,000,000 bytes). Matches the welcome text. */
+export const DOWNLOAD_MEGABYTES = 690;
+
 const photos = (n: number) => `${n} ${n === 1 ? 'photo' : 'photos'}`;
 
 export const copy = {
@@ -15,6 +18,17 @@ export const copy = {
   },
   settings: {
     title: 'Settings',
+  },
+  welcome: {
+    intro: 'PhotoUnwatermark removes watermarks from a whole set of photos in a few clicks.',
+    needsDownload:
+      'The app needs to download its watermark remover once (about 690 MB). Your photos never leave this computer.',
+    download: 'Download',
+    pause: 'Pause',
+    tryAgain: 'Try again',
+    downloading: 'Downloading the watermark remover...',
+    progress: (done: number) => `${done} MB of ${DOWNLOAD_MEGABYTES} MB`,
+    failed: 'The download did not finish.',
   },
   loading: {
     finder: 'Getting the watermark finder ready...',

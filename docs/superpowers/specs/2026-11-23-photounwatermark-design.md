@@ -108,7 +108,7 @@ Wizard, one task per screen, progress line on top (`1 Add photos > 2 Check the w
 4 Remove > 5 Done`), one obvious primary button per screen, one or two plain sentences of explanation per step.
 Back is always possible without losing work.
 
-**First launch:** welcome screen, one sentence on what the app does, then the model download (~450 MB target) with
+**First launch:** welcome screen, one sentence on what the app does, then the model download (about 690 MB) with
 progress, resume after interruption, retry on failure, SHA-256 verification. Explain that it is one-time and that
 photos never leave the computer.
 

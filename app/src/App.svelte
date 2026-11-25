@@ -1,9 +1,28 @@
 <script lang="ts">
+  import { onMount } from 'svelte';
+  import { appStatus } from './lib/api';
   import ProgressLine from './lib/components/ProgressLine.svelte';
   import { copy } from './lib/copy';
   import { wizard as appWizard, type Wizard } from './lib/wizard.svelte';
+  import Welcome from './screens/Welcome.svelte';
 
   let { wizard = appWizard }: { wizard?: Wizard } = $props();
+
+  // Start-up routing: with the models in place the app opens on Add photos, without them on
+  // the welcome screen. The welcome screen waits for the answer so it never flashes.
+  let checked = $state(false);
+  onMount(async () => {
+    if (wizard.screen !== 'welcome') {
+      checked = true;
+      return;
+    }
+    try {
+      if ((await appStatus()).modelsReady) wizard.go('add');
+    } catch {
+      // Cannot tell: the welcome screen is the safe place, its download resumes or finishes at once.
+    }
+    checked = true;
+  });
 </script>
 
 <div class="app">
@@ -19,6 +38,9 @@
   {/if}
 
   <main>
+    {#if wizard.screen === 'welcome' && checked}
+      <Welcome {wizard} />
+    {/if}
     {#if wizard.screen === 'settings'}
       <section class="page">
         <h1>{copy.settings.title}</h1>
