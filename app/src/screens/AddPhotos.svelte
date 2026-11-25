@@ -2,7 +2,6 @@
   import { onMount } from 'svelte';
   import {
     addPaths,
-    cancelJob,
     chooseFolder,
     choosePhotos,
     detect,
@@ -14,6 +13,7 @@
     useSaved,
   } from '../lib/api';
   import { copy } from '../lib/copy';
+  import { stopJob, stopping } from '../lib/jobs.svelte';
   import type { DetectOutcome, PhotoInfo, ProgressEvent, Skipped, Suggestion, UserError } from '../lib/types';
   import { sameSet, type Wizard } from '../lib/wizard.svelte';
   import Finding from './Finding.svelte';
@@ -29,6 +29,8 @@
   let adding = $state(false);
   /** True while the saved watermarks are checked; nothing waits for it. */
   let checking = $state(false);
+  /** The running check's call, so a stop names exactly its ticket. */
+  let check: Promise<unknown> | null = null;
   /** The running job, or null while this screen is the one showing. */
   type Run = (onEvent: (e: ProgressEvent) => void) => Promise<DetectOutcome>;
   let job: { run: Run; first?: string } | null = $state(null);
@@ -66,7 +68,9 @@
     const mine = ++asked;
     suggestion = null;
     checking = true;
-    suggestSaved()
+    const call = suggestSaved();
+    check = call;
+    call
       .then((found) => {
         if (mine === asked) suggestion = found;
       })
@@ -74,20 +78,25 @@
         // The offer is a bonus; without it the person just finds the watermark.
       })
       .finally(() => {
-        if (mine === asked) checking = false;
+        if (mine === asked) {
+          checking = false;
+          check = null;
+        }
       });
   }
 
-  /** Stops a check that is still running; its answer is dropped. */
-  function stopCheck() {
+  /**
+   * Stops a check that is still running (its answer is dropped). The stop names the check's own
+   * ticket and is sent at once; it resolves once the app has taken it, so a job started after it
+   * waits for the check to end instead of finding the app busy.
+   */
+  function stopCheck(): Promise<void> {
     asked++;
     suggestion = null;
-    if (!checking) return;
+    const running = checking ? check : null;
     checking = false;
-    // The check is the job started last, so this stops it and nothing else.
-    Promise.resolve()
-      .then(() => cancelJob())
-      .catch(() => {});
+    check = null;
+    return running === null ? Promise.resolve() : stopJob(running);
   }
 
   /** Reads the list again after a picture failed to load, to show why. */
@@ -105,11 +114,11 @@
 
   async function add(paths: string[]) {
     if (adding || job !== null || paths.length === 0) return;
-    stopCheck();
     adding = true;
     error = null;
     let added = false;
     try {
+      await stopCheck();
       const result = await addPaths(paths);
       skipped = result.skipped;
       photos = await listPhotos();
@@ -133,9 +142,9 @@
 
   async function remove(photo: PhotoInfo) {
     if (adding || job !== null) return;
-    stopCheck();
     adding = true;
     try {
+      await stopCheck();
       await removePhoto(photo.id);
       photos = photos.filter((p) => p.id !== photo.id);
     } catch (e) {
@@ -147,8 +156,14 @@
     if (photos.length > 0) refreshOffer();
   }
 
-  function begin(run: Run, first?: string) {
-    stopCheck();
+  async function begin(run: Run, first?: string) {
+    if (adding || job !== null) return;
+    adding = true;
+    try {
+      await stopCheck();
+    } finally {
+      adding = false;
+    }
     wizard.busy = true;
     job = { run, first };
   }
@@ -156,11 +171,11 @@
   /** Step 2 again as it was when the photos did not change, else a new search. */
   function find() {
     if (sameSet(wizard, photos.map((p) => p.id))) {
-      stopCheck();
+      void stopCheck();
       wizard.go('check');
       return;
     }
-    begin(detect);
+    void begin(detect);
   }
 
   function downloadAgain() {
@@ -172,7 +187,7 @@
   function useSuggested() {
     if (suggestion === null) return;
     const id = suggestion.id;
-    begin((onEvent) => useSaved(id, onEvent), copy.finding.neutral);
+    void begin((onEvent) => useSaved(id, onEvent), copy.finding.neutral);
   }
 
   function leave() {
@@ -216,7 +231,9 @@
       </div>
     {/if}
 
-    {#if checking}
+    {#if adding && stopping.count > 0}
+      <p class="checking" role="status">{copy.addPhotos.waitingForStop}</p>
+    {:else if checking}
       <p class="checking" role="status">{copy.addPhotos.checkingSaved}</p>
     {/if}
 

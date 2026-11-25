@@ -130,6 +130,8 @@ export const copy = {
     addFailed: 'The photos could not be added.',
     /** While the app checks the new photos against the saved watermarks; the buttons stay usable. */
     checkingSaved: 'Checking your saved watermarks...',
+    /** While the app finishes the work that was stopped before it can go on. */
+    waitingForStop: 'Finishing what was stopped first...',
   },
   /** A photo that turned out to be unreadable after it was added. */
   photoProblem: {

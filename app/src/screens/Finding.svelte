@@ -2,7 +2,7 @@
   import { onMount } from 'svelte';
   import Waiting from '../lib/components/Waiting.svelte';
   import { copy } from '../lib/copy';
-  import { cancelJob } from '../lib/api';
+  import { stopJob } from '../lib/jobs.svelte';
   import type { DetectOutcome, ProgressEvent, UserError } from '../lib/types';
 
   type Props = {
@@ -26,6 +26,8 @@
   let error: string | null = $state(null);
   let missingData = $state(false);
   let left = false;
+  /** The running call, so Back stops exactly this job. */
+  let call: Promise<DetectOutcome> | null = null;
 
   function onEvent(e: ProgressEvent) {
     if (left) return;
@@ -43,7 +45,8 @@
 
   onMount(async () => {
     try {
-      const outcome = await run(onEvent);
+      call = run(onEvent);
+      const outcome = await call;
       if (!left) onDone(outcome);
     } catch (e) {
       if (left) return;
@@ -55,11 +58,8 @@
 
   async function back() {
     left = true;
-    try {
-      await cancelJob();
-    } catch {
-      // The job reports how it ended; the screen is left either way.
-    }
+    // The job reports how it ended; the screen is left either way.
+    if (call !== null) await stopJob(call);
     onBack();
   }
 </script>

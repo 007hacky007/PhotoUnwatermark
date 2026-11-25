@@ -30,7 +30,6 @@
   // command that reads it.
   import { onMount, tick } from 'svelte';
   import {
-    cancelJob,
     confirmSetArea,
     dropDraft,
     editSize,
@@ -45,6 +44,7 @@
   import DeviceChip from '../lib/components/DeviceChip.svelte';
   import Waiting from '../lib/components/Waiting.svelte';
   import { copy } from '../lib/copy';
+  import { stopJob } from '../lib/jobs.svelte';
   import Editor from '../lib/editor/Editor.svelte';
   import { keepFocus } from '../lib/editor/keys';
   import { isEmpty } from '../lib/editor/paint';
@@ -96,6 +96,8 @@
   /** Counts photo loads and previews, so an answer that arrives too late is dropped. */
   let shown = 0;
   let job = 0;
+  /** The running preview's call, so a stop names exactly its ticket. */
+  let running: Promise<void> | null = null;
   let busy = false;
 
   onMount(() => {
@@ -107,7 +109,7 @@
       shown++;
       if (phase === 'previewing') {
         job++;
-        cancelJob().catch(() => {});
+        if (running !== null) void stopJob(running);
       }
       setBusy(false);
     };
@@ -192,7 +194,10 @@
     };
     try {
       await putDraft(id, area.w, area.h, area.data);
-      await preview(id, onEvent);
+      // Stopped while the area was on its way: the preview never starts.
+      if (mine !== job) return;
+      running = preview(id, onEvent);
+      await running;
     } catch (e) {
       if (mine !== job) return;
       setBusy(false);
@@ -211,9 +216,8 @@
     job++;
     setBusy(false);
     phase = 'edit';
-    cancelJob().catch(() => {
-      // The preview reports how it ended; its answer is dropped either way.
-    });
+    // The preview reports how it ended; its answer is dropped either way.
+    if (running !== null) void stopJob(running);
   }
 
   async function finish() {

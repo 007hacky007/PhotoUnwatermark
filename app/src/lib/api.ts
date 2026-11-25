@@ -8,6 +8,7 @@ import { getCurrentWebview } from '@tauri-apps/api/webview';
 import { getCurrentWindow } from '@tauri-apps/api/window';
 import { open } from '@tauri-apps/plugin-dialog';
 import { openUrl, revealItemInDir as reveal } from '@tauri-apps/plugin-opener';
+import { firstTicket, tag } from './tickets';
 import type {
   AddResult,
   AppStatus,
@@ -41,31 +42,31 @@ export function imageUrl(route: ImageRoute, id: PhotoId | string, version?: numb
   return version === undefined ? url : `${url}?v=${version}`;
 }
 
-// Long jobs. Each one gets a ticket, and a stop names the ticket, so it reaches the job it was
-// meant for and never one started after it. The app runs one long job at a time, and a job
-// started while a stopped one is still finishing waits for it.
+// Long jobs. Each call gets its own ticket (`ticketOf(call)` in tickets.ts), and a stop names
+// a ticket, so it reaches the job it was meant for and never another one. The app runs one long
+// job at a time, and a job started while a stopped one is still finishing waits for it. Screens
+// stop a job with `stopJob` (jobs.svelte.ts).
 
-let tickets = 0;
-let latest = 0;
+let tickets = firstTicket();
 
-/** A ticket for a long job that is about to start; it becomes the one `cancelJob` stops. */
-function ticket(): number {
-  latest = ++tickets;
-  return latest;
+/** Runs `call` under a new ticket and notes the ticket on its promise. */
+function job<T>(call: (ticket: number) => Promise<T>): Promise<T> {
+  const ticket = ++tickets;
+  return tag(call(ticket), ticket);
 }
 
 /**
- * Asks the long job started last (or the download) to stop; that job's own call then
- * rejects. A job started after this call is never stopped by it.
+ * Asks the job with ticket `job` (or the download with it) to stop; that job's own call then
+ * rejects. Resolves once the app has taken the stop.
  */
-export const cancelJob = () => invoke<void>('cancel_job', { job: latest });
+export const cancelJob = (job: number | undefined) => invoke<void>('cancel_job', { job });
 
 // Start and download
 
 export const appStatus = () => invoke<AppStatus>('app_status');
 
 export const downloadModels = (onEvent: (p: DownloadProgress) => void) =>
-  invoke<void>('download_models', { onEvent: channel(onEvent), job: ticket() });
+  job((t) => invoke<void>('download_models', { onEvent: channel(onEvent), job: t }));
 
 export const removeDownloadedData = () => invoke<void>('remove_downloaded_data');
 
@@ -104,22 +105,22 @@ export async function chooseFolder(): Promise<string | null> {
   return open({ multiple: false, directory: true });
 }
 
-export const addPaths = (paths: string[]) => invoke<AddResult>('add_paths', { paths, job: ticket() });
+export const addPaths = (paths: string[]) => job((t) => invoke<AddResult>('add_paths', { paths, job: t }));
 
-export const removePhoto = (id: PhotoId) => invoke<void>('remove_photo', { id, job: ticket() });
+export const removePhoto = (id: PhotoId) => job((t) => invoke<void>('remove_photo', { id, job: t }));
 
 export const clearPhotos = () => invoke<void>('clear_photos');
 
 export const listPhotos = () => invoke<PhotoInfo[]>('list_photos');
 
-/** Looks for a saved watermark on the photos; `cancelJob` (before another job starts) stops it. */
-export const suggestSaved = () => invoke<Suggestion | null>('suggest_saved', { job: ticket() });
+/** Looks for a saved watermark on the photos. */
+export const suggestSaved = () => job((t) => invoke<Suggestion | null>('suggest_saved', { job: t }));
 
 export const detect = (onEvent: (e: ProgressEvent) => void) =>
-  invoke<DetectOutcome>('detect', { onEvent: channel(onEvent), job: ticket() });
+  job((t) => invoke<DetectOutcome>('detect', { onEvent: channel(onEvent), job: t }));
 
 export const useSaved = (id: string, onEvent: (e: ProgressEvent) => void) =>
-  invoke<DetectOutcome>('use_saved', { id, onEvent: channel(onEvent), job: ticket() });
+  job((t) => invoke<DetectOutcome>('use_saved', { id, onEvent: channel(onEvent), job: t }));
 
 // Step 2: the watermark area
 
@@ -139,15 +140,15 @@ export const putDraft = (id: PhotoId, width: number, height: number, area: Uint8
 /** Forgets the area sent for a photo whose editor was left without saving. */
 export const dropDraft = (id: PhotoId) => invoke<void>('drop_draft', { id });
 
-export const confirmSetArea = (id: PhotoId) => invoke<void>('confirm_set_area', { id, job: ticket() });
+export const confirmSetArea = (id: PhotoId) => job((t) => invoke<void>('confirm_set_area', { id, job: t }));
 
 export const preview = (id: PhotoId, onEvent: (e: ProgressEvent) => void) =>
-  invoke<void>('preview', { id, onEvent: channel(onEvent), job: ticket() });
+  job((t) => invoke<void>('preview', { id, onEvent: channel(onEvent), job: t }));
 
 // Step 3: all photos
 
 export const matchAll = (onEvent: (e: ProgressEvent) => void) =>
-  invoke<MatchSummary>('match_all', { onEvent: channel(onEvent), job: ticket() });
+  job((t) => invoke<MatchSummary>('match_all', { onEvent: channel(onEvent), job: t }));
 
 export const photoStates = () => invoke<PhotoState[]>('photo_states');
 
@@ -169,7 +170,7 @@ export const setOutputOverride = (path: string | null) =>
   invoke<void>('set_output_override', { path });
 
 export const remove = (onEvent: (e: ProgressEvent) => void) =>
-  invoke<RemoveReport>('remove', { onEvent: channel(onEvent), job: ticket() });
+  job((t) => invoke<RemoveReport>('remove', { onEvent: channel(onEvent), job: t }));
 
 /** Shows the file in the system's file manager (Finder, Explorer), in its folder. */
 export const revealItemInDir = (path: string) => reveal(path);

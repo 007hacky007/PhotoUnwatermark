@@ -11,9 +11,10 @@
   // each photo with a tick, a badge for the ones that need a look, and a summary line. A tile
   // opens the single-photo editor. "Remove" waits until no ticked photo is still marked "?".
   import { onMount } from 'svelte';
-  import { cancelJob, imageUrl, listPhotos, matchAll, photoStates, removalBlockers, setIncluded } from '../lib/api';
+  import { imageUrl, listPhotos, matchAll, photoStates, removalBlockers, setIncluded } from '../lib/api';
   import Waiting from '../lib/components/Waiting.svelte';
   import { copy } from '../lib/copy';
+  import { stopJob } from '../lib/jobs.svelte';
   import type { PhotoId, PhotoInfo, PhotoProblem, PhotoState, UserError } from '../lib/types';
   import type { Wizard } from '../lib/wizard.svelte';
   import CheckWatermark from './CheckWatermark.svelte';
@@ -40,6 +41,8 @@
   let root: HTMLElement | undefined = $state();
   let scrollTop = 0;
   let leaving = false;
+  /** The running search, so a stop names exactly its ticket. */
+  let search: Promise<unknown> | null = null;
 
   const included = $derived(states.filter((s) => s.included).length);
   // The app's own rule (MatchSummary): a photo with its own area counts as found only when that
@@ -72,7 +75,7 @@
   onMount(() => {
     void start();
     return () => {
-      if (matching && !leaving) cancelJob().catch(() => {});
+      if (matching && !leaving && search !== null) void stopJob(search);
       leaving = true;
       setBusy(false);
     };
@@ -93,12 +96,13 @@
       matching = true;
       setBusy(true);
       try {
-        await matchAll((e) => {
+        search = matchAll((e) => {
           if (e.phase === 'matching') {
             done = e.done;
             total = e.total;
           }
         });
+        await search;
       } catch (e) {
         if (!leaving) error = message(e, c.findingFailed);
         loaded = true;
@@ -119,7 +123,7 @@
 
   function stop() {
     leaving = true;
-    cancelJob().catch(() => {});
+    if (search !== null) void stopJob(search);
     wizard.back();
   }
 

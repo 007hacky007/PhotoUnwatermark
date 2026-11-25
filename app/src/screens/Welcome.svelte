@@ -1,5 +1,6 @@
 <script lang="ts">
-  import { cancelJob, downloadModels } from '../lib/api';
+  import { downloadModels } from '../lib/api';
+  import { stopJob } from '../lib/jobs.svelte';
   import Waiting from '../lib/components/Waiting.svelte';
   import { copy, DOWNLOAD_MEGABYTES } from '../lib/copy';
   import type { DownloadProgress, UserError } from '../lib/types';
@@ -9,6 +10,8 @@
 
   let downloading = $state(false);
   let pausing = false;
+  /** The running download's call, so Pause names exactly its ticket. */
+  let call: Promise<void> | null = null;
   let doneBytes = $state(0);
   let error: string | null = $state(null);
   /** Seconds the rest should take at the speed so far; null until that speed is known. */
@@ -51,7 +54,8 @@
     since = null;
     wizard.busy = true;
     try {
-      await downloadModels(onProgress);
+      call = downloadModels(onProgress);
+      await call;
       wizard.busy = false;
       wizard.go('add');
     } catch (e) {
@@ -65,11 +69,8 @@
 
   async function pause() {
     pausing = true;
-    try {
-      await cancelJob();
-    } catch {
-      // The download itself reports how it ended.
-    }
+    // The download itself reports how it ended.
+    if (call !== null) await stopJob(call);
   }
 </script>
 

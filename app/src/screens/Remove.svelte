@@ -13,7 +13,6 @@
   import { onMount } from 'svelte';
   import {
     appStatus,
-    cancelJob,
     checkOutput,
     chooseFolder,
     closeWindow,
@@ -27,6 +26,7 @@
   import Dialog from '../lib/components/Dialog.svelte';
   import Waiting from '../lib/components/Waiting.svelte';
   import { copy } from '../lib/copy';
+  import { stopJob } from '../lib/jobs.svelte';
   import type { PhotoId, ProgressEvent, RemoveReport, UserError } from '../lib/types';
   import type { Wizard } from '../lib/wizard.svelte';
 
@@ -68,6 +68,8 @@
   let quitting = false;
 
   let running = false;
+  /** The run's call, so Stop names exactly its ticket. */
+  let call: Promise<unknown> | null = null;
   let left = false;
   let stopGuards: (() => void)[] = [];
 
@@ -83,7 +85,7 @@
     void check();
     return () => {
       left = true;
-      if (running) cancelJob().catch(() => {});
+      if (running && call !== null) void stopJob(call);
       unguard();
       wizard.busy = false;
     };
@@ -173,7 +175,9 @@
     void guard();
     let report: RemoveReport | null = null;
     try {
-      report = await remove(onEvent);
+      const run = remove(onEvent);
+      call = run;
+      report = await run;
     } catch (e) {
       if (!left) {
         error = message(e, c.failed);
@@ -242,9 +246,8 @@
     asking = null;
     stopping = true;
     sentence = quitting ? c.quitting : c.stopping;
-    cancelJob().catch(() => {
-      // The run reports how it ended either way.
-    });
+    // The run reports how it ended either way.
+    if (call !== null) void stopJob(call);
   }
 
   function stopAndQuit() {
