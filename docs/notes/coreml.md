@@ -11,6 +11,9 @@ card (fast)"). Since Plan 2 Task 1b the engine works like this on macOS:
   partial placement that was measured to be faster than the processor alone (see "Partial
   placement" below). Any other partial placement would be loaded again for the processor and
   reported as `Cpu { PartialGpu }`.
+- Only on Apple silicon (`target_arch = "aarch64"`). An Intel Mac never registers Core ML: every
+  model loads for the processor with `Cpu { ProviderUnavailable("This Mac has no Neural Engine") }`
+  (see "Intel Macs" below).
 - Every other session (`prefer_gpu = false`, and every fallback) sets
   `AutoDevicePolicy::PreferCPU`, so `Cpu` in the report really is the processor. Before Task 1b
   those sessions ran on Core ML without saying so (see `model-loading.md`).
@@ -137,6 +140,23 @@ Both partial placements are kept on Core ML, because neither is slower than the 
 - Face: the whole model runs on Core ML (`share: None`).
 
 On Windows the policy is unchanged: DirectML is used only for a model it runs completely.
+
+## Intel Macs
+
+Not measured: every number in this note is from an M1 Pro. The chosen compute units,
+`CPUAndNeuralEngine`, need a Neural Engine, which no Intel Mac has; there Core ML would run the
+models on the processor while the report said "Core ML", and the partial-placement decisions above
+would rest on no evidence. So the engine uses Core ML only on Apple silicon, and an Intel Mac
+reports `Cpu { ProviderUnavailable("This Mac has no Neural Engine") }` for every model. There is
+also no prebuilt ONNX Runtime for `x86_64-apple-darwin` (see `ort-linking.md`), so an Intel build
+needs a self-built ONNX Runtime anyway.
+
+## Tests
+
+The model-quality tests (`detect`, `faces`, `inpaint`, `pipeline`) build their engine with
+`tests/common::shipping_options()`: `prefer_gpu` on macOS, so a Mac runs them on Core ML as the app
+ships, and the processor elsewhere (the Windows CI runner has no GPU). Engine tests of processor
+behaviour use explicit processor options.
 
 ## Core ML vs processor (the GPU parity test)
 

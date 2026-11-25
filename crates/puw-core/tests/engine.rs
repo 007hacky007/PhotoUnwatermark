@@ -211,7 +211,7 @@ fn intra_threads_applied() {
     assert_eq!(outs.len(), 12);
 }
 
-#[cfg(target_os = "macos")]
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
 #[test]
 fn mac_prefers_core_ml() {
     let _gpu = gpu_lock();
@@ -233,7 +233,7 @@ fn cpu_is_really_cpu() {
     assert_eq!(engine.providers(ModelKind::Lama), None);
 }
 
-#[cfg(target_os = "macos")]
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
 #[test]
 fn core_ml_cache_dir_used() {
     let _gpu = gpu_lock();
@@ -357,7 +357,7 @@ fn engine_reports_gpu_honestly() {
     // Measured in docs/notes/coreml.md: Core ML runs the whole face model, all of the segmenter
     // but 8 small nodes at its end, and part of LaMa; both partial placements are faster than
     // the processor alone, so they are kept.
-    #[cfg(target_os = "macos")]
+    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
     {
         let core_ml = |b: &Option<Backend>| match b {
             Some(Backend::Gpu { name, share }) if name == "Core ML" => Some(*share),
@@ -370,6 +370,16 @@ fn engine_reports_gpu_honestly() {
                 "{backend:?}"
             );
         }
+    }
+    // Intel Macs have no Neural Engine and never use Core ML.
+    #[cfg(all(target_os = "macos", not(target_arch = "aarch64")))]
+    for backend in [&report.segmenter, &report.lama, &report.face] {
+        assert_eq!(
+            backend,
+            &Some(Backend::Cpu {
+                reason: CpuReason::ProviderUnavailable("This Mac has no Neural Engine".to_string())
+            })
+        );
     }
 }
 

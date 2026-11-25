@@ -2,7 +2,7 @@
 //!
 //! Each model loads on first use (see [`Engine`]); different models may load at the same time from
 //! different threads. With `prefer_gpu` each model is first loaded with the platform's GPU
-//! provider: Core ML on macOS, DirectML on Windows. ONNX Runtime's own session log is captured
+//! provider: Core ML on Apple silicon Macs, DirectML on Windows. ONNX Runtime's own session log is captured
 //! while the model loads and read for how many graph nodes the provider took. The report says
 //! `Gpu` only when that log shows the provider runs the whole model, or, on Core ML, a part of it
 //! measured to be faster than the processor alone (the report then gives the share). Anything
@@ -163,7 +163,8 @@ pub struct EngineOptions {
     /// physical core).
     pub intra_threads: Option<usize>,
     /// A folder where Core ML keeps each model compiled for this Mac, so later loads skip the
-    /// compile step (about 16 s for the segmenter or LaMa); ignored on other platforms. Each model
+    /// compile step (about 16 s for the segmenter or LaMa); ignored where Core ML is not used
+    /// (Intel Macs and other platforms). Each model
     /// gets a subfolder named after its file's size and modification time, and subfolders left by
     /// older files of the same model are deleted.
     pub cache_dir: Option<PathBuf>,
@@ -455,7 +456,8 @@ fn environment() -> Result<&'static Environment> {
     .map_err(|e| model_err("could not start ONNX Runtime", e))
 }
 
-/// A GPU execution provider this build can try: Core ML on macOS, DirectML on Windows.
+/// A GPU execution provider this build can try: Core ML on Apple silicon Macs, DirectML on
+/// Windows.
 #[cfg_attr(not(any(windows, target_os = "macos")), allow(dead_code))]
 struct GpuProvider {
     /// Name shown to the user.
@@ -987,15 +989,33 @@ mod platform {
     use ort::ep::coreml::ComputeUnits;
     use std::path::Path;
 
+    /// Why an Intel Mac runs every model on the processor.
+    pub(super) const NO_NEURAL_ENGINE: &str = "This Mac has no Neural Engine";
+
+    pub(super) fn gpu_provider(
+        _helper_dir: Option<&Path>,
+        cache_dir: Option<&Path>,
+    ) -> Result<GpuProvider, CpuReason> {
+        core_ml(cfg!(target_arch = "aarch64"), cache_dir)
+    }
+
     /// Core ML with compute units `CPUAndNeuralEngine` and its default NeuralNetwork model
     /// format. That is what ONNX Runtime's automatic provider selection (`MaxEfficiency`) used
     /// before the engine registered Core ML itself, so results stay the ones Plan 1 was tuned on;
     /// the default compute units (All) gave a different, partly broken LaMa result
     /// (`docs/notes/coreml.md`).
-    pub(super) fn gpu_provider(
-        _helper_dir: Option<&Path>,
+    ///
+    /// Only on Apple silicon (`apple_silicon`). An Intel Mac has no Neural Engine, so Core ML
+    /// would run these models on the processor while the report said "Core ML", and the
+    /// measurements behind [`KEEP_PARTIAL`] were made on Apple silicon only; Intel Macs use the
+    /// processor.
+    pub(super) fn core_ml(
+        apple_silicon: bool,
         cache_dir: Option<&Path>,
     ) -> Result<GpuProvider, CpuReason> {
+        if !apple_silicon {
+            return Err(CpuReason::ProviderUnavailable(NO_NEURAL_ENGINE.to_string()));
+        }
         Ok(GpuProvider {
             name: "Core ML",
             ep_name: "CoreMLExecutionProvider",
@@ -1301,5 +1321,24 @@ mod tests {
             " Node(s) placed on [CPUExecutionProvider]. Number of nodes: 10",
         ]);
         assert_eq!(placement(&log, DML), Some(Placement { gpu: 90, cpu: 10 }));
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn core_ml_only_on_apple_silicon() {
+        match platform::core_ml(false, None) {
+            Err(CpuReason::ProviderUnavailable(why)) => {
+                assert_eq!(why, "This Mac has no Neural Engine")
+            }
+            Err(other) => panic!("unexpected reason {other:?}"),
+            Ok(provider) => panic!("{} offered on an Intel Mac", provider.name),
+        }
+        match platform::core_ml(true, None) {
+            Ok(provider) => {
+                assert_eq!(provider.name, "Core ML");
+                assert_eq!(provider.keep_partial, ["segmenter", "lama"]);
+            }
+            Err(reason) => panic!("no Core ML on Apple silicon: {reason:?}"),
+        }
     }
 }

@@ -7,7 +7,7 @@ use std::time::Instant;
 
 use image::{GrayImage, Luma, RgbImage};
 use puw_core::Error;
-use puw_core::engine::{Engine, EngineOptions, ModelPaths};
+use puw_core::engine::{Engine, ModelPaths};
 use puw_core::inpaint::{EDGE_RADIUS, Progress, inpaint};
 use puw_core::mask::{self, Mask};
 
@@ -20,7 +20,7 @@ fn engine() -> Option<&'static Engine> {
                 return None;
             };
             let paths = ModelPaths::from_dir(&dir).expect("model files present");
-            Some(Engine::new(&paths, EngineOptions::default()).expect("engine loads"))
+            Some(Engine::new(&paths, common::shipping_options()).expect("engine loads"))
         })
         .as_ref()
 }

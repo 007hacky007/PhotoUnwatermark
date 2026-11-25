@@ -1,9 +1,21 @@
 //! Helpers shared by the integration tests.
 #![allow(dead_code)]
 
+use puw_core::engine::EngineOptions;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::sync::OnceLock;
+
+/// Engine options as the app ships them, for the tests that check output quality: Core ML on
+/// Macs (it falls back to the processor where Core ML is not used, such as Intel Macs), the
+/// processor elsewhere (the Windows CI runner has no GPU). Tests of processor behaviour build
+/// their own options.
+pub fn shipping_options() -> EngineOptions {
+    EngineOptions {
+        prefer_gpu: cfg!(target_os = "macos"),
+        ..EngineOptions::default()
+    }
+}
 
 /// Folder with the model files, from `PUW_MODELS_DIR`. Tests that need models return early
 /// with `eprintln!("skipped: PUW_MODELS_DIR not set")` when this is `None`.

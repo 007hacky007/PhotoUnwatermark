@@ -13,8 +13,8 @@ use puw_core::detect::{GuessOptions, guess_single};
 use puw_core::faces::{detect_faces_near, drop_eye_components, guard};
 use puw_core::mask::{self, Mask, is_empty};
 use puw_core::{
-    Engine, EngineOptions, Error, LoadedPhoto, ModelPaths, Progress, build_set_layers, guess_photo,
-    load, output_dir_for, pick_representative, remove_one, representative_sample,
+    Engine, Error, LoadedPhoto, ModelPaths, Progress, build_set_layers, guess_photo, load,
+    output_dir_for, pick_representative, remove_one, representative_sample,
 };
 
 fn engine() -> Option<&'static Engine> {
@@ -26,7 +26,7 @@ fn engine() -> Option<&'static Engine> {
                 return None;
             };
             let paths = ModelPaths::from_dir(&dir).expect("model files present");
-            Some(Engine::new(&paths, EngineOptions::default()).expect("engine loads"))
+            Some(Engine::new(&paths, common::shipping_options()).expect("engine loads"))
         })
         .as_ref()
 }
