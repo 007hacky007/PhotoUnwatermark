@@ -39,7 +39,7 @@ use crate::image_io::{LoadedPhoto, load, save_result, upright_size};
 use crate::inpaint::{Progress, inpaint};
 use crate::mask::{self, Mask, is_empty};
 use crate::template::{
-    MatchBasis, MatchResult, MatchStatus, WatermarkTemplate, find, saved_placement,
+    MatchBasis, MatchResult, MatchStatus, WatermarkTemplate, find, saved_placement, saved_score,
 };
 use crate::{Error, Result};
 use image::RgbImage;
@@ -242,14 +242,25 @@ pub fn build_set_layers(paths: &[PathBuf], progress: &Progress) -> Result<SetLay
 const PRIOR_SUPPORT: f64 = 0.5;
 /// Growth of the batch layer for the support check, as a fraction of the long side.
 const PRIOR_GROW: f32 = 0.004;
+/// Score at the saved position (masked NCC, +-2 px, scale 1) for `Found` on set support.
+/// Calibrated on the synthetic fixed set with its own layer and the template of photo 0:
+/// photos without the mark (the clean/ originals other than the reference's scene, and the
+/// negative set resized to 1536x1024) score 0.00-0.155, the 7 other faint (alpha 0.12) marked
+/// photos 0.175-0.331. See `docs/notes/thresholds.md`.
+pub const PRIOR_FOUND: f32 = 0.28;
+/// Score at the saved position for `Unsure` on set support (the user opens the photo).
+pub const PRIOR_UNSURE: f32 = 0.16;
 
 /// [`find`] with a position prior for marks stamped at the same place on every photo.
 ///
 /// When `find` does not return `Found`, `img` has exactly the template's reference size and
 /// `layers` has a layer for that size, the template's pieces are placed at their saved
 /// position and scale 1. If at least half of those pixels lie inside the layer grown by
-/// [`mask::grow_for`] (0.004), the result is `Found` with that placement, `find`'s confidence
-/// and [`MatchBasis::SetPosition`]. In every other case the `find` result is returned as is.
+/// [`mask::grow_for`] (0.004), the photo itself must also show the mark there: the template's
+/// score at the saved position (the fast path of [`find`], +-2 px) decides. At least
+/// [`PRIOR_FOUND`] gives `Found`, at least [`PRIOR_UNSURE`] gives `Unsure`, both with
+/// [`MatchBasis::SetPosition`], that score as the confidence and the saved placement as the
+/// mask. In every other case the `find` result is returned as is.
 pub fn match_photo(t: &WatermarkTemplate, img: &RgbImage, layers: &SetLayers) -> MatchResult {
     let found = find(t, img);
     let (w, h) = img.dimensions();
@@ -273,9 +284,19 @@ pub fn match_photo(t: &WatermarkTemplate, img: &RgbImage, layers: &SetLayers) ->
     if total == 0 || (inside as f64) < PRIOR_SUPPORT * total as f64 {
         return found;
     }
+    let Some(score) = saved_score(t, img) else {
+        return found;
+    };
+    let status = if score >= PRIOR_FOUND {
+        MatchStatus::Found
+    } else if score >= PRIOR_UNSURE {
+        MatchStatus::Unsure
+    } else {
+        return found;
+    };
     MatchResult {
-        status: MatchStatus::Found,
-        confidence: found.confidence,
+        status,
+        confidence: score,
         mask: mask::binarize(&placed),
         basis: MatchBasis::SetPosition,
     }

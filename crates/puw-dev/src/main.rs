@@ -19,6 +19,7 @@ use puw_core::detect::predict_prob;
 use puw_core::image_io::upright_size;
 use puw_core::mask;
 use puw_core::pipeline::MIN_BATCH_PHOTOS;
+use puw_core::template::saved_score;
 use puw_core::template::{FOUND, UNSURE};
 use puw_core::{
     Engine, EngineOptions, Guess, GuessOptions, LoadedPhoto, Mask, MatchStatus, ModelKind,
@@ -968,6 +969,8 @@ fn sweep_real(synthetic: Vec<(String, RgbImage)>, all_refs: bool) -> BoxResult<(
                 // Photos where `match_photo` (the set position prior) gives Found, and how many
                 // of those rest on the prior.
                 let (mut prior_pos, mut prior_pos_set, mut prior_neg) = (0, 0, 0);
+                let mut prior_unsure = 0;
+                let mut saved = Vec::new();
                 for &r in &refs {
                     let mut tmpl = build_template(&set[r].rgb, &layer);
                     let pieces: Vec<String> = tmpl
@@ -1010,6 +1013,10 @@ fn sweep_real(synthetic: Vec<(String, RgbImage)>, all_refs: bool) -> BoxResult<(
                         let pm = match_photo(&tmpl, &p.rgb, &set_layers);
                         prior_pos += (pm.status == MatchStatus::Found) as usize;
                         prior_pos_set += (pm.basis == MatchBasis::SetPosition) as usize;
+                        prior_unsure += (pm.status == MatchStatus::Unsure) as usize;
+                        if let Some(v) = saved_score(&tmpl, &p.rgb) {
+                            saved.push(f64::from(v));
+                        }
                         pos.push(Case::of(&m, iou));
                     }
                     for (j, other) in photos.iter().enumerate().filter(|(j, _)| *j != k) {
@@ -1048,6 +1055,12 @@ fn sweep_real(synthetic: Vec<(String, RgbImage)>, all_refs: bool) -> BoxResult<(
                     pos.len(),
                     prior_neg,
                     real_neg.len()
+                );
+                println!(
+                    "  saved-position score: {}; match_photo Found {prior_pos} / Unsure \
+                     {prior_unsure} / other {}",
+                    summary(&saved, 3),
+                    pos.len() - prior_pos - prior_unsure
                 );
                 report_sweep(
                     &format!("{label}: other real sets as negatives"),

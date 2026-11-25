@@ -102,8 +102,10 @@ pub enum MatchBasis {
 #[derive(Debug, Clone)]
 pub struct MatchResult {
     pub status: MatchStatus,
-    /// Match score, 0..=1: the masked NCC of the best placement, the minimum over the pieces
-    /// when there are several.
+    /// Match score, 0..=1: the masked NCC of the placement that `mask` shows, the minimum over
+    /// the pieces when there are several. For [`MatchBasis::Search`] it is the best placement
+    /// found anywhere (for `NotFound`, the best of a rejected search); for
+    /// [`MatchBasis::SetPosition`] it is the score at the saved position.
     pub confidence: f32,
     /// Image-size mask with the piece shapes at the found placement(s); empty (all 0) for
     /// [`MatchStatus::NotFound`].
@@ -271,6 +273,25 @@ pub fn find(t: &WatermarkTemplate, img: &RgbImage) -> MatchResult {
         mask: out,
         basis: MatchBasis::Search,
     }
+}
+
+/// Score of the template at its saved position in `img` (same size as the reference): the
+/// fast path of [`find`] alone (+-2 px, scale 1, minimum over the pieces). `None` for a damaged
+/// template or a photo of another size.
+pub fn saved_score(t: &WatermarkTemplate, img: &RgbImage) -> Option<f32> {
+    if img.dimensions() != (t.ref_w, t.ref_h) || t.pieces.is_empty() {
+        return None;
+    }
+    let pieces = t
+        .pieces
+        .iter()
+        .map(|p| Prepared::new(p, t.ref_w, t.ref_h))
+        .collect::<Option<Vec<_>>>()?;
+    let singles: Vec<Tmpl> = (0..pieces.len())
+        .map(|i| Tmpl::new(&pieces, &[i]))
+        .collect();
+    let target = Target::new(img);
+    fast_path(t, &pieces, &singles, &target).map(|o| o.score.clamp(0.0, 1.0))
 }
 
 /// The template's pieces drawn at their saved position and scale 1 into a `t.ref_w` x `t.ref_h`

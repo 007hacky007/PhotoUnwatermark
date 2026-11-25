@@ -257,14 +257,30 @@ and none of the lines.
 ## Position prior (`match_photo`)
 
 `match_photo` calls `find`; when that is not `Found`, the photo has the template's size and the
-set has a batch layer for it, the saved placement counts as `Found` if at least 50 % of its
-pixels lie inside the layer grown by `grow_for(w, h, 0.004)`. The confidence stays `find`'s.
+set has a batch layer for it, and at least 50 % of the saved placement lies in the layer grown
+by `grow_for(w, h, 0.004)`, the photo must also show the mark at the saved position. The score
+is `find`'s fast path alone (masked NCC, +-2 px, scale 1, minimum over the pieces), exposed as
+`template::saved_score`. `PRIOR_FOUND` 0.28 gives `Found`, `PRIOR_UNSURE` 0.16 gives `Unsure`
+(both with basis `SetPosition`, confidence = that score); below it `find`'s result stays.
+The first version of the rule (layer support alone) marked every same-size photo, with or
+without the mark, as `Found`; the score gate is the fix.
 
-Synthetic: the fixed set re-blended at alpha 0.12 (stored photos carry 0.25) leaves free search
-below `Found` on at least one photo; with the prior all 8 are `Found` at IoU >= 0.8. Negative
-photos resized to the template size with no layer never reach `Found`.
+Calibration, synthetic fixed set (template of photo 0, the set's own layer):
+
+| photos | n | saved-position score |
+|---|---|---|
+| faint marked (alpha 0.12), photos 1-7 | 7 | 0.175-0.331 (4 Found, 3 Unsure) |
+| clean/ of the same scenes, photos 1-7 | 7 | 0.000-0.155 |
+| negative set resized to 1536x1024 | 6 | 0.000-0.102 |
+
+The reference's own clean photo scores 0.836 (the template holds that scene's edges), so it is
+not a negative. The margin between the highest negative (0.155) and `PRIOR_FOUND` is 0.125;
+between it and `PRIOR_UNSURE` only 0.005, so a clean photo can land just under the Unsure bar
+and a faint one (0.175) just over it. Synthetic only; the faint positives and the negatives
+overlap closely at the low end.
 
 Real set-a (7 photos besides the reference, `puw-dev match-sweep --real`, template built from
 the batch layer, so the layer supports its own placement by construction): `find` Found 0 / 7
-(4 Unsure, 3 NotFound); `match_photo` Found 7 / 7, all on the set position. The one photo of
-the other real set (different size) stays not `Found` (the prior does not apply).
+(4 Unsure, 3 NotFound). Saved-position score min 0.234, median 0.329, max 0.435. `match_photo`:
+Found 6 / Unsure 1 / NotFound 0. The one photo of the other real set (different size) stays not
+`Found` (the prior does not apply).

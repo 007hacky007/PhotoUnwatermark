@@ -12,6 +12,7 @@ use puw_core::batch::{BATCH_HIGH, BATCH_LOW, batch_lines, filter_layer, median_g
 use puw_core::detect::{GuessOptions, guess_single};
 use puw_core::faces::{detect_faces_near, drop_eye_components, guard};
 use puw_core::mask::{self, Mask, is_empty};
+use puw_core::pipeline::{PRIOR_FOUND, PRIOR_UNSURE};
 use puw_core::template::MatchBasis;
 use puw_core::{
     Engine, Error, LoadedPhoto, MatchStatus, ModelPaths, Progress, SetLayers, build_set_layers,
@@ -488,12 +489,37 @@ fn prior_finds_faint_fixed_mark() {
         free.iter().any(|&s| s != MatchStatus::Found),
         "premise: free search misses at least one photo, got {free:?}"
     );
+    let mut found = 0;
     for (i, p) in photos.iter().enumerate() {
         let m = match_photo(&tmpl, p, &layers);
-        assert_eq!(m.status, MatchStatus::Found, "photo {i}");
+        assert_ne!(m.status, MatchStatus::NotFound, "photo {i}");
+        found += (m.status == MatchStatus::Found) as usize;
+        if m.basis == MatchBasis::SetPosition {
+            assert!(m.confidence >= PRIOR_UNSURE, "photo {i}");
+        }
         let q = iou(&m.mask, &gts[i]);
         assert!(q >= 0.8, "photo {i}: iou {q:.3}");
     }
+    assert!(found >= 4, "only {found} of 8 Found");
+}
+
+#[test]
+fn prior_unsure_on_weak_evidence() {
+    // Photo 5 of the faint fixed set scores 0.175 at the saved position: between the
+    // thresholds, so it is Unsure on the set position.
+    let dir = tempfile::tempdir().expect("tempdir");
+    let (photos, gts, paths) = faint_fixed(0.12, dir.path());
+    let layers = no_progress_layers(&paths);
+    let tmpl = build_template(&photos[0], &gts[0]);
+    let m = match_photo(&tmpl, &photos[5], &layers);
+    assert_eq!(m.status, MatchStatus::Unsure);
+    assert_eq!(m.basis, MatchBasis::SetPosition);
+    assert!(
+        (PRIOR_UNSURE..PRIOR_FOUND).contains(&m.confidence),
+        "{}",
+        m.confidence
+    );
+    assert!(iou(&m.mask, &gts[5]) >= 0.8);
 }
 
 #[test]
@@ -548,16 +574,34 @@ fn prior_ignored_for_other_size() {
 
 #[test]
 fn negatives_stay_not_found() {
+    // The fixed set's real layer and the template of its photo 0 against photos without the
+    // mark: the other clean scenes of the set (photo 0's own scene is the template's, so it is
+    // left out) and the negative set resized to the template size.
     let dir = tempfile::tempdir().expect("tempdir");
-    let (photos, gts, _) = faint_fixed(0.12, dir.path());
+    let (photos, gts, paths) = faint_fixed(0.12, dir.path());
+    let layers = no_progress_layers(&paths);
+    assert!(layers.get(1536, 1024).is_some(), "the set has a layer");
     let tmpl = build_template(&photos[0], &gts[0]);
-    let layers = SetLayers::none();
-    let neg = common::synth_dir().join("negative/marked");
-    for e in fs::read_dir(neg).expect("read dir") {
+    let synth = common::synth_dir();
+    let mut negatives: Vec<RgbImage> = (1..8)
+        .map(|i| open_rgb(&synth.join(format!("fixed/clean/0{i}.png"))))
+        .collect();
+    for e in fs::read_dir(synth.join("negative/marked")).expect("read dir") {
         let img = open_rgb(&e.expect("entry").path());
-        let img = imageops::resize(&img, 1536, 1024, imageops::FilterType::Triangle);
-        let m = match_photo(&tmpl, &img, &layers);
-        assert_ne!(m.status, MatchStatus::Found);
+        negatives.push(imageops::resize(
+            &img,
+            1536,
+            1024,
+            imageops::FilterType::Triangle,
+        ));
+    }
+    assert_eq!(negatives.len(), 13);
+    for (i, img) in negatives.iter().enumerate() {
+        let m = match_photo(&tmpl, img, &layers);
+        assert_ne!(m.status, MatchStatus::Found, "negative {i}");
+        // With no layer the prior cannot apply at all.
+        let m = match_photo(&tmpl, img, &SetLayers::none());
+        assert_ne!(m.status, MatchStatus::Found, "negative {i} without a layer");
         assert_eq!(m.basis, MatchBasis::Search);
     }
 }
