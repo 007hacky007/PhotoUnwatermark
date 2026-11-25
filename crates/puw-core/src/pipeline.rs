@@ -29,7 +29,9 @@ use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::Ordering;
 
-use crate::batch::{BATCH_HIGH, BATCH_LOW, PackedLumas, batch_lines, median_gradient_packed};
+use crate::batch::{
+    BATCH_HIGH, BATCH_LOW, PackedLumas, batch_lines, filter_layer, median_gradient_packed,
+};
 use crate::detect::{Guess, GuessOptions, guess_single};
 use crate::engine::Engine;
 use crate::faces::{Face, detect_faces_near, drop_eye_components, guard};
@@ -48,7 +50,7 @@ pub const BATCH_SAMPLE_CAP: usize = 24;
 /// about this plus 0.4 GB at 36 MP (measured 1.53 GB for 40 and for 200 photos of 7360x4912).
 pub const BATCH_LUMA_BUDGET: u64 = 1_200_000_000;
 /// Most photos [`representative_sample`] picks.
-pub const REPRESENTATIVE_CAP: usize = 6;
+pub const REPRESENTATIVE_CAP: usize = 3;
 
 /// The batch layers of a set: for each upright photo size whose group got one, the mask of
 /// the mark stamped at the same place on every photo.
@@ -143,18 +145,18 @@ const MEDIAN_UNITS: usize = 4;
 /// Photos are read one at a time: first every photo's header for its upright size, then, per
 /// group, an evenly spaced sample (see [`BATCH_SAMPLE_CAP`] and [`BATCH_LUMA_BUDGET`]) is
 /// decoded and kept as luma for [`crate::batch::median_gradient`]'s median, followed by
-/// [`batch_lines`] with [`BATCH_LOW`] / [`BATCH_HIGH`]. Peak memory is bounded by the sample
-/// (see [`BATCH_LUMA_BUDGET`]), whatever the size of the set.
+/// [`batch_lines`] with [`BATCH_LOW`] / [`BATCH_HIGH`] and [`filter_layer`]. Peak memory is
+/// bounded by the sample (see [`BATCH_LUMA_BUDGET`]), whatever the size of the set.
 ///
 /// A group whose size is so large that [`MIN_BATCH_PHOTOS`] photos exceed [`BATCH_LUMA_BUDGET`]
 /// (sizes come from file headers, which may lie) has no layer either (logged). Memory is
 /// claimed only as photos decode.
 ///
 /// A photo that cannot be read is left out (logged); a group with fewer than
-/// [`MIN_BATCH_PHOTOS`] readable photos in its sample, or whose layer finds nothing, has no
-/// layer, so a mixed or damaged set never fails here. `progress` gets fractions from 0.0 to
-/// 1.0, and its cancel flag is checked before each photo and each median; when set, this
-/// returns [`Error::Cancelled`].
+/// [`MIN_BATCH_PHOTOS`] readable photos in its sample, or whose layer finds nothing (or nothing
+/// that survives [`filter_layer`]), has no layer, so a mixed or damaged set never fails here.
+/// `progress` gets fractions from 0.0 to 1.0, and its cancel flag is checked before each photo
+/// and each median; when set, this returns [`Error::Cancelled`].
 pub fn build_set_layers(paths: &[PathBuf], progress: &Progress) -> Result<SetLayers> {
     let mut units = Units {
         progress,
@@ -216,7 +218,10 @@ pub fn build_set_layers(paths: &[PathBuf], progress: &Progress) -> Result<SetLay
             drop(lumas);
             match mag {
                 Ok(mag) => {
-                    if let Some(layer) = batch_lines(&mag, BATCH_LOW, BATCH_HIGH) {
+                    let layer = batch_lines(&mag, BATCH_LOW, BATCH_HIGH)
+                        .map(|l| filter_layer(&l))
+                        .filter(|l| !is_empty(l));
+                    if let Some(layer) = layer {
                         layers.insert((w, h), layer);
                     }
                 }

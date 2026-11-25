@@ -3,7 +3,8 @@
 //!
 //! `--real` reads the photo sets in `PUW_REAL_DIR` (one subfolder per set) and prints aggregate
 //! numbers only: no file names, no paths, no images. Results it has to write for timing go to a
-//! temporary folder outside the repository and are deleted afterwards.
+//! temporary folder outside the repository and are deleted afterwards. The one exception is
+//! `guess --overlay`, which writes overlays to the folder it is given (keep it under `local/`).
 
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
@@ -21,7 +22,7 @@ use puw_core::template::{FOUND, UNSURE};
 use puw_core::{
     Engine, EngineOptions, Guess, GuessOptions, LoadedPhoto, Mask, MatchStatus, ModelKind,
     ModelPaths, Progress, SetLayers, WORK_LONG_SIDE, build_set_layers, build_template, find,
-    guess_photo, load, remove_one,
+    guess_photo, load, pick_representative, remove_one, representative_sample,
 };
 
 type BoxResult<T> = Result<T, Box<dyn std::error::Error>>;
@@ -75,6 +76,18 @@ enum Cmd {
     Layers {
         #[command(flatten)]
         source: Source,
+    },
+    /// Automatic first guess as the app makes it before the editor opens: `build_set_layers`,
+    /// then `guess_photo` on the `representative_sample`. Prints coverage of the layers and the
+    /// guesses. A `--set` folder without marked/ is read as a plain photo folder.
+    Guess {
+        #[command(flatten)]
+        source: Source,
+        /// Write the representative photo of each set here as `set-<k>-guess.png` (the grown
+        /// guess tinted red, the batch layer in yellow) and its batch layer as
+        /// `set-<k>-layer.png`.
+        #[arg(long)]
+        overlay: Option<PathBuf>,
     },
     /// Template-matching scores: a confirmed mark as template, searched in the other photos.
     MatchSweep {
@@ -131,6 +144,16 @@ fn run_cli(cli: Cli) -> BoxResult<()> {
             }
             None => layers_report(&real_sets()?, true),
         },
+        Cmd::Guess { source, overlay } => {
+            let sets = match source.set {
+                Some(dir) => {
+                    let marked = dir.join("marked");
+                    vec![photo_files(if marked.is_dir() { &marked } else { &dir })?]
+                }
+                None => real_sets()?,
+            };
+            guess_report(&engine()?, &sets, overlay.as_deref())
+        }
         Cmd::MatchSweep {
             source,
             negatives,
@@ -555,6 +578,79 @@ fn layers_report(sets: &[Vec<PathBuf>], real: bool) -> BoxResult<()> {
         print_groups(&batch_groups(&sizes, &layers));
     }
     Ok(())
+}
+
+// ---------------------------------------------------------------------------------------------
+// guess
+
+/// `guess`: the first guesses of each set, aggregate numbers only (photos are named by their
+/// position in the set).
+fn guess_report(engine: &Engine, sets: &[Vec<PathBuf>], overlay: Option<&Path>) -> BoxResult<()> {
+    let opts = GuessOptions::default();
+    for (k, files) in sets.iter().enumerate() {
+        let k = k + 1;
+        let t = Instant::now();
+        let layers = build_set_layers(files, &Progress::none())?;
+        println!(
+            "== set {k}: {} photos, build_set_layers {:.1} s",
+            files.len(),
+            t.elapsed().as_secs_f64()
+        );
+        for ((w, h), l) in layers.iter() {
+            println!(
+                "  batch layer {w}x{h}: coverage {:.2} %, {} components",
+                100.0 * mask::coverage(l),
+                mask::components(l).len()
+            );
+        }
+        let sample = representative_sample(files.len());
+        let t = Instant::now();
+        let mut photos = Vec::new();
+        let mut guesses = Vec::new();
+        for &i in &sample {
+            let photo = load_real(&files[i..=i], k)?.remove(0);
+            let g = guess_photo(engine, &photo, &layers, &opts)?;
+            println!(
+                "  photo {}: coverage {:.2} %, confidence {:.3}",
+                i + 1,
+                100.0 * mask::coverage(&g.mask),
+                g.confidence
+            );
+            photos.push(photo);
+            guesses.push(g);
+        }
+        let rep = pick_representative(&guesses);
+        println!(
+            "  {} guesses in {:.1} s, representative photo {}",
+            sample.len(),
+            t.elapsed().as_secs_f64(),
+            sample.get(rep).map_or(0, |i| i + 1)
+        );
+        if let (Some(dir), Some(photo), Some(g)) = (overlay, photos.get(rep), guesses.get(rep)) {
+            let (w, h) = photo.rgb.dimensions();
+            let out = guess_overlay(&photo.rgb, &g.mask, layers.get(w, h));
+            std::fs::create_dir_all(dir)?;
+            out.save(dir.join(format!("set-{k}-guess.png")))?;
+            if let Some(l) = layers.get(w, h) {
+                l.save(dir.join(format!("set-{k}-layer.png")))?;
+            }
+        }
+    }
+    Ok(())
+}
+
+/// `img` with `guess` tinted red and the pixels of `layer` painted yellow.
+fn guess_overlay(img: &RgbImage, guess: &Mask, layer: Option<&Mask>) -> RgbImage {
+    let mut out = img.clone();
+    for (x, y, p) in out.enumerate_pixels_mut() {
+        if layer.is_some_and(|l| l.get_pixel(x, y).0[0] != 0) {
+            p.0 = [255, 230, 0];
+        } else if guess.get_pixel(x, y).0[0] != 0 {
+            let [r, g, b] = p.0;
+            p.0 = [r / 2 + 128, g / 2, b / 2];
+        }
+    }
+    out
 }
 
 /// One row of the per-scale table: a scale or a vote over scales.

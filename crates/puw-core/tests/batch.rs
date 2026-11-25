@@ -1,9 +1,9 @@
 mod common;
 
-use image::{RgbImage, imageops};
-use puw_core::Error;
-use puw_core::batch::{BATCH_HIGH, BATCH_LOW, batch_lines, median_gradient};
+use image::{Luma, RgbImage, imageops};
+use puw_core::batch::{BATCH_HIGH, BATCH_LOW, batch_lines, filter_layer, median_gradient};
 use puw_core::mask::{self, Mask};
+use puw_core::{Error, Progress, build_set_layers};
 use std::path::{Path, PathBuf};
 use std::time::Instant;
 
@@ -183,4 +183,67 @@ fn negative_set_none() {
             assert!(c < 0.01, "coverage {c}");
         }
     }
+}
+
+/// Share (0..1) of the set pixels of `truth` that are also set in `found`.
+fn covered(found: &Mask, truth: &Mask) -> f32 {
+    let total = truth.pixels().filter(|p| p.0[0] != 0).count();
+    let hit = truth
+        .pixels()
+        .zip(found.pixels())
+        .filter(|(a, b)| a.0[0] != 0 && b.0[0] != 0)
+        .count();
+    hit as f32 / total.max(1) as f32
+}
+
+#[test]
+fn filter_keeps_watermark() {
+    let set = common::synth_dir().join("fixed");
+    let paths = pngs(&set.join("marked"));
+    let layers = build_set_layers(&paths, &Progress::none()).expect("layers");
+    let gt: Mask = image::open(set.join("mask").join("00.png"))
+        .expect("gt")
+        .to_luma8();
+    let (w, h) = gt.dimensions();
+    let layer = layers.get(w, h).expect("fixed mark in the stored layer");
+    let share = covered(layer, &gt);
+    eprintln!(
+        "fixed: stored layer covers {share:.3} of the mark, coverage {:.4}",
+        mask::coverage(layer)
+    );
+    assert!(share >= 0.9, "mark covered {share}");
+}
+
+#[test]
+fn filter_drops_scene_line() {
+    let set = common::synth_dir().join("fixed");
+    let gt: Mask = image::open(set.join("mask").join("00.png"))
+        .expect("gt")
+        .to_luma8();
+    let (w, h) = gt.dimensions();
+    let bbox = mask::bbox(&gt).expect("mark in the ground truth");
+    // The photo is 1024 px tall and the mark sits near the bottom, so the full-width line runs
+    // 300 px above the mark; the full-height line runs 300 px left of it.
+    let row = (bbox.top() - 300) as u32;
+    let col = (bbox.left() - 300) as u32;
+    let mut lines = Mask::new(w, h);
+    for x in 0..w {
+        lines.put_pixel(x, row, Luma([255]));
+    }
+    for y in 0..h {
+        lines.put_pixel(col, y, Luma([255]));
+    }
+    let layer = mask::union(&gt, &lines);
+    let out = filter_layer(&layer);
+    let (mark, line) = (covered(&out, &gt), covered(&out, &lines));
+    eprintln!("scene lines: mark kept {mark:.3}, lines kept {line:.3}");
+    assert!(mark >= 0.9, "mark kept {mark}");
+    assert!(line < 0.05, "lines kept {line}");
+}
+
+#[test]
+fn filter_keeps_empty() {
+    let out = filter_layer(&Mask::new(64, 48));
+    assert_eq!(out.dimensions(), (64, 48));
+    assert!(mask::is_empty(&out));
 }

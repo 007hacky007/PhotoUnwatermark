@@ -133,43 +133,13 @@ pub fn build_template(img: &RgbImage, mask: &Mask) -> WatermarkTemplate {
         return t;
     }
 
-    // Union-find over components with nearby bounding boxes.
-    fn root(p: &mut [usize], mut i: usize) -> usize {
-        while p[i] != i {
-            p[i] = p[p[i]];
-            i = p[i];
-        }
-        i
-    }
     let near = MERGE_FRAC * w.max(h) as f32;
-    let mut parent: Vec<usize> = (0..comps.len()).collect();
-    for i in 0..comps.len() {
-        for j in i + 1..comps.len() {
-            let (a, b) = (comps[i].bbox, comps[j].bbox);
-            // Gap between the boxes (0 when they overlap); right()/bottom() are inclusive.
-            let dx = (b.left() - a.right() - 1)
-                .max(a.left() - b.right() - 1)
-                .max(0) as f32;
-            let dy = (b.top() - a.bottom() - 1)
-                .max(a.top() - b.bottom() - 1)
-                .max(0) as f32;
-            if dx.hypot(dy) < near {
-                let (ri, rj) = (root(&mut parent, i), root(&mut parent, j));
-                parent[ri.max(rj)] = ri.min(rj);
-            }
-        }
-    }
+    let groups = mask::group_near(&comps, near);
 
     let (ww, wh) = ref_dims(w, h);
     let edges = sobel_magnitude(&working_luma(img, ww, wh), ww, wh);
-    for g in 0..comps.len() {
-        let members: Vec<_> = (0..comps.len())
-            .filter(|&i| root(&mut parent, i) == g)
-            .map(|i| &comps[i])
-            .collect();
-        if members.is_empty() {
-            continue;
-        }
+    for group in groups {
+        let members: Vec<_> = group.iter().map(|&i| &comps[i]).collect();
         let x0 = members.iter().map(|c| c.bbox.left()).min().unwrap() as u32;
         let y0 = members.iter().map(|c| c.bbox.top()).min().unwrap() as u32;
         let x1 = members.iter().map(|c| c.bbox.right()).max().unwrap() as u32;

@@ -8,7 +8,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Mutex, OnceLock};
 
 use image::{GrayImage, RgbImage, imageops};
-use puw_core::batch::{BATCH_HIGH, BATCH_LOW, batch_lines, median_gradient};
+use puw_core::batch::{BATCH_HIGH, BATCH_LOW, batch_lines, filter_layer, median_gradient};
 use puw_core::detect::{GuessOptions, guess_single};
 use puw_core::faces::{detect_faces_near, drop_eye_components, guard};
 use puw_core::mask::{self, Mask, is_empty};
@@ -222,7 +222,7 @@ fn set_layers_and_guesses_group_by_size() {
         .expect("fixed mark in the batch layer");
     let group: Vec<&RgbImage> = photos[..3].iter().map(|p| &p.rgb).collect();
     let mag = median_gradient(&group).expect("median");
-    let exact = batch_lines(&mag, BATCH_LOW, BATCH_HIGH).expect("exact layer");
+    let exact = filter_layer(&batch_lines(&mag, BATCH_LOW, BATCH_HIGH).expect("exact layer"));
     let agree = iou(layer, &exact);
     eprintln!("batch layer vs full precision: IoU {agree:.5}");
     assert!(agree > 0.995, "IoU {agree}");
@@ -274,9 +274,9 @@ fn set_layers_and_guesses_group_by_size() {
         guesses.push(got);
     }
 
-    // Six photos fit the representative sample whole.
+    // Three of the six photos, evenly spaced.
     let sample = representative_sample(photos.len());
-    assert_eq!(sample, [0, 1, 2, 3, 4, 5]);
+    assert_eq!(sample, [1, 3, 5]);
     let rep = pick_representative(&guesses);
     assert!(!is_empty(&guesses[rep].mask));
     let best = guesses
@@ -285,6 +285,14 @@ fn set_layers_and_guesses_group_by_size() {
         .map(|g| g.confidence)
         .fold(f32::MIN, f32::max);
     assert_eq!(guesses[rep].confidence, best);
+}
+
+#[test]
+fn representative_sample_caps_at_three() {
+    let v = representative_sample(120);
+    assert_eq!(v.len(), 3, "{v:?}");
+    assert!(v.windows(2).all(|p| p[0] < p[1]), "{v:?}");
+    assert!(v.iter().all(|&i| i < 120), "{v:?}");
 }
 
 #[test]

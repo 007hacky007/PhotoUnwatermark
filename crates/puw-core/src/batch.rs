@@ -18,6 +18,15 @@ const ROI_PAD: u32 = 60;
 /// Result is discarded when it covers more than this fraction of the image.
 const MAX_COVERAGE: f32 = 0.10;
 
+/// [`filter_layer`]: a component wider or taller than this fraction of the image is a scene line.
+const LINE_SPAN: f32 = 0.6;
+/// [`filter_layer`]: components with fewer than this fraction of the layer's pixels are dropped
+/// (as the pieces of [`crate::template::build_template`]).
+const MIN_PIECE_FRAC: f64 = 0.001;
+/// [`filter_layer`]: components whose bounding boxes are closer than this fraction of the long
+/// side form one group (as in [`crate::template::build_template`]).
+const MERGE_FRAC: f32 = 0.02;
+
 #[cfg(test)]
 thread_local! {
     /// Largest number of luma values [`PackedLumas::reserve_photos`] reserved on this thread.
@@ -291,6 +300,56 @@ pub fn batch_lines(mag: &MagImage, low: f32, high: f32) -> Option<Mask> {
     }
     let out = mask::dilate(&full, 3);
     (mask::coverage(&out) <= MAX_COVERAGE).then_some(out)
+}
+
+/// The part of a batch layer that is the mark, without the static scene edges around it.
+///
+/// A batch layer also holds whatever stayed put across the set: horizons, frame edges, and
+/// specks of a subject that hardly moved. On its 8-connected components:
+/// 1. a component wider or taller than 60 % of the image is a scene line and is dropped (a mark
+///    is made of several letter- or logo-sized components, even when it runs the whole height);
+/// 2. components with fewer than 0.1 % of the remaining pixels are dropped (specks);
+/// 3. the rest are grouped when their bounding boxes are closer than 2 % of the long side;
+/// 4. the group with the most pixels is kept, plus every group with at least half as many.
+///
+/// An empty layer, or one with nothing left, gives an empty mask of the same size.
+pub fn filter_layer(layer: &Mask) -> Mask {
+    let (w, h) = layer.dimensions();
+    let mut out = Mask::new(w, h);
+    let comps: Vec<_> = mask::components(layer)
+        .into_iter()
+        .filter(|c| {
+            c.bbox.width() as f32 <= LINE_SPAN * w as f32
+                && c.bbox.height() as f32 <= LINE_SPAN * h as f32
+        })
+        .collect();
+    let total: u64 = comps.iter().map(|c| u64::from(c.pixels)).sum();
+    let comps: Vec<_> = comps
+        .into_iter()
+        .filter(|c| c.pixels as f64 >= MIN_PIECE_FRAC * total as f64)
+        .collect();
+    let groups = mask::group_near(&comps, MERGE_FRAC * w.max(h) as f32);
+    let sizes: Vec<u64> = groups
+        .iter()
+        .map(|g| g.iter().map(|&i| u64::from(comps[i].pixels)).sum())
+        .collect();
+    let Some(&most) = sizes.iter().max() else {
+        return out;
+    };
+    for (group, &size) in groups.iter().zip(&sizes) {
+        if 2 * size < most {
+            continue;
+        }
+        for c in group.iter().map(|&i| &comps[i]) {
+            let (ox, oy) = (c.bbox.left() as u32, c.bbox.top() as u32);
+            for (x, y, p) in c.mask.enumerate_pixels() {
+                if p.0[0] != 0 {
+                    out.put_pixel(ox + x, oy + y, *p);
+                }
+            }
+        }
+    }
+    out
 }
 
 /// Pixels above `low` in a 4-connected component that holds a pixel above `high`

@@ -190,3 +190,64 @@ at a time and keeps an evenly spaced sample of each size group as 2-byte luma (`
 Peak memory of `build_set_layers` on synthetic 36 MP JPEGs (7360x4912, release build, macOS
 peak memory footprint): 0.76 GB for 3 photos, 0.95 GB for 8, 1.53 GB for 40 and 1.53 GB for
 200 (the sample stops at 16 photos at this size, `BATCH_LUMA_BUDGET`). 200 photos took 8.3 s.
+
+## Batch-layer filter (Plan 2)
+
+`build_set_layers` now passes every layer through `batch::filter_layer` and drops a layer that
+filters to empty. The filter works on the layer's 8-connected components:
+
+| step | constant | value |
+|---|---|---|
+| drop a component wider or taller than this share of the image (scene lines) | `LINE_SPAN` | 0.6 |
+| drop components below this share of the remaining pixels (specks) | `MIN_PIECE_FRAC` | 0.001 |
+| group components whose boxes are closer than this share of the long side | `MERGE_FRAC` | 0.02 |
+| keep the largest group and every group with at least half its pixels | - | 0.5 |
+
+The last two match the template pieces of `template.rs`. The plan dropped *groups* spanning
+more than 60 % of the image. On real set 1 that removes the mark itself: the mark is vertical
+text whose letters group into one piece of 0.225 x 0.951 of the photo. A single component of a
+text mark is letter-sized, so the span test runs on components instead. A scene line broken
+into short pieces would not be caught by it. Set 1 has no component spanning 60 % either way.
+
+What the batch layer of set 1 holds besides the mark: specks where the subject stood still
+across the set (a dilated single pixel is 49 px; median component 98 px). Grown by the 24 px of
+the guess, each becomes a 55 x 55 px square, which is most of the old 15 %. Layer-only sweep of
+`MIN_PIECE_FRAC` on set 1 (components spanning 60 % dropped, groups as above; coverage of the
+layer grown by 24 px; "mark kept" is the share of the mark's components, picked by hand, that
+survives):
+
+| `MIN_PIECE_FRAC` | components left | grown layer % | mark kept |
+|---|---|---|---|
+| none (unfiltered layer) | 1084 | 13.81 | 100 % |
+| 0 (grouping only) | 1084 | 11.86 | 100 % |
+| 0.0002 | 361 | 9.24 | 100 % |
+| 0.0005 | 132 | 8.41 | 100 % |
+| 0.001 | 80 | 8.13 | 100 % |
+| 0.002 | 49 | 7.91 | 100 % |
+| 0.005 | 31 | 7.16 | 96.8 % |
+
+The smallest of those mark components holds 0.38 % of the layer's pixels, so 0.001 keeps a
+margin of about 4x.
+
+Set 1 with `puw-dev guess --real` (Core ML, release build):
+
+| | batch layer | components | guesses | guess coverage % (grown) | guess time |
+|---|---|---|---|---|---|
+| before (6 guesses) | 2.91 % | 1084 | 6 | 14.46-14.99 (mean 14.79) | 41.1 s |
+| after (3 guesses) | 1.80 % | 57 | 3 | 8.89-9.46 (mean 9.18) | 20.2 s |
+
+The representative photo of the old sample went from 14.71 % to 9.18 %. The overlay of the new
+representative photo shows every letter of the mark inside the layer. What is left besides the
+mark is two speck clusters that touch letters (hair and shirt) and the detector's own guess.
+
+The plan's target of at most 3 % is out of reach while the layer grows with the guess: the
+mark's components (with the two speck clusters joined to them), grown by 24 px, cover about
+7.2 % of the photo, because the mark is outline text running almost the full height. Adding the layer after the growth instead of
+before would give about 3.2 % (estimate from the layer and the overlay). That is a change to
+`guess_photo` and needs a removal check on a 3 px border around the strokes first.
+
+Set 2 (1 photo) has no batch layer; its guess stays at 6.40 %.
+
+Synthetic: the stored layer of the fixed set covers 99.8 % of the mark (coverage 1.90 %), and a
+layer made of the fixed mark plus a full-width and a full-height 1 px line keeps all of the mark
+and none of the lines.

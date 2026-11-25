@@ -246,6 +246,48 @@ pub fn components(m: &Mask) -> Vec<Component> {
         .collect()
 }
 
+/// Groups of `comps` whose bounding boxes are closer than `near` pixels, merged transitively.
+/// Each group lists indexes into `comps` in ascending order; groups are ordered by their
+/// first index.
+pub fn group_near(comps: &[Component], near: f32) -> Vec<Vec<usize>> {
+    fn root(p: &mut [usize], mut i: usize) -> usize {
+        while p[i] != i {
+            p[i] = p[p[i]];
+            i = p[i];
+        }
+        i
+    }
+    let mut parent: Vec<usize> = (0..comps.len()).collect();
+    for i in 0..comps.len() {
+        for j in i + 1..comps.len() {
+            let (a, b) = (comps[i].bbox, comps[j].bbox);
+            // Gap between the boxes (0 when they overlap); right()/bottom() are inclusive.
+            let dx = (b.left() - a.right() - 1)
+                .max(a.left() - b.right() - 1)
+                .max(0) as f32;
+            let dy = (b.top() - a.bottom() - 1)
+                .max(a.top() - b.bottom() - 1)
+                .max(0) as f32;
+            if dx.hypot(dy) < near {
+                let (ri, rj) = (root(&mut parent, i), root(&mut parent, j));
+                parent[ri.max(rj)] = ri.min(rj);
+            }
+        }
+    }
+    // A root is the smallest index of its group, so groups come out in first-index order.
+    let mut groups: Vec<Vec<usize>> = Vec::new();
+    let mut slot = vec![usize::MAX; comps.len()];
+    for i in 0..comps.len() {
+        let r = root(&mut parent, i);
+        if slot[r] == usize::MAX {
+            slot[r] = groups.len();
+            groups.push(Vec::new());
+        }
+        groups[slot[r]].push(i);
+    }
+    groups
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -334,6 +376,20 @@ mod tests {
         assert_eq!(c[1].bbox, Rect::at(12, 5).of_size(3, 2));
         assert_eq!(c[1].pixels, 6);
         assert!(components(&blank(4, 4)).is_empty());
+    }
+
+    #[test]
+    fn group_near_is_transitive_and_ordered() {
+        let mut m = blank(60, 20);
+        fill(&mut m, 40, 0, 2, 2); // first in raster order, alone
+        fill(&mut m, 0, 5, 2, 2); // 3 px from the next one
+        fill(&mut m, 5, 5, 2, 2); // 3 px from the next one
+        fill(&mut m, 10, 5, 2, 2);
+        let c = components(&m);
+        assert_eq!(c.len(), 4);
+        assert_eq!(group_near(&c, 4.0), [vec![0], vec![1, 2, 3]]);
+        assert_eq!(group_near(&c, 3.0), [vec![0], vec![1], vec![2], vec![3]]);
+        assert!(group_near(&[], 4.0).is_empty());
     }
 
     #[test]
