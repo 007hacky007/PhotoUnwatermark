@@ -205,7 +205,7 @@ fn chosen_folder_skips_only_itself() {
 
     // A chosen folder that does not exist yet leaves nothing out.
     let r = list.add_paths(
-        &[below.clone()],
+        std::slice::from_ref(&below),
         &OutputRule::Folder {
             path: dir.path().join("not yet"),
         },

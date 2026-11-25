@@ -91,7 +91,7 @@ jargon (note the exact text if one does).
 - [ ] A photo deleted after adding: it is listed as failed with a readable reason; the others finish.
 - [ ] Close the window during a run: the in-app question appears; "Keep going" continues; "Stop and quit" stops, then the app closes.
 - [ ] macOS: Cmd+Q during a run shows the same question; with no run it quits at once; the app menu still reads "Quit PhotoUnwatermark" with Cmd+Q.
-- [ ] Click Stop, then close the window: "Stopping... the app will close when the current photo is finished." with only OK; a second close during the wait closes at once.
+- [ ] Click Stop, then close the window: "Stopping... the app will close in a moment." with only OK; a second close during the wait closes at once.
 - [ ] Close on Add photos or Done closes at once, with no question.
 
 ## 7. Step 5: Done
