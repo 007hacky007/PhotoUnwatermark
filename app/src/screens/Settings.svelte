@@ -9,12 +9,16 @@
 
   let { wizard }: { wizard: Wizard } = $props();
 
+  /** The settings as last saved. */
   let settings: Settings | null = $state(null);
   let platform = $state('');
   let error: string | null = $state(null);
-  /** Which output choice is shown as picked; differs from `settings` while a folder is being chosen. */
+  // What the controls show. Each changes as soon as it is clicked and goes back to the saved
+  // value when a save fails, so a failed choice never stays on screen.
   let outputKind: 'next' | 'folder' = $state('next');
   let folderName = $state('');
+  let detail: Detail = $state('best');
+  let preferGpu = $state(true);
   /** Bumped when the device choice changes, so the chip asks again. */
   let chipRefresh = $state(0);
   let confirming = $state(false);
@@ -29,79 +33,109 @@
   ];
 
   const messageOf = (e: unknown, fallback: string) => (e as Partial<UserError> | null)?.message || fallback;
+  const kindOf = (s: Settings) => ('nextToOriginals' in s.output ? 'next' : 'folder');
 
   function show(s: Settings) {
     settings = s;
-    outputKind = 'nextToOriginals' in s.output ? 'next' : 'folder';
+    outputKind = kindOf(s);
     if ('nextToOriginals' in s.output) folderName = s.output.nextToOriginals.folderName;
-  }
-
-  function loaded(result: PromiseSettledResult<Settings>) {
-    if (result.status === 'fulfilled') show(result.value);
-    else error = messageOf(result.reason, copy.settings.loadFailed);
-  }
-
-  /** Reads the settings again (a fix in the "why?" dialog may have changed them). */
-  async function reload() {
-    const [result] = await Promise.allSettled([getSettings()]);
-    loaded(result);
+    detail = s.detail;
+    preferGpu = s.preferGpu;
   }
 
   // The platform comes first, so the device part never shows the wrong wording.
   onMount(async () => {
     const [system, result] = await Promise.allSettled([appStatus(), getSettings()]);
     platform = system.status === 'fulfilled' ? system.value.platform : '';
-    loaded(result);
+    if (result.status === 'fulfilled') show(result.value);
+    else error = messageOf(result.reason, copy.settings.loadFailed);
   });
 
-  async function save(next: Settings) {
+  // Saves run one after another. Once none is waiting, the controls show what was saved.
+  let queue: Promise<void> = Promise.resolve();
+  let pending = 0;
+
+  function enqueue(task: () => Promise<void>): Promise<void> {
+    pending++;
+    const run = queue.then(task).finally(() => {
+      pending--;
+      if (pending === 0 && settings !== null) show(settings);
+    });
+    queue = run.catch(() => {});
+    return run;
+  }
+
+  /** Saves `change` applied to the latest saved settings, so quick changes never undo each other. */
+  function save(change: (s: Settings) => Settings): Promise<void> {
     error = null;
-    try {
-      await setSettings(next);
-    } catch (e) {
-      error = messageOf(e, copy.settings.saveFailed);
-      if (settings !== null) show(settings);
-      return;
-    }
-    const gpuChanged = settings !== null && settings.preferGpu !== next.preferGpu;
-    show(next);
-    if (gpuChanged) chipRefresh++;
+    return enqueue(async () => {
+      if (settings === null) return;
+      const next = change(settings);
+      try {
+        await setSettings(next);
+      } catch (e) {
+        error = messageOf(e, copy.settings.saveFailed);
+        return;
+      }
+      if (next.preferGpu !== settings.preferGpu) chipRefresh++;
+      settings = next;
+    });
   }
 
-  /** The folder name kept when switching back from a fixed folder. */
-  function savedFolderName(s: Settings): string {
-    return 'nextToOriginals' in s.output ? s.output.nextToOriginals.folderName : folderName;
+  /** Reads the settings again (a fix in the "why?" dialog may have changed them). */
+  function reload(): Promise<void> {
+    return enqueue(async () => {
+      try {
+        settings = await getSettings();
+      } catch (e) {
+        error = messageOf(e, copy.settings.loadFailed);
+      }
+    });
   }
 
-  async function useNextToOriginals() {
-    if (settings === null) return;
+  function chooseDetail(value: Detail) {
+    detail = value;
+    void save((s) => ({ ...s, detail: value }));
+  }
+
+  function choosePreferGpu(value: boolean) {
+    preferGpu = value;
+    void save((s) => ({ ...s, preferGpu: value }));
+  }
+
+  /** The folder name saved last, or the usual one. */
+  function savedFolderName(): string {
+    return settings !== null && 'nextToOriginals' in settings.output
+      ? settings.output.nextToOriginals.folderName
+      : copy.settings.defaultFolderName;
+  }
+
+  function useNextToOriginals() {
     outputKind = 'next';
-    const name = folderName.trim() || savedFolderName(settings) || 'Without watermark';
-    await save({ ...settings, output: { nextToOriginals: { folderName: name } } });
+    const name = folderName.trim() || copy.settings.defaultFolderName;
+    void save((s) => ({ ...s, output: { nextToOriginals: { folderName: name } } }));
   }
 
-  async function renameFolder() {
-    if (settings === null) return;
+  function renameFolder() {
     const name = folderName.trim();
     if (name === '') {
-      folderName = savedFolderName(settings);
+      folderName = savedFolderName();
       return;
     }
     folderName = name;
-    if ('nextToOriginals' in settings.output && settings.output.nextToOriginals.folderName === name) return;
-    await save({ ...settings, output: { nextToOriginals: { folderName: name } } });
+    if (name === savedFolderName() && settings !== null && kindOf(settings) === 'next') return;
+    void save((s) => ({ ...s, output: { nextToOriginals: { folderName: name } } }));
   }
 
   async function pickFolder() {
-    if (settings === null) return;
     outputKind = 'folder';
     const path = await chooseFolder().catch(() => null);
     if (path === null) {
       // Cancelled: show the saved choice again.
-      show(settings);
+      if (settings !== null) outputKind = kindOf(settings);
       return;
     }
-    await save({ ...settings, output: { folder: { path } } });
+    await save((s) => ({ ...s, output: { folder: { path } } }));
   }
 
   async function removeData() {
@@ -166,9 +200,9 @@
           <input
             type="radio"
             name="{id}-detail"
-            checked={settings.detail === d.value}
+            checked={detail === d.value}
             aria-describedby="{id}-{d.value}"
-            onchange={() => settings && save({ ...settings, detail: d.value })}
+            onchange={() => chooseDetail(d.value)}
           />
           {d.label}
         </label>
@@ -183,8 +217,8 @@
           <input
             type="radio"
             name="{id}-device"
-            checked={settings.preferGpu}
-            onchange={() => settings && save({ ...settings, preferGpu: true })}
+            checked={preferGpu}
+            onchange={() => choosePreferGpu(true)}
           />
           {copy.settings.useGraphicsCard}
         </label>
@@ -192,11 +226,16 @@
           <input
             type="radio"
             name="{id}-device"
-            checked={!settings.preferGpu}
-            onchange={() => settings && save({ ...settings, preferGpu: false })}
+            checked={!preferGpu}
+            onchange={() => choosePreferGpu(false)}
           />
           {copy.settings.useProcessor}
         </label>
+      {:else if platform === 'macos' && !settings.preferGpu}
+        <div class="mac-choice">
+          <p>{copy.settings.macProcessorChosen}</p>
+          <button type="button" onclick={() => choosePreferGpu(true)}>{copy.settings.useNeuralEngine}</button>
+        </div>
       {/if}
       <div class="chip">
         <DeviceChip inSettings {platform} refresh={chipRefresh} onChange={reload} />
@@ -295,6 +334,12 @@
   .path {
     color: var(--text-muted);
     word-break: break-all;
+  }
+  .mac-choice {
+    display: flex;
+    flex-wrap: wrap;
+    align-items: center;
+    gap: var(--space-2);
   }
   .links {
     display: flex;

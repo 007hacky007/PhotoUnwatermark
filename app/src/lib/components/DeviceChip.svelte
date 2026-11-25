@@ -58,6 +58,11 @@
     open = true;
   }
 
+  /** A fix in flight keeps the dialog open, so its outcome is always seen. */
+  function close() {
+    if (!working) open = false;
+  }
+
   async function fix(chosen: DeviceFix) {
     working = true;
     error = null;
@@ -91,11 +96,12 @@
       aria-haspopup="dialog"
       onclick={show}
     >
-      {status.state === 'gpu' ? fast : copy.device.cpu}
+      <span>{status.state === 'gpu' ? fast : copy.device.cpu}</span>
+      <span class="info" aria-hidden="true">{copy.device.infoGlyph}</span>
     </button>
   {/if}
   {#if open}
-    <WhyDialog {status} platform={known} onFix={fix} onClose={() => (open = false)} {working} {error} />
+    <WhyDialog {status} platform={known} onFix={fix} onClose={close} {working} {error} />
   {/if}
 {/if}
 
@@ -112,8 +118,34 @@
   .fast {
     color: var(--text);
   }
+  button.chip {
+    display: inline-flex;
+    align-items: center;
+    gap: var(--space-2);
+    cursor: pointer;
+  }
+  button.chip:hover {
+    border-color: var(--accent);
+  }
+  button.chip:hover span:first-child {
+    text-decoration: underline;
+  }
   button.slow {
     border-color: var(--warning);
     color: var(--text);
+  }
+  /* The "there is more" mark: a small circled i. */
+  .info {
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    width: 1.1em;
+    height: 1.1em;
+    border: 1px solid currentColor;
+    border-radius: 50%;
+    font-size: 0.85em;
+    font-style: italic;
+    font-weight: 600;
+    line-height: 1;
   }
 </style>

@@ -136,6 +136,46 @@ describe('DeviceChip', () => {
     expect(buttons).toEqual([copy.device.showDetails, copy.common.close]);
   });
 
+  it('chipLooksClickable', async () => {
+    deviceStatus.mockResolvedValue(loadFailed);
+    const slow = render(DeviceChip);
+    const chip = await screen.findByRole('button', { name: copy.device.cpu });
+    const mark = chip.querySelector('.info');
+    expect(mark?.textContent).toBe(copy.device.infoGlyph);
+    expect(mark?.getAttribute('aria-hidden')).toBe('true');
+    slow.unmount();
+
+    appStatus.mockResolvedValue(status('macos'));
+    deviceStatus.mockResolvedValue(shared);
+    const explained = render(DeviceChip);
+    const fast = await screen.findByRole('button', { name: copy.device.neuralEngine });
+    expect(fast.querySelector('.info')).toBeTruthy();
+    explained.unmount();
+
+    deviceStatus.mockResolvedValue(gpu);
+    const plain = render(DeviceChip);
+    await screen.findByText(copy.device.neuralEngine);
+    expect(plain.container.querySelector('.info')).toBeNull();
+  });
+
+  it('fixInFlightKeepsTheDialogOpen', async () => {
+    deviceStatus.mockResolvedValue(loadFailed);
+    let fail: (e: unknown) => void = () => {};
+    deviceFix.mockImplementationOnce(() => new Promise<void>((_, reject) => (fail = reject)));
+    render(DeviceChip);
+    await fireEvent.click(await screen.findByRole('button', { name: copy.device.cpu }));
+    await fireEvent.click(screen.getByRole('button', { name: copy.device.fixes.tryAgain }));
+    const close = screen.getByRole('button', { name: copy.common.close }) as HTMLButtonElement;
+    expect(close.disabled).toBe(true);
+    await fireEvent.keyDown(window, { key: 'Escape' });
+    expect(screen.getByRole('dialog')).toBeTruthy();
+    fail({ message: 'The graphics card is still busy.', details: '' });
+    expect(await screen.findByText('The graphics card is still busy.')).toBeTruthy();
+    expect(close.disabled).toBe(false);
+    await fireEvent.keyDown(window, { key: 'Escape' });
+    expect(screen.queryByRole('dialog')).toBeNull();
+  });
+
   it('failedFixSaysSo', async () => {
     deviceStatus.mockResolvedValue(loadFailed);
     deviceFix.mockRejectedValueOnce({ message: 'The app is still working on your photos.', details: '' });

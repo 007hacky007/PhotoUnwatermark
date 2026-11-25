@@ -48,7 +48,11 @@
 
   async function rename(w: SavedInfo) {
     const name = draft.trim();
-    if (name === '' || name === w.name) {
+    if (name === '') {
+      renameError = copy.saved.emptyName;
+      return;
+    }
+    if (name === w.name) {
       stopRename();
       return;
     }

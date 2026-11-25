@@ -81,8 +81,20 @@ fn rank(reason: &CpuReason) -> u8 {
     }
 }
 
+/// What the engine reports on an Intel Mac (`puw_core` engine, macOS platform module).
+const NO_NEURAL_ENGINE: &str = "This Mac has no Neural Engine";
+
+/// The hardware the reasons talk about: Macs use the Neural Engine through Core ML.
+fn hardware(platform: Platform) -> &'static str {
+    if platform == Platform::MacOs {
+        "Neural Engine"
+    } else {
+        "graphics card"
+    }
+}
+
 /// The raw text of a reason, for "Show details"; `None` when there is nothing more to say.
-fn raw(reason: &CpuReason) -> Option<String> {
+fn raw(reason: &CpuReason, platform: Platform) -> Option<String> {
     match reason {
         CpuReason::NotRequested => None,
         CpuReason::ProviderUnavailable(t) | CpuReason::LoadFailed(t) | CpuReason::RunFailed(t) => {
@@ -92,37 +104,50 @@ fn raw(reason: &CpuReason) -> Option<String> {
             gpu_nodes,
             total_nodes,
         } => Some(format!(
-            "the graphics card can run {gpu_nodes} of {total_nodes} steps"
+            "the {} can run {gpu_nodes} of {total_nodes} steps",
+            hardware(platform)
         )),
     }
 }
 
-/// The sentence and fixes for a model on the processor.
-fn explain(reason: &CpuReason, platform: Platform) -> (&'static str, Vec<DeviceFix>) {
+/// The sentence and fixes for a model on the processor. Macs say "Neural Engine" where other
+/// systems say "graphics card".
+fn explain(reason: &CpuReason, platform: Platform) -> (String, Vec<DeviceFix>) {
     use DeviceFix::*;
+    let mac = platform == Platform::MacOs;
+    let hw = hardware(platform);
     match reason {
+        CpuReason::NotRequested if mac => {
+            ("You chose the processor.".into(), vec![UseGraphicsCard])
+        }
         CpuReason::NotRequested => (
-            "You chose the processor in Settings.",
+            "You chose the processor in Settings.".into(),
             vec![UseGraphicsCard],
         ),
-        CpuReason::ProviderUnavailable(_) if platform == Platform::MacOs => (
-            "This Mac has no Neural Engine, so the processor is used.",
+        CpuReason::ProviderUnavailable(t) if mac && t == NO_NEURAL_ENGINE => (
+            "This Mac has no Neural Engine, so the processor is used.".into(),
             vec![],
         ),
+        CpuReason::ProviderUnavailable(_) if mac => (
+            "The Neural Engine could not be used.".into(),
+            vec![TryAgain],
+        ),
         CpuReason::ProviderUnavailable(_) => (
-            "This computer's graphics card could not be used.",
+            "This computer's graphics card could not be used.".into(),
             vec![TryAgain],
         ),
         CpuReason::LoadFailed(_) => (
-            "The graphics card could not load the watermark remover.",
+            format!("The {hw} could not load the watermark remover."),
             vec![TryAgain, UseProcessor],
         ),
         CpuReason::PartialGpu { .. } => (
-            "Your graphics card can run only part of the watermark remover, so the processor runs all of it.",
+            format!(
+                "Your {hw} can run only part of the watermark remover, so the processor runs all of it."
+            ),
             vec![UseProcessor],
         ),
         CpuReason::RunFailed(_) => (
-            "The graphics card stopped working, so the app switched to the processor.",
+            format!("The {hw} stopped working, so the app switched to the processor."),
             vec![TryAgain],
         ),
     }
@@ -206,11 +231,11 @@ pub fn device_status(
     let (sentence, fixes) = explain(&shown, platform);
     let details = on_cpu
         .iter()
-        .filter_map(|&(label, r)| raw(r).map(|t| format!("{label}: {t}")))
+        .filter_map(|&(label, r)| raw(r, platform).map(|t| format!("{label}: {t}")))
         .collect();
     DeviceStatus {
         state: DeviceState::Cpu,
-        reason: Some(sentence.to_string()),
+        reason: Some(sentence),
         details: joined(details),
         fixes,
     }
@@ -441,6 +466,67 @@ mod tests {
             Some(
                 "Most of the work runs on the graphics hardware; a small part runs on the processor."
             )
+        );
+    }
+
+    #[test]
+    fn device_status_mac_reasons_say_neural_engine() {
+        let mac = Platform::MacOs;
+        let cases = [
+            (
+                CpuReason::NotRequested,
+                "You chose the processor.",
+                vec![UseGraphicsCard],
+            ),
+            (
+                CpuReason::ProviderUnavailable(
+                    "Core ML cannot run any of the 9 steps of the lama model".into(),
+                ),
+                "The Neural Engine could not be used.",
+                vec![TryAgain],
+            ),
+            (
+                // Only the exact Intel text means there is no Neural Engine.
+                CpuReason::ProviderUnavailable("This Mac has no Neural Engine here".into()),
+                "The Neural Engine could not be used.",
+                vec![TryAgain],
+            ),
+            (
+                CpuReason::LoadFailed("x".into()),
+                "The Neural Engine could not load the watermark remover.",
+                vec![TryAgain, UseProcessor],
+            ),
+            (
+                CpuReason::PartialGpu {
+                    gpu_nodes: 1,
+                    total_nodes: 2,
+                },
+                "Your Neural Engine can run only part of the watermark remover, so the processor runs all of it.",
+                vec![UseProcessor],
+            ),
+            (
+                CpuReason::RunFailed("x".into()),
+                "The Neural Engine stopped working, so the app switched to the processor.",
+                vec![TryAgain],
+            ),
+        ];
+        for (reason, sentence, fixes) in cases {
+            let prefer_gpu = reason != CpuReason::NotRequested;
+            let st = device_status(Some(&all(cpu(reason.clone()))), prefer_gpu, mac);
+            assert_eq!(st.state, DeviceState::Cpu, "{reason:?}");
+            assert_eq!(st.reason.as_deref(), Some(sentence), "{reason:?}");
+            assert_eq!(st.fixes, fixes, "{reason:?}");
+            assert!(!sentence.contains("graphics"), "{sentence}");
+            assert_plain(sentence);
+        }
+        let partial = all(cpu(CpuReason::PartialGpu {
+            gpu_nodes: 1,
+            total_nodes: 2,
+        }));
+        let details = device_status(Some(&partial), true, mac).details.unwrap();
+        assert!(
+            details.contains("the Neural Engine can run 1 of 2 steps"),
+            "{details}"
         );
     }
 

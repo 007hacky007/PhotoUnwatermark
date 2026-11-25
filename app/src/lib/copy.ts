@@ -24,6 +24,8 @@ export const copy = {
     output: 'Where to save the results',
     nextToOriginals: 'In a folder next to the original photos',
     folderName: 'Folder name',
+    /** Also the app's default (crates/puw-app/src/settings.rs). */
+    defaultFolderName: 'Without watermark',
     alwaysFolder: 'Always save to...',
     chooseFolder: 'Choose a folder...',
     detail: 'Detail vs speed',
@@ -36,6 +38,9 @@ export const copy = {
     device: 'Processor or graphics card',
     useGraphicsCard: 'Use the graphics card when it works (faster)',
     useProcessor: 'Use the processor only',
+    /** Macs only, when the processor was chosen. */
+    macProcessorChosen: 'The processor is used because you chose it.',
+    useNeuralEngine: 'Use Neural Engine',
     savedWatermarks: 'Saved watermarks',
     about: 'About',
     advanced: 'Advanced',
@@ -58,6 +63,7 @@ export const copy = {
     renameOne: (name: string) => `Rename ${name}`,
     newName: (name: string) => `New name for ${name}`,
     save: 'Save',
+    emptyName: 'Type a name for the saved watermark.',
     delete: 'Delete',
     deleteOne: (name: string) => `Delete ${name}`,
     deleteTitle: (name: string) => `Delete "${name}"?`,
@@ -152,6 +158,8 @@ export const copy = {
     cpu: 'Using processor (slower) - why?',
     /** Settings only; the steps show nothing before the models load. */
     notStarted: 'Not started yet',
+    /** The mark on a chip that opens an explanation (hidden from screen readers). */
+    infoGlyph: 'i',
     whyTitle: 'Where the work runs',
     showDetails: 'Show details',
     hideDetails: 'Hide details',

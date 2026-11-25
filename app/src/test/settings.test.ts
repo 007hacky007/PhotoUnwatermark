@@ -125,6 +125,74 @@ describe('Settings', () => {
     expect(await screen.findByText(copy.device.notStarted)).toBeTruthy();
   });
 
+  it('failedSaveRestoresTheChoice', async () => {
+    await openSettings('windows');
+    const radio = (name: string) => screen.getByRole('radio', { name }) as HTMLInputElement;
+    setSettings.mockRejectedValueOnce({ message: 'The settings file is locked.', details: '' });
+    await fireEvent.click(radio(copy.settings.faster));
+    expect(await screen.findByRole('alert')).toBeTruthy();
+    expect(screen.getByText('The settings file is locked.')).toBeTruthy();
+    await waitFor(() => expect(radio(copy.settings.best).checked).toBe(true));
+    expect(radio(copy.settings.faster).checked).toBe(false);
+
+    setSettings.mockRejectedValueOnce({ message: 'The settings file is locked.', details: '' });
+    await fireEvent.click(radio(copy.settings.useProcessor));
+    await waitFor(() => expect(radio(copy.settings.useGraphicsCard).checked).toBe(true));
+    expect(radio(copy.settings.useProcessor).checked).toBe(false);
+  });
+
+  it('quickChangesDoNotUndoEachOther', async () => {
+    await openSettings('windows');
+    const settle: (() => void)[] = [];
+    setSettings.mockImplementation(() => new Promise<void>((resolve) => settle.push(resolve)));
+    await fireEvent.click(screen.getByRole('radio', { name: copy.settings.faster }));
+    await fireEvent.click(screen.getByRole('radio', { name: copy.settings.useProcessor }));
+    await waitFor(() => expect(setSettings).toHaveBeenCalledTimes(1));
+    expect(setSettings).toHaveBeenLastCalledWith({ ...defaults, detail: 'faster' });
+    // While the first save runs, both clicked choices stay shown.
+    expect((screen.getByRole('radio', { name: copy.settings.faster }) as HTMLInputElement).checked).toBe(true);
+    expect((screen.getByRole('radio', { name: copy.settings.useProcessor }) as HTMLInputElement).checked).toBe(true);
+    settle[0]();
+    await waitFor(() => expect(setSettings).toHaveBeenCalledTimes(2));
+    expect(setSettings).toHaveBeenLastCalledWith({ ...defaults, detail: 'faster', preferGpu: false });
+    settle[1]();
+    await waitFor(() => expect(deviceStatus).toHaveBeenCalledTimes(2));
+    expect((screen.getByRole('radio', { name: copy.settings.faster }) as HTMLInputElement).checked).toBe(true);
+    expect((screen.getByRole('radio', { name: copy.settings.useProcessor }) as HTMLInputElement).checked).toBe(true);
+  });
+
+  it('macShowsTheProcessorOnlyWhenChosen', async () => {
+    const chosen = await openSettings('macos', { ...defaults, preferGpu: false });
+    expect(screen.getByText(copy.settings.macProcessorChosen)).toBeTruthy();
+    expect(screen.queryByRole('radio', { name: copy.settings.useProcessor })).toBeNull();
+    await fireEvent.click(screen.getByRole('button', { name: copy.settings.useNeuralEngine }));
+    await waitFor(() => expect(setSettings).toHaveBeenCalledWith({ ...defaults, preferGpu: true }));
+    await waitFor(() => expect(screen.queryByText(copy.settings.macProcessorChosen)).toBeNull());
+    expect(screen.queryByRole('button', { name: copy.settings.useNeuralEngine })).toBeNull();
+    chosen.unmount();
+
+    const usual = await openSettings('macos');
+    expect(screen.queryByText(copy.settings.macProcessorChosen)).toBeNull();
+    expect(screen.queryByRole('button', { name: copy.settings.useNeuralEngine })).toBeNull();
+    usual.unmount();
+
+    await openSettings('windows', { ...defaults, preferGpu: false });
+    expect(screen.queryByText(copy.settings.macProcessorChosen)).toBeNull();
+    expect((screen.getByRole('radio', { name: copy.settings.useProcessor }) as HTMLInputElement).checked).toBe(true);
+  });
+
+  it('backToOriginalsUsesTheUsualFolderName', async () => {
+    await openSettings('windows', { ...defaults, output: { folder: { path: '/Users/me/Clean' } } });
+    await fireEvent.click(screen.getByRole('radio', { name: copy.settings.nextToOriginals }));
+    await waitFor(() =>
+      expect(setSettings).toHaveBeenCalledWith({
+        ...defaults,
+        output: { nextToOriginals: { folderName: copy.settings.defaultFolderName } },
+      }),
+    );
+    expect(copy.settings.defaultFolderName).toBe('Without watermark');
+  });
+
   it('removeDataNeedsConfirmation', async () => {
     const { wizard } = await openSettings();
     await fireEvent.click(screen.getByText(copy.settings.advanced));
@@ -243,6 +311,16 @@ describe('Saved watermarks', () => {
     expect(await screen.findByRole('alert')).toBeTruthy();
     expect(screen.getByText(/That name cannot be used/)).toBeTruthy();
     expect(screen.getByRole('textbox')).toBeTruthy();
+  });
+
+  it('emptyRenameSaysSo', async () => {
+    await openSaved([saved('a1', 'Studio')]);
+    await fireEvent.click(await screen.findByRole('button', { name: copy.saved.renameOne('Studio') }));
+    await fireEvent.input(screen.getByRole('textbox'), { target: { value: '   ' } });
+    await fireEvent.click(screen.getByRole('button', { name: copy.saved.save }));
+    expect(screen.getByRole('alert').textContent).toBe(copy.saved.emptyName);
+    expect(screen.getByRole('textbox')).toBeTruthy();
+    expect(renameSaved).not.toHaveBeenCalled();
   });
 
   it('deleteSavedNeedsConfirmation', async () => {

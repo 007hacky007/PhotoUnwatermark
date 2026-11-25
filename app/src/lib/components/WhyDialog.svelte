@@ -58,7 +58,7 @@
     {#each status.fixes as fix (label(fix))}
       <button type="button" class="primary" disabled={working} onclick={() => onFix(fix)}>{label(fix)}</button>
     {/each}
-    <button type="button" onclick={onClose}>{copy.common.close}</button>
+    <button type="button" disabled={working} onclick={onClose}>{copy.common.close}</button>
   {/snippet}
 </Dialog>
 
