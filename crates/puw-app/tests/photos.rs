@@ -6,11 +6,17 @@ use puw_app::images::{
     EDIT_LONG_SIDE, area_from_edit, area_to_edit, edit_image, edit_size, jpeg, overlay, thumbnail,
 };
 use puw_app::photos::PhotoList;
-use puw_app::{AppError, Result};
+use puw_app::{AppError, OutputRule, Result};
 use puw_core::Error;
 use puw_core::image_io::load;
 
 const OUT: &str = "Without watermark";
+
+fn next_to(name: &str) -> OutputRule {
+    OutputRule::NextToOriginals {
+        folder_name: name.into(),
+    }
+}
 
 fn exif_orientation(orientation: u16, thumb: Option<&[u8]>) -> Vec<u8> {
     let mut b = Vec::new();
@@ -74,7 +80,7 @@ fn adds_files_and_folders() {
     plain(20, 10).save(&single).unwrap();
 
     let mut list = PhotoList::default();
-    let r = list.add_paths(&[folder, single], OUT);
+    let r = list.add_paths(&[folder, single], &next_to(OUT));
     assert!(r.skipped.is_empty(), "{:?}", r.skipped);
     assert_eq!(names(&list), ["a.jpeg", "b.JPG", "single.png"]);
     let infos = list.infos();
@@ -93,6 +99,10 @@ fn adds_files_and_folders() {
     assert!(list.infos().is_empty());
 }
 
+fn skipped_names(r: &puw_app::photos::AddResult) -> Vec<String> {
+    r.skipped.iter().map(|s| s.name.clone()).collect()
+}
+
 #[test]
 fn scan_skips_output_folder() {
     let dir = tempfile::tempdir().unwrap();
@@ -101,34 +111,144 @@ fn scan_skips_output_folder() {
     write_jpeg(&out.join("done.jpg"), &plain(10, 10), None);
     write_jpeg(&dir.path().join("keep.jpg"), &plain(10, 10), None);
 
+    // A scanned folder lists only its own files; the output folder inside it is not opened.
     let mut list = PhotoList::default();
-    let r = list.add_paths(&[dir.path().to_path_buf()], OUT);
+    let r = list.add_paths(&[dir.path().to_path_buf()], &next_to(OUT));
     assert_eq!(names(&list), ["keep.jpg"]);
     assert!(r.skipped.is_empty());
 
+    // Named directly, a result or the output folder is left out with a reason.
     let mut list = PhotoList::default();
-    let r = list.add_paths(&[out.join("done.jpg"), out.clone()], OUT);
-    assert!(r.added.is_empty() && r.skipped.is_empty());
+    let r = list.add_paths(&[out.join("done.jpg"), out.clone()], &next_to(OUT));
+    assert!(r.added.is_empty());
+    assert_eq!(skipped_names(&r), ["done.jpg", OUT]);
+    assert!(
+        r.skipped[0].reason.contains("finished photos"),
+        "{:?}",
+        r.skipped
+    );
+    assert!(r.skipped[0].reason.contains(OUT));
+    assert!(r.skipped[1].reason.starts_with("This folder was left out"));
     assert!(list.infos().is_empty());
 
     let nested = out.join("x");
     fs::create_dir(&nested).unwrap();
     write_jpeg(&nested.join("a.jpg"), &plain(10, 10), None);
-    let r = list.add_paths(&[nested.join("a.jpg"), nested.clone()], OUT);
-    assert!(r.added.is_empty() && r.skipped.is_empty());
+    let r = list.add_paths(&[nested.join("a.jpg"), nested.clone()], &next_to(OUT));
+    assert!(r.added.is_empty());
+    assert_eq!(skipped_names(&r), ["a.jpg", "x"]);
 
     #[cfg(unix)]
     {
         let link = dir.path().join("link");
         std::os::unix::fs::symlink(&out, &link).unwrap();
-        let r = list.add_paths(&[link], OUT);
-        assert!(r.added.is_empty() && r.skipped.is_empty());
+        let r = list.add_paths(&[link], &next_to(OUT));
+        assert!(r.added.is_empty());
+        assert_eq!(skipped_names(&r), ["link"]);
     }
 
     if cfg!(any(target_os = "macos", windows)) {
-        let r = list.add_paths(&[out.join("done.jpg")], "WITHOUT WATERMARK");
+        let r = list.add_paths(&[out.join("done.jpg")], &next_to("WITHOUT WATERMARK"));
         assert!(r.added.is_empty());
+        assert_eq!(r.skipped.len(), 1);
     }
+    for s in &r.skipped {
+        assert!(s.reason.is_ascii());
+    }
+}
+
+/// "Always save to <folder>": only what is inside that very folder is left out, never photos
+/// in other folders of the same name.
+#[test]
+fn chosen_folder_skips_only_itself() {
+    let dir = tempfile::tempdir().unwrap();
+    let chosen = dir.path().join("home").join("Pictures");
+    let elsewhere = dir.path().join("card").join("Pictures");
+    let below = dir.path().join("home").join("Pictures").join("trip");
+    for d in [&chosen, &elsewhere, &below] {
+        fs::create_dir_all(d).unwrap();
+    }
+    write_jpeg(&chosen.join("done.jpg"), &plain(10, 10), None);
+    write_jpeg(&elsewhere.join("photo.jpg"), &plain(10, 10), None);
+    write_jpeg(&below.join("deep.jpg"), &plain(10, 10), None);
+    let rule = OutputRule::Folder {
+        path: chosen.clone(),
+    };
+
+    let mut list = PhotoList::default();
+    let r = list.add_paths(
+        &[
+            elsewhere.clone(),
+            chosen.join("done.jpg"),
+            below.clone(),
+            chosen.clone(),
+        ],
+        &rule,
+    );
+    assert_eq!(names(&list), ["photo.jpg"]);
+    assert_eq!(skipped_names(&r), ["done.jpg", "trip", "Pictures"]);
+    assert!(
+        r.skipped
+            .iter()
+            .all(|s| s.reason.contains("finished photos are saved"))
+    );
+
+    // The same folder spelled another way is still the chosen one.
+    let other = dir
+        .path()
+        .join("home")
+        .join("..")
+        .join("home")
+        .join("Pictures");
+    let r = list.add_paths(&[other.join("done.jpg")], &rule);
+    assert_eq!(skipped_names(&r), ["done.jpg"]);
+
+    // A chosen folder that does not exist yet leaves nothing out.
+    let r = list.add_paths(
+        &[below.clone()],
+        &OutputRule::Folder {
+            path: dir.path().join("not yet"),
+        },
+    );
+    assert_eq!(names(&list), ["photo.jpg", "deep.jpg"]);
+    assert!(r.skipped.is_empty());
+
+    // Next to the originals, a folder named like the output folder is left out by name.
+    let mut list = PhotoList::default();
+    let r = list.add_paths(&[elsewhere.join("photo.jpg")], &next_to("pictures"));
+    if cfg!(any(target_os = "macos", windows)) {
+        assert_eq!(skipped_names(&r), ["photo.jpg"]);
+    }
+}
+
+#[test]
+fn shown_paths_have_no_verbatim_prefix() {
+    use puw_app::photos::plain_path;
+    use std::path::Path;
+    let p = |s: &str| plain_path(Path::new(s)).to_string_lossy().into_owned();
+    assert_eq!(p(r"\\?\C:\bench\t2"), r"C:\bench\t2");
+    assert_eq!(p(r"\\?\UNC\server\share\a.jpg"), r"\\server\share\a.jpg");
+    assert_eq!(p(r"C:\already\plain"), r"C:\already\plain");
+    assert_eq!(p("/Users/a/b.jpg"), "/Users/a/b.jpg");
+    // Kept where only the prefixed form works.
+    assert_eq!(p(r"\\?\C:\dir\CON"), r"\\?\C:\dir\CON");
+    assert_eq!(p(r"\\?\C:\dir\name."), r"\\?\C:\dir\name.");
+    let long = format!(r"\\?\C:\{}", "a".repeat(300));
+    assert_eq!(p(&long), long);
+    assert_eq!(p(r"\\?\Volume{x}\a"), r"\\?\Volume{x}\a");
+}
+
+#[cfg(windows)]
+#[test]
+fn real_paths_on_windows_are_plain() {
+    let dir = tempfile::tempdir().unwrap();
+    let a = dir.path().join("a.jpg");
+    write_jpeg(&a, &plain(10, 10), None);
+    let real = puw_app::photos::real_path(&a).unwrap();
+    assert!(!real.to_string_lossy().starts_with(r"\\?\"), "{real:?}");
+    let mut list = PhotoList::default();
+    list.add_paths(&[a], &next_to(OUT));
+    assert!(!list.paths()[0].to_string_lossy().starts_with(r"\\?\"));
 }
 
 #[test]
@@ -141,9 +261,9 @@ fn dedupes_same_file() {
     let other_spelling = sub.join("..").join("s").join("a.jpg");
 
     let mut list = PhotoList::default();
-    list.add_paths(&[a.clone(), other_spelling.clone()], OUT);
+    list.add_paths(&[a.clone(), other_spelling.clone()], &next_to(OUT));
     assert_eq!(list.infos().len(), 1);
-    let r = list.add_paths(&[other_spelling, sub], OUT);
+    let r = list.add_paths(&[other_spelling, sub], &next_to(OUT));
     assert!(r.added.is_empty());
     assert_eq!(list.infos().len(), 1);
 }
@@ -163,7 +283,7 @@ fn skips_unsupported() {
     let gone = dir.path().join("gone.jpg");
 
     let mut list = PhotoList::default();
-    let r = list.add_paths(&[txt, heic, broken, good, gone], OUT);
+    let r = list.add_paths(&[txt, heic, broken, good, gone], &next_to(OUT));
     assert_eq!(names(&list), ["good.jpg"]);
     let reason = |n: &str| {
         r.skipped
@@ -191,7 +311,7 @@ fn skips_heic_by_content_in_a_jpg_name() {
     b.extend_from_slice(&[0; 16]);
     fs::write(&p, b).unwrap();
     let mut list = PhotoList::default();
-    let r = list.add_paths(&[p], OUT);
+    let r = list.add_paths(&[p], &next_to(OUT));
     assert!(r.skipped[0].reason.contains("HEIC"));
 }
 
@@ -217,7 +337,7 @@ fn edit_image_is_upright() {
     let p = dir.path().join("r.jpg");
     rotated_fixture(&p, None);
     let mut list = PhotoList::default();
-    list.add_paths(std::slice::from_ref(&p), OUT);
+    list.add_paths(std::slice::from_ref(&p), &next_to(OUT));
     let info = &list.infos()[0];
     assert_eq!((info.width, info.height), (400, 600));
     let photo = load(&p).unwrap();

@@ -9,6 +9,7 @@ use puw_core::image_io::upright_size;
 use rayon::prelude::*;
 use serde::Serialize;
 
+use crate::OutputRule;
 use crate::messages::{AppError, user_message};
 
 pub type PhotoId = u32;
@@ -65,35 +66,144 @@ fn file_name(p: &Path) -> String {
         .unwrap_or_else(|| p.to_string_lossy().into_owned())
 }
 
-fn same_name(name: &str, output_folder_name: &str) -> bool {
+fn same_name(a: &str, b: &str) -> bool {
     if cfg!(any(target_os = "macos", windows)) {
-        name.to_lowercase() == output_folder_name.to_lowercase()
+        a.to_lowercase() == b.to_lowercase()
     } else {
-        name == output_folder_name
+        a == b
     }
 }
 
-/// True when the path, or any folder above it, is the output folder. Meant for canonical paths.
-fn inside_output(p: &Path, output_folder_name: &str) -> bool {
-    p.components().any(|c| match c {
-        std::path::Component::Normal(n) => same_name(&n.to_string_lossy(), output_folder_name),
-        _ => false,
+/// `p` without the `\\?\` prefix Windows puts on canonical paths (`C:\a` instead of
+/// `\\?\C:\a`, `\\server\share` instead of `\\?\UNC\server\share`), for paths that are
+/// shown or compared with paths the person chose. Paths the prefix is needed for (too long,
+/// or with names Windows does not allow) are kept as they are. Pure text handling, so it
+/// behaves the same on every system.
+pub fn plain_path(p: &Path) -> PathBuf {
+    let s = p.to_string_lossy();
+    let plain = if let Some(rest) = s.strip_prefix(r"\\?\UNC\") {
+        format!(r"\\{rest}")
+    } else if let Some(rest) = s.strip_prefix(r"\\?\") {
+        let drive = rest.as_bytes();
+        if drive.len() >= 3 && drive[0].is_ascii_alphabetic() && &drive[1..3] == b":\\" {
+            rest.to_string()
+        } else {
+            return p.to_path_buf();
+        }
+    } else {
+        return p.to_path_buf();
+    };
+    // Longer paths, and names such as "CON" or "a.", only work with the prefix.
+    let reserved = |c: &str| {
+        let stem = c.split('.').next().unwrap_or("").to_ascii_uppercase();
+        matches!(stem.as_str(), "CON" | "PRN" | "AUX" | "NUL")
+            || (stem.len() == 4
+                && (stem.starts_with("COM") || stem.starts_with("LPT"))
+                && stem.as_bytes()[3].is_ascii_digit())
+            || c.ends_with('.')
+            || c.ends_with(' ')
+    };
+    if plain.len() >= 260 || plain.split('\\').skip(1).any(reserved) {
+        return p.to_path_buf();
+    }
+    PathBuf::from(plain)
+}
+
+/// The real path of `p` (links followed), without the Windows `\\?\` prefix where it is
+/// not needed ([`plain_path`]), so it compares with and shows like the paths people choose.
+pub fn real_path(p: &Path) -> std::io::Result<PathBuf> {
+    let real = fs::canonicalize(p)?;
+    Ok(if cfg!(windows) {
+        plain_path(&real)
+    } else {
+        real
     })
 }
 
-fn real_inside_output(p: &Path, output_folder_name: &str) -> bool {
-    fs::canonicalize(p).is_ok_and(|r| inside_output(&r, output_folder_name))
+/// True when `p` is `dir` or inside it. Both are real paths ([`real_path`]); names compare
+/// the way the file system does (without case on macOS and Windows).
+fn within(p: &Path, dir: &Path) -> bool {
+    let mut p = p.components();
+    dir.components().all(|d| {
+        p.next().is_some_and(|c| {
+            same_name(
+                &c.as_os_str().to_string_lossy(),
+                &d.as_os_str().to_string_lossy(),
+            )
+        })
+    })
+}
+
+/// Where finished photos are saved, as far as adding photos is concerned: whatever is in
+/// there is a result of an earlier run and is left out (with a reason).
+enum Results {
+    /// A folder of this name next to the originals: any folder of this name.
+    Named(String),
+    /// One chosen folder (real path), or `None` when it does not exist yet.
+    Chosen(Option<PathBuf>),
+}
+
+impl Results {
+    fn of(rule: &OutputRule) -> Results {
+        match rule {
+            OutputRule::NextToOriginals { folder_name } => Results::Named(folder_name.clone()),
+            OutputRule::Folder { path } => Results::Chosen(real_path(path).ok()),
+        }
+    }
+
+    /// Why the file or folder at real path `p` is left out, or `None` when it is not.
+    fn reason(&self, p: &Path, is_dir: bool) -> Option<String> {
+        match self {
+            Results::Named(name) => {
+                let inside = p.components().any(|c| match c {
+                    std::path::Component::Normal(n) => same_name(&n.to_string_lossy(), name),
+                    _ => false,
+                });
+                inside.then(|| {
+                    if is_dir {
+                        format!(
+                            "This folder was left out: it is named \"{name}\" or is inside a folder of that name, where finished photos are saved."
+                        )
+                    } else {
+                        format!(
+                            "This photo was left out: it is inside a folder named \"{name}\", where finished photos are saved."
+                        )
+                    }
+                })
+            }
+            Results::Chosen(Some(dir)) if within(p, dir) => Some(if is_dir {
+                "This folder was left out: finished photos are saved there.".into()
+            } else {
+                "This photo was left out: it is in the folder where finished photos are saved."
+                    .into()
+            }),
+            Results::Chosen(_) => None,
+        }
+    }
 }
 
 impl PhotoList {
-    /// Add files and folders (one level deep). Results of earlier runs (inside the output
-    /// folder) and photos already in the list are left out quietly.
-    pub fn add_paths(&mut self, paths: &[PathBuf], output_folder_name: &str) -> AddResult {
+    /// Add files and folders (one level deep). Photos already in the list are left out
+    /// quietly. Results of earlier runs are left out with a reason in
+    /// [`AddResult::skipped`]: with [`OutputRule::Folder`] whatever is inside the chosen folder,
+    /// with [`OutputRule::NextToOriginals`] whatever is inside a folder of that name.
+    pub fn add_paths(&mut self, paths: &[PathBuf], rule: &OutputRule) -> AddResult {
+        let results = Results::of(rule);
+        let left_out = |p: &Path, is_dir: bool| {
+            real_path(p)
+                .ok()
+                .and_then(|r| results.reason(&r, is_dir))
+                .map(|reason| Skipped {
+                    name: file_name(p),
+                    reason,
+                })
+        };
         let mut result = AddResult::default();
         let mut candidates: Vec<PathBuf> = Vec::new();
         for p in paths {
             if p.is_dir() {
-                if real_inside_output(p, output_folder_name) {
+                if let Some(s) = left_out(p, true) {
+                    result.skipped.push(s);
                     continue;
                 }
                 let Ok(rd) = fs::read_dir(p) else {
@@ -110,8 +220,8 @@ impl PhotoList {
                     .collect();
                 files.sort();
                 candidates.extend(files);
-            } else if real_inside_output(p, output_folder_name) {
-                continue;
+            } else if let Some(s) = left_out(p, false) {
+                result.skipped.push(s);
             } else if !has_supported_extension(p) {
                 result.skipped.push(Skipped {
                     name: file_name(p),
@@ -130,9 +240,13 @@ impl PhotoList {
         let mut seen: HashSet<PathBuf> = self.entries.iter().map(|e| e.path.clone()).collect();
         let mut fresh: Vec<PathBuf> = Vec::new();
         for c in candidates {
-            match fs::canonicalize(&c) {
+            match real_path(&c) {
                 Ok(real) => {
-                    if inside_output(&real, output_folder_name) {
+                    if let Some(reason) = results.reason(&real, false) {
+                        result.skipped.push(Skipped {
+                            name: file_name(&c),
+                            reason,
+                        });
                         continue;
                     }
                     if seen.insert(real.clone()) {

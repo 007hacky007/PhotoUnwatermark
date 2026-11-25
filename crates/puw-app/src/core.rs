@@ -45,7 +45,7 @@ use crate::images::{self, area_from_edit};
 use crate::jobs::{Events, Job, JobSlot, LoadPurpose, ProgressEvent, with_ticker};
 use crate::photos::{AddResult, PhotoId, PhotoInfo};
 use crate::session::{Draft, Session};
-use crate::{AppError, DataDirs, OutputRule, Result, Settings, load_fraction};
+use crate::{AppError, DataDirs, Result, Settings, load_fraction};
 
 mod remove;
 mod saved;
@@ -240,16 +240,10 @@ impl AppCore {
     /// Adds files and folders. Results of earlier runs (in the output folder) are left out.
     pub fn add_paths(&self, paths: &[PathBuf]) -> Result<AddResult> {
         let _job = self.jobs.start()?;
-        let output_name = match &self.settings().output {
-            OutputRule::NextToOriginals { folder_name } => folder_name.clone(),
-            OutputRule::Folder { path } => path
-                .file_name()
-                .map(|n| n.to_string_lossy().into_owned())
-                .unwrap_or_default(),
-        };
+        let rule = self.settings().output;
         // Photo files are read without the lock; the job slot keeps the list from changing.
         let mut list = self.session().photos.clone();
-        let result = list.add_paths(paths, &output_name);
+        let result = list.add_paths(paths, &rule);
         self.session().photos = list;
         Ok(result)
     }
