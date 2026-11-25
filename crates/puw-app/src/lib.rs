@@ -1,14 +1,19 @@
 //! App logic for PhotoUnwatermark, free of any UI toolkit.
 
+pub mod core;
 pub mod download;
 pub mod estimate;
 pub mod images;
+pub mod jobs;
 pub mod messages;
 pub mod paths;
 pub mod photos;
+mod session;
 pub mod settings;
 
+pub use crate::core::{AppCore, DetectOutcome, Suggestion};
 pub use estimate::{Eta, load_fraction};
+pub use jobs::{Events, LoadPurpose, ProgressEvent};
 pub use messages::{AppError, UserError, user_message};
 pub use paths::DataDirs;
 pub use settings::{Detail, OutputRule, Settings};

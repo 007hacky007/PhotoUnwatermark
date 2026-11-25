@@ -45,7 +45,7 @@ pub struct AddResult {
     pub skipped: Vec<Skipped>,
 }
 
-#[derive(Debug, Default)]
+#[derive(Debug, Clone, Default)]
 pub struct PhotoList {
     entries: Vec<PhotoEntry>,
     next_id: PhotoId,
