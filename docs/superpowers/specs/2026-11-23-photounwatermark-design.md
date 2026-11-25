@@ -165,12 +165,14 @@ the actual reason (GPU helper not downloaded, download failed, helper failed to 
 not supported, GPU run failed and fell back mid-way) and, when a fix exists, a button for it: "Download GPU helper
 (N MB)", "Try again", or "Use processor anyway". A fallback from GPU to CPU during a run is announced in the progress
 screen, never silent. On macOS the chip reflects whether the CoreML path is actually used for the models (not only
-whether it was requested).
+whether it was requested): Macs use Core ML for every model unless it fails, and a model that falls back runs on the
+processor and is shown as such (see `docs/notes/coreml.md`).
 
-**Model loading (owner's decision, 2026-11-24):** loading the models is slow on the CPU (about 30 s for all of
-them), so it never happens at app start and never blocks the screens where the user is working. Models are loaded
-only when the user starts something they already expect to wait for, and every load shows a progress or loading bar
-with a plain sentence ("Getting the watermark remover ready..."), never a frozen window. Confirmed by the owner
+**Model loading (owner's decision, 2026-11-24):** loading the models is slow (about 30 s for all of them on a Mac
+the first time, while Core ML prepares them; see `docs/notes/model-loading.md`), so it never happens at app start
+and never blocks the screens where the user is working. Models are loaded only when the user starts something they
+already expect to wait for, and every load shows a progress or loading bar with a plain sentence ("Getting the
+watermark remover ready..."), never a frozen window. Confirmed by the owner
 2026-11-25: the detection models (segmenter, face detector) load when automatic detection starts after photos are added, as part of
 that step's progress; the removal model (LaMa) loads when the user first presses Preview or Remove, as part of that
 progress. Loaded models stay in memory for the rest of the session.

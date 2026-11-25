@@ -1,6 +1,7 @@
 mod common;
 
 use image::imageops::FilterType;
+use std::sync::{Mutex, MutexGuard, PoisonError};
 use std::time::{Duration, Instant};
 
 use puw_core::engine::{Backend, CpuReason, Engine, EngineOptions, ModelKind, ModelPaths};
@@ -17,6 +18,14 @@ fn engine_with(opts: EngineOptions) -> Option<Engine> {
     };
     let paths = ModelPaths::from_dir(&dir).expect("model files present");
     Some(Engine::new(&paths, opts).expect("engine created"))
+}
+
+/// Held by every test that loads models with `prefer_gpu`, so GPU loads never overlap. On a Mac a
+/// segmenter load from the Core ML cache took 0.85 s alone but 27 s while other tests were
+/// compiling models with Core ML, which broke the timing in `core_ml_cache_dir_used`.
+fn gpu_lock() -> MutexGuard<'static, ()> {
+    static LOCK: Mutex<()> = Mutex::new(());
+    LOCK.lock().unwrap_or_else(PoisonError::into_inner)
 }
 
 fn engine(prefer_gpu: bool) -> Option<Engine> {
@@ -75,9 +84,13 @@ fn centred_hole(side: usize) -> Vec<f32> {
     mask
 }
 
-/// A partly supported model is reloaded on the CPU, so only `Gpu` means a GPU session.
 fn gpu_active(backend: &Backend) -> bool {
     matches!(backend, Backend::Gpu { .. })
+}
+
+/// What the session log of a processor-only session names.
+fn cpu_only() -> Option<Vec<String>> {
+    Some(vec!["CPUExecutionProvider".to_string()])
 }
 
 fn face_input() -> Vec<f32> {
@@ -198,6 +211,88 @@ fn intra_threads_applied() {
     assert_eq!(outs.len(), 12);
 }
 
+#[cfg(target_os = "macos")]
+#[test]
+fn mac_prefers_core_ml() {
+    let _gpu = gpu_lock();
+    let Some(engine) = engine(true) else { return };
+    let backend = engine.load(ModelKind::Face).expect("face loads");
+    assert!(
+        matches!(&backend, Backend::Gpu { name, share: None } if name == "Core ML"),
+        "{backend:?}"
+    );
+    let providers = engine.providers(ModelKind::Face).expect("face loaded");
+    assert_eq!(providers, ["CoreMLExecutionProvider"]);
+}
+
+#[test]
+fn cpu_is_really_cpu() {
+    let Some(engine) = engine(false) else { return };
+    engine.load(ModelKind::Face).expect("face loads");
+    assert_eq!(engine.providers(ModelKind::Face), cpu_only());
+    assert_eq!(engine.providers(ModelKind::Lama), None);
+}
+
+#[cfg(target_os = "macos")]
+#[test]
+fn core_ml_cache_dir_used() {
+    let _gpu = gpu_lock();
+    fn files_in(dir: &std::path::Path) -> usize {
+        std::fs::read_dir(dir)
+            .expect("read cache dir")
+            .map(|e| e.expect("dir entry").path())
+            .map(|p| if p.is_dir() { files_in(&p) } else { 1 })
+            .sum()
+    }
+    let cache = tempfile::tempdir().expect("temp dir");
+    let opts = EngineOptions {
+        prefer_gpu: true,
+        cache_dir: Some(cache.path().to_path_buf()),
+        ..EngineOptions::default()
+    };
+    // The segmenter, not the face model: its compile takes seconds, so the comparison is not
+    // swamped by other tests loading models at the same time.
+    let Some(first) = engine_with(opts.clone()) else {
+        return;
+    };
+    let start = Instant::now();
+    let backend = first.load(ModelKind::Segmenter).expect("segmenter loads");
+    let cold = start.elapsed();
+    assert!(
+        matches!(&backend, Backend::Gpu { name, .. } if name == "Core ML"),
+        "{backend:?}"
+    );
+    assert!(files_in(cache.path()) > 0, "cache folder is empty");
+    let second = engine_with(opts).expect("models available");
+    let start = Instant::now();
+    assert_eq!(
+        second.load(ModelKind::Segmenter).expect("segmenter loads"),
+        backend
+    );
+    let warm = start.elapsed();
+    eprintln!("segmenter load with Core ML: cold {cold:?}, from the cache {warm:?}");
+    assert!(warm <= cold, "cold {cold:?}, warm {warm:?}");
+}
+
+#[test]
+fn fallback_uses_cpu_policy() {
+    let _gpu = gpu_lock();
+    let Some(engine) = engine(true) else { return };
+    engine
+        .simulate_gpu_failure(ModelKind::Face)
+        .expect("face loads");
+    engine
+        .run_face(&face_input(), 640, 640)
+        .expect("face runs after the GPU failed");
+    assert!(matches!(
+        engine.backend(ModelKind::Face),
+        Some(Backend::Cpu {
+            reason: CpuReason::RunFailed(_)
+        })
+    ));
+    assert_eq!(engine.providers(ModelKind::Face), cpu_only());
+}
+
 #[test]
 fn model_kind_serialises_lowercase() {
     let json = serde_json::to_string(&[ModelKind::Segmenter, ModelKind::Lama, ModelKind::Face])
@@ -230,6 +325,7 @@ fn engine_loads_on_cpu() {
 
 #[test]
 fn engine_reports_gpu_honestly() {
+    let _gpu = gpu_lock();
     let Some(engine) = loaded_engine(true) else {
         return;
     };
@@ -238,12 +334,16 @@ fn engine_reports_gpu_honestly() {
     for backend in [&report.segmenter, &report.lama, &report.face] {
         let backend = backend.as_ref().expect("model loaded");
         match backend {
-            Backend::Gpu { name } => assert!(!name.is_empty()),
+            Backend::Gpu { name, share } => {
+                assert!(!name.is_empty());
+                if let Some((gpu_nodes, total_nodes)) = share {
+                    assert!(0 < *gpu_nodes && gpu_nodes < total_nodes, "{share:?}");
+                }
+            }
             Backend::Cpu { reason } => match reason {
                 CpuReason::NotRequested => panic!("GPU was requested"),
                 CpuReason::ProviderUnavailable(why)
                 | CpuReason::LoadFailed(why)
-                | CpuReason::GpuNotBeneficial(why)
                 | CpuReason::RunFailed(why) => {
                     assert!(!why.trim().is_empty(), "empty reason")
                 }
@@ -253,13 +353,23 @@ fn engine_reports_gpu_honestly() {
                 } => assert!(0 < *gpu_nodes && gpu_nodes < total_nodes),
             },
         }
-        #[cfg(target_os = "macos")]
-        assert_eq!(
-            backend,
-            &Backend::Cpu {
-                reason: CpuReason::GpuNotBeneficial(puw_core::engine::MAC_GPU_REASON.to_string())
-            }
-        );
+    }
+    // Measured in docs/notes/coreml.md: Core ML runs the whole face model, all of the segmenter
+    // but 8 small nodes at its end, and part of LaMa; both partial placements are faster than
+    // the processor alone, so they are kept.
+    #[cfg(target_os = "macos")]
+    {
+        let core_ml = |b: &Option<Backend>| match b {
+            Some(Backend::Gpu { name, share }) if name == "Core ML" => Some(*share),
+            _ => None,
+        };
+        assert_eq!(core_ml(&report.face), Some(None), "{:?}", report.face);
+        for backend in [&report.segmenter, &report.lama] {
+            assert!(
+                matches!(core_ml(backend), Some(Some((gpu, total))) if gpu < total),
+                "{backend:?}"
+            );
+        }
     }
 }
 
@@ -313,8 +423,25 @@ fn missing_model_file_is_an_error() {
     assert!(matches!(err, Err(puw_core::Error::Io(_))));
 }
 
+/// GPU vs processor limits: the segmenter's largest probability difference and LaMa's smallest
+/// PSNR in the hole. DirectML: Plan 1's limits. Core ML (the configuration Plan 1 was tuned on)
+/// works at reduced precision. On the first styles image, the one compared here, it differs from
+/// the processor by 0.094 (segmenter) and 39.4 dB (LaMa); over styles 00-03 by 0.077-0.209 and
+/// 39.4-57.6 dB (`docs/notes/coreml.md`).
+const SEG_GPU_LIMIT: f32 = if cfg!(target_os = "macos") {
+    0.25
+} else {
+    0.02
+};
+const LAMA_GPU_PSNR: f64 = if cfg!(target_os = "macos") {
+    35.0
+} else {
+    40.0
+};
+
 #[test]
 fn gpu_matches_cpu() {
+    let _gpu = gpu_lock();
     let Some(gpu) = engine(true) else { return };
     let check_seg = gpu_active(&gpu.load(ModelKind::Segmenter).expect("segmenter loads"));
     let check_lama = gpu_active(&gpu.load(ModelKind::Lama).expect("lama loads"));
@@ -336,7 +463,7 @@ fn gpu_matches_cpu() {
             .map(|(x, y)| (x - y).abs())
             .fold(0.0f32, f32::max);
         eprintln!("segmenter GPU vs CPU max prob diff: {max_diff}");
-        assert!(max_diff < 0.02, "segmenter max diff {max_diff}");
+        assert!(max_diff < SEG_GPU_LIMIT, "segmenter max diff {max_diff}");
     } else {
         eprintln!("segmenter on CPU ({:?}), not compared", report.segmenter);
     }
@@ -362,7 +489,7 @@ fn gpu_matches_cpu() {
             10.0 * (255.0f64 * 255.0 / mse).log10()
         };
         eprintln!("LaMa GPU vs CPU PSNR in hole: {psnr:.2} dB");
-        assert!(psnr > 40.0, "LaMa PSNR {psnr:.2} dB");
+        assert!(psnr > LAMA_GPU_PSNR, "LaMa PSNR {psnr:.2} dB");
     } else {
         eprintln!("LaMa on CPU ({:?}), not compared", report.lama);
     }

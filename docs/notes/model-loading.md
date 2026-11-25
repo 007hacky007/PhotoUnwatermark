@@ -24,12 +24,10 @@ CoreMLExecutionProvider::GetCapability, number of partitions supported by CoreML
 With `.with_auto_device(AutoDevicePolicy::PreferCPU)` the same load logs
 `All nodes placed on [CPUExecutionProvider]. Number of nodes: 106`.
 
-`engine.rs` never sets the policy, so every session the engine reports as
-`Cpu { NotRequested | GpuNotBeneficial(..) }` is in fact a Core ML session on macOS. That
-contradicts `MAC_GPU_REASON` and `docs/notes/coreml.md`. Manually registered providers take
-precedence over the policy, so the DirectML sessions on Windows are not affected. The processor
-fallback sessions on Windows may be, but that was not checked here. Task 1 leaves this behaviour
-unchanged and reports it for a decision (see "Open question" below).
+Until Task 1b `engine.rs` never set the policy, so every session the engine reported as
+`Cpu { NotRequested | GpuNotBeneficial(..) }` was in fact a Core ML session on macOS. Manually
+registered providers take precedence over the policy, so the DirectML sessions on Windows were not
+affected. Task 1 left this unchanged and reported it for a decision; the decision is below.
 
 ## Measurements
 
@@ -74,20 +72,25 @@ The "about 33 s to load" that motivated the cache is Core ML compiling the model
 Runtime's graph optimisation. On the processor alone all three models load in well under a second
 once the files are in the page cache.
 
-## Open question
+## Decision on the policy (owner, 2026-11-25; Task 1b)
 
-Should the engine set `AutoDevicePolicy::PreferCPU` so that "processor" really means the processor?
+Macs use Core ML on purpose and the report says so. Since Task 1b:
 
-- For: the device report would be honest again, and loads would drop from about 16 s per model to
-  under 1 s. Results would match the processor numbers the GPU parity checks assume.
-- Against: Core ML currently runs the fp32 segmenter at 0.15 s per tile, against 2.12 s on the
-  processor (14 times slower), and coreml.md measured Core ML segmenter results 0.04-0.21 away
-  from the processor's. Thresholds tuned in Plan 1 may have been tuned on Core ML output.
+- every session the engine creates sets `AutoDevicePolicy::PreferCPU`, so a session reported as
+  `Cpu` runs on the processor on every platform (the tests check the session log);
+- with `prefer_gpu` on macOS each model is loaded with Core ML registered explicitly, with the
+  options that reproduce the automatic placement Plan 1 was tuned on, and reported as
+  `Gpu { name: "Core ML" }` only when the session log shows Core ML runs it;
+- `EngineOptions.cache_dir` gives Core ML a folder for its compiled models, which takes the
+  16 s compile out of every load after the first.
 
-Whole test suite (`cargo test --workspace --release`, same machine) with the policy as now and
-with `PreferCPU` set in the engine's session builder; every test passes both ways:
+Measurements and the per-model outcome are in `docs/notes/coreml.md`.
 
-| test binary | as now | `PreferCPU` |
+Before the decision, the whole test suite (`cargo test --workspace --release`, same machine) was
+run with the policy as it was and with `PreferCPU` set in the engine's session builder; every
+test passed both ways:
+
+| test binary | Core ML (implicit) | `PreferCPU` |
 |---|---|---|
 | engine | 132 s | 3 s |
 | detect | 31 s | 194 s |
@@ -95,10 +98,9 @@ with `PreferCPU` set in the engine's session builder; every test passes both way
 | pipeline | 60 s | 458 s |
 | whole run (wall clock, with build) | 5 min 49 s | 12 min 39 s |
 
-The speed figures in `docs/notes/coreml.md` may need to be measured again. Its "processor"
-segmenter fp32 time (0.17 s) matches the Core ML time measured here, not the processor time.
+The speed figures in `docs/notes/coreml.md` were measured again in Task 1b.
 
-How the measurement was made: a throwaway example (not committed) that loads each model with
+How the cache measurement was made: a throwaway example (not committed) that loads each model with
 `Session::builder`, then with `with_optimized_model_path(<file>)` at each `GraphOptimizationLevel`,
 then loads the written file with `GraphOptimizationLevel::Disable`, and compares one run's output
 on a constant 0.1 input.

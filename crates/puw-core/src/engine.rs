@@ -1,10 +1,14 @@
 //! ONNX Runtime sessions for the three models, and an honest report of where each one runs.
 //!
-//! Models load one at a time, on first use (see [`Engine`]). With `prefer_gpu` on Windows, each
-//! model is first loaded with the DirectML execution provider. ONNX Runtime's own session log is
-//! captured while the model loads and read for how many graph nodes the provider took. The report says `Gpu` only when that log shows the
-//! provider took every node; anything else is reported as `Cpu` with the real reason, never a
-//! guess. macOS never uses Core ML (see [`MAC_GPU_REASON`] and `docs/notes/coreml.md`).
+//! Each model loads on first use (see [`Engine`]); different models may load at the same time from
+//! different threads. With `prefer_gpu` each model is first loaded with the platform's GPU
+//! provider: Core ML on macOS, DirectML on Windows. ONNX Runtime's own session log is captured
+//! while the model loads and read for how many graph nodes the provider took. The report says
+//! `Gpu` only when that log shows the provider runs the whole model, or, on Core ML, a part of it
+//! measured to be faster than the processor alone (the report then gives the share). Anything
+//! else is reported as `Cpu` with the real reason, never a guess. Every other session is pinned
+//! to the processor, so `Cpu` in the report always means the processor (see `builder` and
+//! `docs/notes/coreml.md`).
 
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
@@ -15,7 +19,7 @@ use ort::environment::Environment;
 use ort::ep::ExecutionProviderDispatch;
 use ort::logging::LogLevel;
 use ort::session::Session;
-use ort::session::builder::SessionBuilder;
+use ort::session::builder::{AutoDevicePolicy, SessionBuilder};
 use ort::value::TensorRef;
 use serde::{Deserialize, Serialize};
 
@@ -55,8 +59,15 @@ impl ModelPaths {
 /// Where one model runs.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Backend {
-    /// The whole model runs through the named GPU provider (`"DirectML"`).
-    Gpu { name: String },
+    /// The model runs through the named GPU provider (`"Core ML"` or `"DirectML"`). `share` is
+    /// `None` when the provider runs every compute node. `Some((gpu_nodes, total_nodes))` means it
+    /// runs only that many of the model's nodes and the processor runs the rest; this is kept only
+    /// for Core ML models measured to be faster that way than on the processor alone (see
+    /// [`CpuReason::PartialGpu`]).
+    Gpu {
+        name: String,
+        share: Option<(usize, usize)>,
+    },
     /// The model runs on the processor, for the given reason.
     Cpu { reason: CpuReason },
 }
@@ -72,31 +83,26 @@ pub enum CpuReason {
     /// The GPU provider was set up but loading the model with it failed; the text is the error.
     /// The model was then loaded again for the processor.
     LoadFailed(String),
-    /// The GPU provider can run only `gpu_nodes` of the model's `total_nodes` compute nodes. Both
-    /// are real graph nodes after ONNX Runtime's graph optimisations, counted with the provider's
-    /// own graph fusion off; `Shape`, `Size` and `Memcpy*` nodes, which ONNX Runtime keeps on the
-    /// processor by design, are not counted. By policy the model is then loaded again for the
-    /// processor alone: v1 uses the GPU only for a model it can run completely, so "graphics
-    /// card" in the report always means the whole model, and no per-machine guess is made about
-    /// whether a split between the two is faster.
+    /// The GPU provider can run only `gpu_nodes` of the model's `total_nodes` compute nodes, and
+    /// the model was loaded again for the processor alone.
+    ///
+    /// DirectML: both counts are real graph nodes after ONNX Runtime's graph optimisations,
+    /// counted with DirectML's own graph fusion off; `Shape`, `Size` and `Memcpy*` nodes, which
+    /// ONNX Runtime keeps on the processor by design, are not counted. By policy DirectML is used
+    /// only for a model it can run completely, and no per-machine guess is made about whether a
+    /// split between the two is faster.
+    ///
+    /// Core ML: the counts are the ones Core ML reports for the graph it was offered. A partly
+    /// supported model stays on Core ML (reported as [`Backend::Gpu`] with a `share`) only when
+    /// that was measured to be faster than the processor (`docs/notes/coreml.md`).
     PartialGpu {
         gpu_nodes: usize,
         total_nodes: usize,
     },
-    /// A GPU path exists but was measured to be worse than the processor on this platform; the
-    /// text states the measured facts.
-    GpuNotBeneficial(String),
     /// The model ran on the GPU, but a run failed; the text is the error. The model was then
     /// loaded again for the processor and the run retried there.
     RunFailed(String),
 }
-
-/// Why macOS runs every model on the processor. Measured with Core ML through ONNX Runtime 1.31
-/// on Apple silicon: segmenter results differed from the processor's by up to 0.04-0.21 in
-/// probability with every compute-unit setting, the fp32 models ran as fast or faster on the
-/// processor, LaMa only partly fits Core ML, and loading took 14-55 s longer.
-pub const MAC_GPU_REASON: &str = "On Macs the graphics path (Core ML) gave different results and was slower than the \
-     processor in our tests";
 
 /// Where each loaded model runs; `None` for a model that is not loaded yet.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -123,6 +129,15 @@ impl ModelKind {
             ModelKind::Face => "face",
         }
     }
+
+    /// The model's place in [`Engine::slots`].
+    fn slot(self) -> usize {
+        match self {
+            ModelKind::Segmenter => 0,
+            ModelKind::Lama => 1,
+            ModelKind::Face => 2,
+        }
+    }
 }
 
 impl ModelPaths {
@@ -147,12 +162,18 @@ pub struct EngineOptions {
     /// Threads ONNX Runtime may use within one model run; `None` keeps its default (one per
     /// physical core).
     pub intra_threads: Option<usize>,
+    /// A folder where Core ML keeps each model compiled for this Mac, so later loads skip the
+    /// compile step (about 16 s for the segmenter or LaMa); ignored on other platforms. Each model
+    /// gets a subfolder named after its file's size and modification time, and subfolders left by
+    /// older files of the same model are deleted.
+    pub cache_dir: Option<PathBuf>,
 }
 
 /// The three models, each loaded on first use and kept until the engine is dropped.
 ///
 /// All methods take `&self` and may be called from several threads. Callers asking for a model
-/// that is being loaded wait for that one load. A model running on the GPU whose run fails is
+/// that is being loaded wait for that one load; different models load independently, so they may
+/// load at the same time. A model running on the GPU whose run fails is
 /// loaded again for the processor and the run is retried once there; its backend then reports
 /// [`CpuReason::RunFailed`].
 pub struct Engine {
@@ -160,7 +181,7 @@ pub struct Engine {
     opts: EngineOptions,
     /// The GPU provider, or why there is none; resolved on the first load.
     gpu: OnceLock<std::result::Result<GpuProvider, CpuReason>>,
-    /// Indexed by `ModelKind as usize`.
+    /// Indexed by [`ModelKind::slot`].
     slots: [Slot; 3],
 }
 
@@ -238,6 +259,16 @@ impl Engine {
         self.slot(kind).loads.load(Ordering::SeqCst)
     }
 
+    /// The execution providers the session log of `kind` shows graph nodes placed on, in log
+    /// order (`["CPUExecutionProvider"]` for a processor session), or `None` when `kind` is not
+    /// loaded.
+    ///
+    /// Public only for the integration tests; not part of the stable API.
+    #[doc(hidden)]
+    pub fn providers(&self, kind: ModelKind) -> Option<Vec<String>> {
+        self.slot(kind).get().map(|l| l.model.providers.clone())
+    }
+
     /// Loads `kind` if needed, then reports it as running on a GPU and makes its next run fail, so
     /// the fallback after a failed GPU run can be tested on any machine.
     ///
@@ -252,6 +283,7 @@ impl Engine {
             model,
             backend: Backend::Gpu {
                 name: "simulated".to_string(),
+                share: None,
             },
         });
         Ok(())
@@ -306,7 +338,7 @@ impl Engine {
     }
 
     fn slot(&self, kind: ModelKind) -> &Slot {
-        &self.slots[kind as usize]
+        &self.slots[kind.slot()]
     }
 
     /// The loaded `kind`, loading it first if needed.
@@ -322,7 +354,10 @@ impl Engine {
         let env = environment()?;
         let gpu = self.gpu.get_or_init(|| {
             if self.opts.prefer_gpu {
-                platform::gpu_provider(self.opts.gpu_helper_dir.as_deref())
+                platform::gpu_provider(
+                    self.opts.gpu_helper_dir.as_deref(),
+                    self.opts.cache_dir.as_deref(),
+                )
             } else {
                 Err(CpuReason::NotRequested)
             }
@@ -420,17 +455,29 @@ fn environment() -> Result<&'static Environment> {
     .map_err(|e| model_err("could not start ONNX Runtime", e))
 }
 
-/// A GPU execution provider this build can try (only DirectML is ever built).
-#[cfg_attr(not(windows), allow(dead_code))]
+/// A GPU execution provider this build can try: Core ML on macOS, DirectML on Windows.
+#[cfg_attr(not(any(windows, target_os = "macos")), allow(dead_code))]
 struct GpuProvider {
     /// Name shown to the user.
     name: &'static str,
     /// ONNX Runtime's name for the provider, as it appears in its logs.
     ep_name: &'static str,
-    build: fn() -> ExecutionProviderDispatch,
-    /// Session config entries for the placement probe only: they turn off the provider's graph
-    /// fusion, so the probe's log lists real graph nodes instead of fused partitions.
-    probe_config: &'static [(&'static str, &'static str)],
+    /// Builds the provider; the argument is the model's compiled-model cache folder, if any.
+    build: fn(Option<&Path>) -> ExecutionProviderDispatch,
+    /// `Some`: the placement is read from a separate probe load with these session config
+    /// entries, which turn off the provider's graph fusion so that the probe's log lists real
+    /// graph nodes instead of fused partitions (DirectML). `None`: it is read from the real
+    /// session's own log (Core ML, whose log states how many nodes it took; a probe would make
+    /// it compile the model twice).
+    probe_config: Option<&'static [(&'static str, &'static str)]>,
+    /// For a provider that fuses the nodes it takes into partitions: the log text followed by
+    /// the number of graph nodes it took, which then replaces the partition count.
+    taken_marker: Option<&'static str>,
+    /// Where the per-model compiled-model caches go (Core ML with `cache_dir` only).
+    cache_root: Option<PathBuf>,
+    /// Labels of the models kept on this provider when it runs only part of them (measured to be
+    /// faster that way). Any other partial placement is loaded again for the processor alone.
+    keep_partial: &'static [&'static str],
 }
 
 /// One loaded model. `Session::run` needs `&mut`, hence the mutex.
@@ -439,6 +486,8 @@ struct Model {
     session: Mutex<Session>,
     /// Input names and fixed shapes, in graph order.
     inputs: Vec<(String, Vec<i64>)>,
+    /// Providers the session log shows nodes placed on (see [`Engine::providers`]).
+    providers: Vec<String>,
     /// Set by [`Engine::simulate_gpu_failure`]: the next run fails.
     fail_next_run: AtomicBool,
 }
@@ -455,49 +504,128 @@ impl Model {
             Ok(provider) => provider,
             Err(reason) => return Self::load_cpu(env, label, path, reason.clone(), threads),
         };
-        // Probe: load once with verbose logging and graph fusion off, and read the placement.
+        let cache = provider
+            .cache_root
+            .as_deref()
+            .and_then(|root| model_cache_dir(root, label, path));
+        // The log to read the placement from, and the real session if that log is its own.
         let log = SessionLog::new();
-        let mut probe = builder(env, label, Some(&log), threads)?;
-        for (key, value) in provider.probe_config {
-            probe = probe
-                .with_config_entry(*key, *value)
-                .map_err(|e| model_err("could not configure ONNX Runtime", e))?;
-        }
-        let probe = match Self::commit_with(probe, provider, label, path) {
-            Ok(session) => session,
-            Err(reason) => return Self::load_cpu(env, label, path, reason, threads),
-        };
-        drop(probe);
-        match classify(
-            &placement(&log.finish(), provider.ep_name),
-            provider.name,
-            label,
-        ) {
-            Ok(()) => {}
-            Err(reason) => return Self::load_cpu(env, label, path, reason, threads),
-        }
-        // The real session keeps the provider's defaults (graph fusion on).
-        let session =
-            match Self::commit_with(builder(env, label, None, threads)?, provider, label, path) {
-                Ok(session) => session,
+        let mut session = None;
+        match provider.probe_config {
+            Some(config) => {
+                let mut probe = builder(env, label, &log, threads)?;
+                for (key, value) in config {
+                    probe = probe
+                        .with_config_entry(*key, *value)
+                        .map_err(|e| model_err("could not configure ONNX Runtime", e))?;
+                }
+                match Self::commit_with(probe, provider, None, label, path) {
+                    Ok(probe) => drop(probe),
+                    Err(reason) => return Self::load_cpu(env, label, path, reason, threads),
+                }
+            }
+            None => match Self::commit_cached(
+                env,
+                &log,
+                provider,
+                cache.as_deref(),
+                label,
+                path,
+                threads,
+            )? {
+                Ok(real) => session = Some(real),
                 Err(reason) => return Self::load_cpu(env, label, path, reason, threads),
-            };
+            },
+        }
+        let lines = log.finish();
+        let found = provider_placement(&lines, provider.ep_name, provider.taken_marker);
+        let share = match classify(&found, provider.name, label) {
+            Ok(()) => None,
+            Err(CpuReason::PartialGpu {
+                gpu_nodes,
+                total_nodes,
+            }) if session.is_some() && provider.keep_partial.contains(&label) => {
+                Some((gpu_nodes, total_nodes))
+            }
+            Err(reason) => {
+                drop(session);
+                return Self::load_cpu(env, label, path, reason, threads);
+            }
+        };
+        let (session, lines) = match session {
+            Some(session) => (session, lines),
+            // After a probe, the real session keeps the provider's defaults (graph fusion on).
+            None => {
+                let log = SessionLog::new();
+                match Self::commit_with(
+                    builder(env, label, &log, threads)?,
+                    provider,
+                    None,
+                    label,
+                    path,
+                ) {
+                    Ok(session) => (session, log.finish()),
+                    Err(reason) => return Self::load_cpu(env, label, path, reason, threads),
+                }
+            }
+        };
         let backend = Backend::Gpu {
             name: provider.name.to_string(),
+            share,
         };
-        Ok((Self::from_session(label, session)?, backend))
+        Ok((Self::from_session(label, session, &lines)?, backend))
     }
 
-    /// Registers `provider` on `builder` and loads the model; any failure is the reason to fall
-    /// back to the processor.
+    /// Loads the model with `provider` using the compiled-model cache folder `cache`. If that
+    /// fails, the folder may hold a broken compile (say, from a load that was killed), so it is
+    /// deleted and the model loaded once more without a cache.
+    fn commit_cached(
+        env: &Environment,
+        log: &SessionLog,
+        provider: &GpuProvider,
+        cache: Option<&Path>,
+        label: &'static str,
+        path: &Path,
+        threads: Option<usize>,
+    ) -> Result<std::result::Result<Session, CpuReason>> {
+        let first = Self::commit_with(
+            builder(env, label, log, threads)?,
+            provider,
+            cache,
+            label,
+            path,
+        );
+        let (Err(reason), Some(dir)) = (&first, cache) else {
+            return Ok(first);
+        };
+        tracing::warn!(
+            model = label,
+            ?reason,
+            cache = %dir.display(),
+            "loading with the model cache failed, trying without it"
+        );
+        let _ = std::fs::remove_dir_all(dir);
+        log.restart();
+        Ok(Self::commit_with(
+            builder(env, label, log, threads)?,
+            provider,
+            None,
+            label,
+            path,
+        ))
+    }
+
+    /// Registers `provider` (with the compiled-model cache folder `cache`, if any) on `builder`
+    /// and loads the model; any failure is the reason to fall back to the processor.
     fn commit_with(
         builder: SessionBuilder,
         provider: &GpuProvider,
+        cache: Option<&Path>,
         label: &str,
         path: &Path,
     ) -> std::result::Result<Session, CpuReason> {
         let builder = builder
-            .with_execution_providers([(provider.build)()])
+            .with_execution_providers([(provider.build)(cache)])
             .map_err(|e| {
                 CpuReason::ProviderUnavailable(format!(
                     "{} could not be set up: {}",
@@ -521,13 +649,18 @@ impl Model {
         reason: CpuReason,
         threads: Option<usize>,
     ) -> Result<(Model, Backend)> {
-        let session = builder(env, label, None, threads)?
+        let log = SessionLog::new();
+        let session = builder(env, label, &log, threads)?
             .commit_from_file(path)
             .map_err(|e| model_err(&format!("could not load {}", path.display()), e))?;
-        Ok((Self::from_session(label, session)?, Backend::Cpu { reason }))
+        Ok((
+            Self::from_session(label, session, &log.finish())?,
+            Backend::Cpu { reason },
+        ))
     }
 
-    fn from_session(label: &'static str, session: Session) -> Result<Model> {
+    /// The model around `session`; `log` is the session's log from its creation.
+    fn from_session(label: &'static str, session: Session, log: &[String]) -> Result<Model> {
         let mut inputs = Vec::new();
         for input in session.inputs() {
             let shape = input
@@ -547,6 +680,7 @@ impl Model {
             label,
             session: Mutex::new(session),
             inputs,
+            providers: providers(log),
             fail_next_run: AtomicBool::new(false),
         })
     }
@@ -600,23 +734,30 @@ impl Model {
     }
 }
 
-/// Session builder with the crate's logging: ONNX Runtime messages go to `tracing`, and with a
-/// `log` the session logs verbosely so its placement messages can be read after loading.
-/// `threads` sets the threads used within one run.
+/// Session builder with the crate's logging, pinned to the processor unless a provider is
+/// registered on it.
+///
+/// `ort` sets ONNX Runtime's automatic provider selection to `MaxEfficiency` on every new
+/// builder, which on macOS quietly runs a session with no registered provider on Core ML. The
+/// policy is set to `PreferCPU` here, which never adds a provider, so a session the report calls
+/// "processor" really runs there. Providers registered with `with_execution_providers` take
+/// precedence over the policy.
+///
+/// The session logs verbosely while it is created, and `log` records those messages, so its
+/// placement can be read after loading; ONNX Runtime messages also go to `tracing`. `threads`
+/// sets the threads used within one run.
 fn builder(
     env: &Environment,
     label: &str,
-    log: Option<&SessionLog>,
+    log: &SessionLog,
     threads: Option<usize>,
 ) -> Result<SessionBuilder> {
     let err = |e: ort::Error| model_err("could not configure ONNX Runtime", e);
-    let level = if log.is_some() {
-        LogLevel::Verbose
-    } else {
-        LogLevel::Warning
-    };
-    let lines = log.map(|l| Arc::clone(&l.lines));
-    let mut builder = Session::builder(env).map_err(err)?;
+    let lines = Arc::clone(&log.lines);
+    let mut builder = Session::builder(env)
+        .map_err(err)?
+        .with_auto_device(AutoDevicePolicy::PreferCPU)
+        .map_err(|e| err(e.into()))?;
     if let Some(threads) = threads {
         builder = builder
             .with_intra_threads(threads)
@@ -625,14 +766,13 @@ fn builder(
     builder
         .with_log_id(format!("puw-{label}"))
         .map_err(|e| err(e.into()))?
-        .with_log_level(level)
+        .with_log_level(LogLevel::Verbose)
         .map_err(|e| err(e.into()))?
         .with_logger(Arc::new(move |level, _category, id, location, message| {
-            if let Some(lines) = &lines
-                && let Some(lines) = lines
-                    .lock()
-                    .unwrap_or_else(PoisonError::into_inner)
-                    .as_mut()
+            if let Some(lines) = lines
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .as_mut()
             {
                 lines.push(message.to_string());
             }
@@ -674,6 +814,11 @@ impl SessionLog {
             .take()
             .unwrap_or_default()
     }
+
+    /// Drops what was recorded and records afresh.
+    fn restart(&self) {
+        *self.lines.lock().unwrap_or_else(PoisonError::into_inner) = Some(Vec::new());
+    }
 }
 
 /// Node placement read from ONNX Runtime's session log.
@@ -695,8 +840,9 @@ const CPU_BY_DESIGN: &[&str] = &["Shape", "Size", "MemcpyFromHost", "MemcpyToHos
 /// or for each provider ` Node(s) placed on [X]. Number of nodes: N` followed by one
 /// `  OpType (node name)` line per node. The per-node lines are used when present so that
 /// [`CPU_BY_DESIGN`] nodes can be left out. The log is written after graph partitioning, so a
-/// provider that fuses its nodes shows each fused partition as one node; the probe session turns
-/// fusion off for that reason (see `GpuProvider::probe_config`).
+/// provider that fuses its nodes shows each fused partition as one node; the DirectML probe
+/// session turns fusion off for that reason (see `GpuProvider::probe_config`), and Core ML's own
+/// node count is read instead (see [`provider_placement`]).
 fn placement(lines: &[String], ep_name: &str) -> Option<Placement> {
     // (provider, count from the header, op types listed under it)
     let mut groups: Vec<(String, usize, Vec<String>)> = Vec::new();
@@ -742,6 +888,24 @@ fn placement(lines: &[String], ep_name: &str) -> Option<Placement> {
     Some(result)
 }
 
+/// [`placement`] for `ep_name`. For a provider that fuses the nodes it takes into partitions and
+/// logs how many nodes it took after `taken_marker`, the partition count is replaced by that
+/// node count (the last one logged, which describes the final graph).
+fn provider_placement(
+    lines: &[String],
+    ep_name: &str,
+    taken_marker: Option<&str>,
+) -> Option<Placement> {
+    let mut found = placement(lines, ep_name)?;
+    if let Some(marker) = taken_marker
+        && found.gpu > 0
+        && let Some(taken) = lines.iter().rev().find_map(|l| number_after(l, marker))
+    {
+        found.gpu = taken;
+    }
+    Some(found)
+}
+
 /// `Ok` when the GPU provider runs every compute node, otherwise the reason to use the processor.
 fn classify(
     placement: &Option<Placement>,
@@ -764,6 +928,52 @@ fn classify(
     }
 }
 
+/// The providers named in the log's placement lines (see [`placement`]), each once, in log order.
+fn providers(lines: &[String]) -> Vec<String> {
+    let mut found: Vec<String> = Vec::new();
+    for line in lines {
+        if let Some(rest) = line.split("placed on [").nth(1)
+            && let Some((ep, _)) = rest.split_once(']')
+            && !found.iter().any(|f| f == ep)
+        {
+            found.push(ep.to_string());
+        }
+    }
+    found
+}
+
+/// This model's folder in the compiled-model cache at `root`, created if needed:
+/// `<label>-<file bytes>-<file mtime secs>`, so a changed model file never reuses an old compile
+/// (Core ML itself recompiles only when the graph's structure changes, not its weights). Folders
+/// left by older files of the same model are deleted. `None`, meaning no cache, when the folder
+/// cannot be made.
+fn model_cache_dir(root: &Path, label: &str, path: &Path) -> Option<PathBuf> {
+    let meta = std::fs::metadata(path).ok()?;
+    let mtime = meta
+        .modified()
+        .ok()?
+        .duration_since(std::time::UNIX_EPOCH)
+        .ok()?
+        .as_secs();
+    let name = format!("{label}-{}-{mtime}", meta.len());
+    let dir = root.join(&name);
+    if let Err(e) = std::fs::create_dir_all(&dir) {
+        tracing::warn!(model = label, cache = %dir.display(), error = %e, "no model cache");
+        return None;
+    }
+    for entry in std::fs::read_dir(root).into_iter().flatten().flatten() {
+        let other = entry.file_name();
+        let other = other.to_string_lossy();
+        let same_model = other
+            .strip_prefix(label)
+            .is_some_and(|rest| rest.starts_with('-'));
+        if same_model && other != name && entry.path().is_dir() {
+            let _ = std::fs::remove_dir_all(entry.path());
+        }
+    }
+    Some(dir)
+}
+
 fn number_after(text: &str, marker: &str) -> Option<usize> {
     let rest = &text[text.find(marker)? + marker.len()..];
     let digits: String = rest.chars().take_while(char::is_ascii_digit).collect();
@@ -772,12 +982,44 @@ fn number_after(text: &str, marker: &str) -> Option<usize> {
 
 #[cfg(target_os = "macos")]
 mod platform {
-    use super::{CpuReason, GpuProvider, MAC_GPU_REASON};
+    use super::{CpuReason, GpuProvider};
+    use ort::ep::CoreML;
+    use ort::ep::coreml::ComputeUnits;
     use std::path::Path;
 
-    pub(super) fn gpu_provider(_helper_dir: Option<&Path>) -> Result<GpuProvider, CpuReason> {
-        Err(CpuReason::GpuNotBeneficial(MAC_GPU_REASON.to_string()))
+    /// Core ML with compute units `CPUAndNeuralEngine` and its default NeuralNetwork model
+    /// format. That is what ONNX Runtime's automatic provider selection (`MaxEfficiency`) used
+    /// before the engine registered Core ML itself, so results stay the ones Plan 1 was tuned on;
+    /// the default compute units (All) gave a different, partly broken LaMa result
+    /// (`docs/notes/coreml.md`).
+    pub(super) fn gpu_provider(
+        _helper_dir: Option<&Path>,
+        cache_dir: Option<&Path>,
+    ) -> Result<GpuProvider, CpuReason> {
+        Ok(GpuProvider {
+            name: "Core ML",
+            ep_name: "CoreMLExecutionProvider",
+            build: |cache| {
+                let mut coreml =
+                    CoreML::default().with_compute_units(ComputeUnits::CPUAndNeuralEngine);
+                if let Some(dir) = cache {
+                    coreml = coreml.with_model_cache_dir(dir.display());
+                }
+                coreml.build().error_on_failure()
+            },
+            probe_config: None,
+            taken_marker: Some("number of nodes supported by CoreML: "),
+            cache_root: cache_dir.map(Path::to_path_buf),
+            keep_partial: KEEP_PARTIAL,
+        })
     }
+
+    /// Models kept on Core ML when it runs only part of them, measured faster that way than on
+    /// the processor alone (`docs/notes/coreml.md`, M1 Pro, median per 512x512 tile):
+    /// - segmenter: all but its last 8 small nodes (`Unsqueeze`, `Concat`, `ReduceMax`), 0.15 s
+    ///   against 2.1 s;
+    /// - LaMa: 1680 of its 2841 nodes in 189 pieces, 2.0 s against 2.2 s.
+    const KEEP_PARTIAL: &[&str] = &["segmenter", "lama"];
 }
 
 #[cfg(windows)]
@@ -788,16 +1030,23 @@ mod platform {
     use std::os::windows::ffi::OsStrExt;
     use std::path::Path;
 
-    pub(super) fn gpu_provider(helper_dir: Option<&Path>) -> Result<GpuProvider, CpuReason> {
+    pub(super) fn gpu_provider(
+        helper_dir: Option<&Path>,
+        _cache_dir: Option<&Path>,
+    ) -> Result<GpuProvider, CpuReason> {
         if let Some(dir) = helper_dir {
             use_helper_dir(dir).map_err(CpuReason::ProviderUnavailable)?;
         }
         Ok(GpuProvider {
             name: "DirectML",
             ep_name: "DmlExecutionProvider",
-            build: || DirectML::default().build().error_on_failure(),
+            build: |_| DirectML::default().build().error_on_failure(),
             // kOrtSessionOptionsConfigDisableDmlGraphFusion in ONNX Runtime.
-            probe_config: &[("ep.dml.disable_graph_fusion", "1")],
+            probe_config: Some(&[("ep.dml.disable_graph_fusion", "1")]),
+            taken_marker: None,
+            cache_root: None,
+            // Whole model or processor (see `CpuReason::PartialGpu`).
+            keep_partial: &[],
         })
     }
 
@@ -855,7 +1104,10 @@ mod platform {
     use super::{CpuReason, GpuProvider};
     use std::path::Path;
 
-    pub(super) fn gpu_provider(_helper_dir: Option<&Path>) -> Result<GpuProvider, CpuReason> {
+    pub(super) fn gpu_provider(
+        _helper_dir: Option<&Path>,
+        _cache_dir: Option<&Path>,
+    ) -> Result<GpuProvider, CpuReason> {
         Err(CpuReason::ProviderUnavailable(
             "this build has no graphics card support for this platform".to_string(),
         ))
@@ -953,6 +1205,93 @@ mod tests {
             classify(&none, "DirectML", "face"),
             Err(CpuReason::ProviderUnavailable(_))
         ));
+    }
+
+    const COREML: &str = "CoreMLExecutionProvider";
+    const COREML_TAKEN: &str = "number of nodes supported by CoreML: ";
+
+    fn coreml_capability(partitions: usize, graph: usize, taken: usize) -> String {
+        format!(
+            "CoreMLExecutionProvider::GetCapability, number of partitions supported by CoreML: \
+             {partitions} number of nodes in the graph: {graph} number of nodes supported by \
+             CoreML: {taken}"
+        )
+    }
+
+    #[test]
+    fn core_ml_partitions_count_as_the_nodes_it_took() {
+        let mut log = vec![coreml_capability(3, 140, 100)];
+        log.extend(placement_log(&[
+            (COREML, &[("CoreML_1", 3)]),
+            ("CPUExecutionProvider", &[("Einsum", 15), ("Shape", 5)]),
+        ]));
+        let found = provider_placement(&log, COREML, Some(COREML_TAKEN));
+        assert_eq!(found, Some(Placement { gpu: 100, cpu: 15 }));
+        assert_eq!(
+            classify(&found, "Core ML", "lama"),
+            Err(CpuReason::PartialGpu {
+                gpu_nodes: 100,
+                total_nodes: 115
+            })
+        );
+
+        let whole = vec![
+            coreml_capability(1, 106, 106),
+            " All nodes placed on [CoreMLExecutionProvider]. Number of nodes: 1".to_string(),
+        ];
+        let found = provider_placement(&whole, COREML, Some(COREML_TAKEN));
+        assert_eq!(found, Some(Placement { gpu: 106, cpu: 0 }));
+        assert_eq!(classify(&found, "Core ML", "face"), Ok(()));
+
+        // Core ML took nothing: its capability line does not turn the processor's nodes into
+        // Core ML ones.
+        let none = vec![
+            coreml_capability(0, 42, 0),
+            " All nodes placed on [CPUExecutionProvider]. Number of nodes: 42".to_string(),
+        ];
+        let found = provider_placement(&none, COREML, Some(COREML_TAKEN));
+        assert_eq!(found, Some(Placement { gpu: 0, cpu: 42 }));
+    }
+
+    #[test]
+    fn providers_named_once_in_log_order() {
+        let log = placement_log(&[
+            (COREML, &[("CoreML_1", 2)]),
+            ("CPUExecutionProvider", &[("Einsum", 2)]),
+            (COREML, &[("CoreML_2", 1)]),
+        ]);
+        assert_eq!(providers(&log), [COREML, "CPUExecutionProvider"]);
+        let cpu = lines(&[" All nodes placed on [CPUExecutionProvider]. Number of nodes: 91"]);
+        assert_eq!(providers(&cpu), ["CPUExecutionProvider"]);
+        assert!(providers(&lines(&["Session created"])).is_empty());
+    }
+
+    #[test]
+    fn model_cache_dir_replaces_older_folders() {
+        let root = tempfile::tempdir().expect("temp dir");
+        let model = root.path().join("lama.onnx");
+        std::fs::write(&model, b"model").expect("write model");
+        for old in ["lama-1-2", "face-1-2", "lamaold-1-2"] {
+            std::fs::create_dir(root.path().join(old)).expect("create folder");
+        }
+        let dir = model_cache_dir(root.path(), "lama", &model).expect("cache folder");
+        assert!(dir.is_dir());
+        let name = dir
+            .file_name()
+            .expect("name")
+            .to_string_lossy()
+            .into_owned();
+        assert!(name.starts_with("lama-5-"), "{name}");
+        let mut left: Vec<String> = std::fs::read_dir(root.path())
+            .expect("read root")
+            .map(|e| e.expect("entry").file_name().to_string_lossy().into_owned())
+            .collect();
+        left.sort();
+        assert_eq!(
+            left,
+            ["face-1-2", name.as_str(), "lama.onnx", "lamaold-1-2"]
+        );
+        assert_eq!(model_cache_dir(root.path(), "lama", &model), Some(dir));
     }
 
     #[test]

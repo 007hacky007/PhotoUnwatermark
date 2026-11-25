@@ -20,6 +20,9 @@ tiff = "0.11"
 tracing = "0.1"
 uuid = { version = "1", features = ["v4"] }
 
+[target.'cfg(target_os = "macos")'.dependencies]
+ort = { version = "=2.0.0-rc.15", default-features = false, features = ["coreml"] }
+
 [target.'cfg(windows)'.dependencies]
 ort = { version = "=2.0.0-rc.15", default-features = false, features = ["directml"] }
 

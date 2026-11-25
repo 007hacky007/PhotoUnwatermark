@@ -24,9 +24,9 @@ Runs:
 - macOS (aarch64): `libonnxruntime.a` only. The example binary (27.6 MB) depends on system
   libraries only: `libc++`, `libSystem`, `libobjc`, Foundation, CoreFoundation, CoreML.
   The only `aarch64-apple-darwin` build is `+coreml`; ort-sys picks it even without the `coreml`
-  feature (v1 does not enable it, see `coreml.md`), so CoreML.framework stays linked but the
-  provider is never registered. `dist.tsv` has no `x86_64-apple-darwin` build: Intel Macs would
-  need a self-built ORT.
+  feature; puw-core enables the `coreml` feature on macOS since Plan 2 Task 1b and registers the
+  provider when the GPU is preferred (see `coreml.md`). `dist.tsv` has no `x86_64-apple-darwin`
+  build: Intel Macs would need a self-built ORT.
 
 ## Observed on Windows
 
