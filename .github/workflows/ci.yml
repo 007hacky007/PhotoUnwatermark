@@ -6,14 +6,14 @@ on:
   workflow_dispatch:
 
 jobs:
+  # Fast checks on every push: formatting, lints, the UI tests and every Rust test that needs
+  # no model files (the model-backed tests skip themselves without PUW_MODELS_DIR).
   check:
     strategy:
       fail-fast: false
       matrix:
         os: [macos-latest, windows-latest]
     runs-on: ${{ matrix.os }}
-    env:
-      PUW_MODELS_DIR: ${{ github.workspace }}/models
     steps:
       - uses: actions/checkout@v4
       - uses: pnpm/action-setup@v4
@@ -32,6 +32,33 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
         with:
           components: rustfmt, clippy
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo fmt --all --check
+      - run: cargo clippy --workspace --all-targets -- -D warnings
+      - run: cargo test --workspace --release
+
+  # The tests that run the real models. They take about 30 minutes on a Windows runner and
+  # much longer on a macOS runner (no Neural Engine there), so they run on Windows only, on
+  # pushes to master and on request; on the Mac they run locally with Core ML.
+  models:
+    if: github.event_name == 'workflow_dispatch' || (github.event_name == 'push' && github.ref == 'refs/heads/master')
+    runs-on: windows-latest
+    env:
+      PUW_MODELS_DIR: ${{ github.workspace }}/models
+    steps:
+      - uses: actions/checkout@v4
+      - uses: pnpm/action-setup@v4
+        with:
+          package_json_file: app/package.json
+      - uses: actions/setup-node@v4
+        with:
+          node-version: lts/*
+          cache: pnpm
+          cache-dependency-path: app/pnpm-lock.yaml
+      - run: pnpm -C app install --frozen-lockfile
+      - run: pnpm -C app build
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
       - uses: astral-sh/setup-uv@v6
         with:
           python-version: "3.12"
@@ -41,21 +68,33 @@ jobs:
         with:
           path: models
           key: models-v2-${{ runner.os }}
-      - name: Fetch models (macOS)
-        if: steps.models-cache.outputs.cache-hit != 'true' && runner.os != 'Windows'
-        run: scripts/fetch-models.sh
-      - name: Fetch models (Windows)
-        if: steps.models-cache.outputs.cache-hit != 'true' && runner.os == 'Windows'
+      - name: Fetch models
+        if: steps.models-cache.outputs.cache-hit != 'true'
         shell: pwsh
         run: scripts/fetch-models.ps1
-      - run: cargo fmt --all --check
-      - run: cargo clippy --workspace --all-targets -- -D warnings
       - run: cargo test --workspace --release
+
+  # The portable Windows app for manual testing, on request only. It does not wait for the
+  # tests, so it is ready in minutes.
+  windows-exe:
+    if: github.event_name == 'workflow_dispatch'
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: pnpm/action-setup@v4
+        with:
+          package_json_file: app/package.json
+      - uses: actions/setup-node@v4
+        with:
+          node-version: lts/*
+          cache: pnpm
+          cache-dependency-path: app/pnpm-lock.yaml
+      - run: pnpm -C app install --frozen-lockfile
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
       - name: Build the Windows app (no installer)
-        if: github.event_name == 'workflow_dispatch' && runner.os == 'Windows'
         run: pnpm -C app tauri build --no-bundle
       - name: Upload the Windows exe
-        if: github.event_name == 'workflow_dispatch' && runner.os == 'Windows'
         uses: actions/upload-artifact@v4
         with:
           name: photounwatermark-windows-exe
