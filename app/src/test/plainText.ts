@@ -1,12 +1,26 @@
 // The plain-language rule for everything the app shows: no jargon, no Unicode dashes.
 
 export const BANNED = {
-  /** Never shown as whole words, in any case ("watermark" is fine). */
-  words: ['mask', 'mark', 'unmark'],
+  /** Never shown as whole words, in any case ("watermark", "watermarks", "watermarked" are fine). */
+  words: [
+    'mask',
+    'masks',
+    'masked',
+    'masking',
+    'mark',
+    'marks',
+    'marked',
+    'marking',
+    'unmark',
+    'unmarked',
+  ],
   /** Never shown anywhere inside a word, in any case. */
   parts: ['inpaint', 'segment', 'threshold', 'dilat', 'onnx', 'tensor'],
-  /** Hyphen, non-breaking hyphen, figure dash, en and em dash, bar, minus sign. */
-  dashes: /[\u2010-\u2015\u2212]/u,
+  /**
+   * Hyphen, non-breaking hyphen, figure dash, en and em dash, bar, minus sign, and the small
+   * em dash, small and full-width hyphen-minus.
+   */
+  dashes: /[\u2010-\u2015\u2212\ufe58\ufe63\uff0d]/u,
 } as const;
 
 /** Attributes whose text people see or hear. */

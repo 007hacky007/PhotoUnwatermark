@@ -13,17 +13,16 @@
 //! session, and no `AppCore` lock is ever held when it is taken, so a callback that calls back
 //! into `AppCore` (to cancel, say) cannot deadlock either.
 //!
-//! A long call (detection, model loading, the saved-watermark search, matching, adding, removing
-//! or clearing photos, confirming the set area, the preview, the removal run, saving the
-//! watermark) holds the job slot from start to end, so only one runs at a time and another one
-//! gets [`AppError::Busy`]. It locks the session to copy its inputs, works without it, and locks
-//! it again to store the results (matching stores each photo's result as soon as it is ready,
-//! and so does the removal run). Because the photo list changes only inside the job slot, the
-//! photos a job read are still there when it stores the results. Everything else (the photo
-//! list, areas, drafts, photo states and edits, images, settings, the saved-watermark list)
-//! answers while a job runs; a match result never replaces an area the person saved for that
-//! photo in the meantime, and the removal run works with the photos and areas it copied when
-//! it started.
+//! A long call (detection, model loading, the saved-watermark search, matching, adding, removing or
+//! clearing photos, confirming the set area, the preview, the removal run, saving the watermark,
+//! removing the downloaded data) holds the job slot from start to end, so only one runs at a time
+//! and another one gets [`AppError::Busy`]. It locks the session to copy its inputs, works without
+//! it, and locks it again to store the results (matching stores each photo's result as soon as it
+//! is ready, and so does the removal run). Because the photo list changes only inside the job slot,
+//! the photos a job read are still there when it stores the results. Everything else (the photo
+//! list, areas, drafts, photo states and edits, images, settings, the saved-watermark list) answers
+//! while a job runs; a match result never replaces an area the person saved for that photo in the
+//! meantime, and the removal run works with the photos and areas it copied when it started.
 
 use std::collections::HashSet;
 use std::path::PathBuf;
@@ -39,7 +38,7 @@ use puw_core::{
 };
 use serde::Serialize;
 
-use crate::download::model_assets;
+use crate::download::{self, model_assets};
 use crate::image_cache::ImageCache;
 use crate::images::{self, area_from_edit};
 use crate::jobs::{Events, Job, JobSlot, LoadPurpose, ProgressEvent, with_ticker};
@@ -186,6 +185,17 @@ impl AppCore {
     /// Asks the running job, if any, to stop.
     pub fn cancel(&self) {
         self.jobs.cancel();
+    }
+
+    /// Deletes the downloaded models, the saved watermarks and the model cache (the settings
+    /// stay) and leaves empty folders behind. The loaded models are dropped too. Fails with
+    /// [`AppError::Busy`] while a job runs, and no job can start until it is done.
+    pub fn remove_downloaded_data(&self) -> Result<()> {
+        let _job = self.jobs.start()?;
+        *lock(&self.engine) = None;
+        lock(&self.announced).clear();
+        download::remove_downloaded_data(&self.dirs)?;
+        self.dirs.ensure()
     }
 
     fn session(&self) -> MutexGuard<'_, Session> {
@@ -604,5 +614,23 @@ mod tests {
         assert!(!s.prefer_gpu);
         assert_eq!(s.load_seconds[&ModelKind::Face], 0.5);
         assert_eq!(Settings::load(&core.dirs.settings), s);
+    }
+
+    #[test]
+    fn remove_downloaded_data_is_refused_during_a_job() {
+        let t = tempfile::tempdir().unwrap();
+        let core = AppCore::new(DataDirs::at(t.path())).unwrap();
+        let model = core.dirs.models.join("lama.onnx");
+        std::fs::write(&model, b"x").unwrap();
+        {
+            let _job = core.jobs.start().unwrap();
+            assert!(matches!(core.remove_downloaded_data(), Err(AppError::Busy)));
+            assert!(model.exists());
+        }
+        core.set_settings(Settings::default()).unwrap();
+        core.remove_downloaded_data().unwrap();
+        assert!(!model.exists());
+        assert!(core.dirs.models.is_dir() && core.dirs.watermarks.is_dir());
+        assert!(core.dirs.settings.is_file());
     }
 }

@@ -3,7 +3,7 @@
 //! encodes the slash; any query (`?v=3`, for cache busting) is ignored.
 
 use std::io::ErrorKind;
-use std::sync::Arc;
+use std::sync::{Arc, Condvar, LazyLock, Mutex, PoisonError};
 
 use puw_app::photos::PhotoId;
 use puw_app::{AppCore, AppError};
@@ -11,6 +11,56 @@ use tauri::http::{Request, Response, StatusCode, header};
 use tauri::{Manager, Runtime, UriSchemeContext, UriSchemeResponder};
 
 use crate::commands::Shell;
+
+/// How many pictures may be made at once for `cores` processor cores: half of them, as for
+/// any parallel photo decoding. Each one may decode a full-size photo (about 72 MB at 24 MP).
+fn render_slots(cores: usize) -> usize {
+    (cores / 2).max(1)
+}
+
+/// Lets at most a fixed number of closures run at once; the others wait their turn.
+struct RenderLimit {
+    free: Mutex<usize>,
+    freed: Condvar,
+}
+
+impl RenderLimit {
+    fn new(slots: usize) -> RenderLimit {
+        RenderLimit {
+            free: Mutex::new(slots),
+            freed: Condvar::new(),
+        }
+    }
+
+    fn run<T>(&self, f: impl FnOnce() -> T) -> T {
+        {
+            let mut free = self.free.lock().unwrap_or_else(PoisonError::into_inner);
+            while *free == 0 {
+                free = self
+                    .freed
+                    .wait(free)
+                    .unwrap_or_else(PoisonError::into_inner);
+            }
+            *free -= 1;
+        }
+        // Gives the slot back even if `f` panics.
+        struct Slot<'a>(&'a RenderLimit);
+        impl Drop for Slot<'_> {
+            fn drop(&mut self) {
+                *self.0.free.lock().unwrap_or_else(PoisonError::into_inner) += 1;
+                self.0.freed.notify_one();
+            }
+        }
+        let _slot = Slot(self);
+        f()
+    }
+}
+
+/// The limit for all picture requests: a step-3 grid asks for every photo at once.
+static RENDERS: LazyLock<RenderLimit> = LazyLock::new(|| {
+    let cores = std::thread::available_parallelism().map_or(1, |n| n.get());
+    RenderLimit::new(render_slots(cores))
+});
 
 /// A picture the protocol serves.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -126,7 +176,7 @@ fn respond(core: &AppCore, path: &str) -> Response<Vec<u8>> {
 }
 
 /// Handler for `register_asynchronous_uri_scheme_protocol("puw", ...)`: the picture is made on
-/// a blocking worker thread, never on the main thread.
+/// a blocking worker thread, never on the main thread, and only a few at a time ([`RENDERS`]).
 pub fn handle<R: Runtime>(
     ctx: UriSchemeContext<'_, R>,
     request: Request<Vec<u8>>,
@@ -141,7 +191,9 @@ pub fn handle<R: Runtime>(
         return;
     };
     let path = request.uri().path().to_string();
-    tauri::async_runtime::spawn_blocking(move || responder.respond(respond(&core, &path)));
+    tauri::async_runtime::spawn_blocking(move || {
+        responder.respond(RENDERS.run(|| respond(&core, &path)));
+    });
 }
 
 #[cfg(test)]
@@ -234,5 +286,35 @@ mod tests {
                 "{path}"
             );
         }
+    }
+
+    #[test]
+    fn render_limit_caps_concurrent_renders() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use std::time::Duration;
+        let limit = RenderLimit::new(3);
+        let (active, peak) = (AtomicUsize::new(0), AtomicUsize::new(0));
+        std::thread::scope(|scope| {
+            for _ in 0..24 {
+                scope.spawn(|| {
+                    limit.run(|| {
+                        let now = active.fetch_add(1, Ordering::SeqCst) + 1;
+                        peak.fetch_max(now, Ordering::SeqCst);
+                        std::thread::sleep(Duration::from_millis(20));
+                        active.fetch_sub(1, Ordering::SeqCst);
+                    })
+                });
+            }
+        });
+        assert_eq!(peak.load(Ordering::SeqCst), 3);
+        assert_eq!(active.load(Ordering::SeqCst), 0);
+    }
+
+    #[test]
+    fn render_limit_is_half_the_cores() {
+        assert_eq!(render_slots(1), 1);
+        assert_eq!(render_slots(2), 1);
+        assert_eq!(render_slots(8), 4);
+        assert_eq!(render_slots(11), 5);
     }
 }

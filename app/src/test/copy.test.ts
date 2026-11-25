@@ -72,6 +72,13 @@ describe('plainText', () => {
     expect(plainTextProblems('slow \u2013 why')).not.toEqual([]);
     expect(plainTextProblems('\u22121')).not.toEqual([]);
     expect(plainTextProblems('slow - why? → ...')).toEqual([]);
+    for (const word of ['masks', 'Masked', 'MASKING', 'marks', 'Marked', 'marking', 'Unmarked']) {
+      expect(plainTextProblems(`Photo ${word} here`), word).not.toEqual([]);
+    }
+    expect(plainTextProblems('Watermarks, watermarked and WATERMARK photos')).toEqual([]);
+    for (const dash of ['\ufe58', '\ufe63', '\uff0d']) {
+      expect(plainTextProblems(`a ${dash} b`), dash).not.toEqual([]);
+    }
   });
 
   it('checksShownAttributes', () => {

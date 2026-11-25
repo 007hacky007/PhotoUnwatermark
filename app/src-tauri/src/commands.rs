@@ -198,16 +198,13 @@ pub async fn cancel_job(shell: State<'_, Shell>) -> Res<()> {
     Ok(())
 }
 
-/// Deletes the models, saved watermarks and model cache (not the settings).
+/// Deletes the models, saved watermarks and model cache (not the settings). Refused while a
+/// download or any other job runs.
 #[tauri::command]
 pub async fn remove_downloaded_data(shell: State<'_, Shell>) -> Res<()> {
     let (_run, _) = DownloadRun::start(&shell)?;
-    let dirs = shell.dirs.clone();
-    blocking(move || {
-        download::remove_downloaded_data(&dirs)?;
-        dirs.ensure()
-    })
-    .await
+    let core = shell.core.clone();
+    blocking(move || core.remove_downloaded_data()).await
 }
 
 #[tauri::command]
