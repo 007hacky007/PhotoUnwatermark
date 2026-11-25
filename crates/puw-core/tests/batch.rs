@@ -247,3 +247,55 @@ fn filter_keeps_empty() {
     assert_eq!(out.dimensions(), (64, 48));
     assert!(mask::is_empty(&out));
 }
+
+/// Sets the `w` x `h` block at (`x`, `y`).
+fn block(m: &mut Mask, x: u32, y: u32, w: u32, h: u32) {
+    for yy in y..y + h {
+        for xx in x..x + w {
+            m.put_pixel(xx, yy, Luma([255]));
+        }
+    }
+}
+
+#[test]
+fn filter_keeps_tall_mark_and_drops_specks() {
+    // 1000 x 1000, so components closer than 20 px group. The mark is a column of 100 x 40
+    // blocks 5 px apart from y 25 to 965: each block is far under 60 % of the image, the
+    // column spans 94 % of the height (the shape of a mark running the photo's full height).
+    let mut mark = Mask::new(1000, 1000);
+    let mut y = 25;
+    while y + 40 <= 975 {
+        block(&mut mark, 450, y, 100, 40);
+        y += 45;
+    }
+    // 7x7 specks (49 px, under 0.1 % of the layer): some 10 px from the column, where they
+    // would join its group, and some scattered far from it.
+    let mut specks = Mask::new(1000, 1000);
+    for k in 0..10 {
+        block(&mut specks, 560, 30 + 90 * k, 7, 7);
+        block(&mut specks, 60 + 25 * (k % 4), 100 + 80 * k, 7, 7);
+        block(&mut specks, 800 + 30 * (k % 3), 70 + 85 * k, 7, 7);
+    }
+    let layer = mask::union(&mark, &specks);
+    let out = filter_layer(&layer);
+    let (kept, speck) = (covered(&out, &mark), covered(&out, &specks));
+    eprintln!("tall mark: kept {kept:.3}, specks kept {speck:.3}");
+    assert_eq!(kept, 1.0, "mark kept {kept}");
+    assert_eq!(speck, 0.0, "specks kept {speck}");
+}
+
+#[test]
+fn filter_keeps_groups_of_half_the_largest() {
+    // 1000 x 1000: groups are blocks more than 20 px apart. The largest holds 10000 px.
+    let mut largest = Mask::new(1000, 1000);
+    block(&mut largest, 100, 100, 100, 100);
+    let mut half = Mask::new(1000, 1000);
+    block(&mut half, 500, 100, 50, 100); // 5000 px: exactly half, kept
+    let mut under = Mask::new(1000, 1000);
+    block(&mut under, 100, 500, 49, 100); // 4900 px: under half, dropped
+    let layer = mask::union(&mask::union(&largest, &half), &under);
+    let out = filter_layer(&layer);
+    assert_eq!(covered(&out, &largest), 1.0);
+    assert_eq!(covered(&out, &half), 1.0);
+    assert_eq!(covered(&out, &under), 0.0);
+}

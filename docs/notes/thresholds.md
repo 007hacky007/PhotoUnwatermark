@@ -204,12 +204,12 @@ filters to empty. The filter works on the layer's 8-connected components:
 | keep the largest group and every group with at least half its pixels | - | 0.5 |
 
 The last two match the template pieces of `template.rs`. The plan dropped *groups* spanning
-more than 60 % of the image. On real set 1 that removes the mark itself: the mark is vertical
-text whose letters group into one piece of 0.225 x 0.951 of the photo. A single component of a
-text mark is letter-sized, so the span test runs on components instead. A scene line broken
-into short pieces would not be caught by it. Set 1 has no component spanning 60 % either way.
+more than 60 % of the image. On real set 1 that removes the mark itself: a mark spanning 0.95
+of the photo's height, whose separate components group into one piece of 0.225 x 0.951 of the
+photo. Each of those components is small, so the span test runs on components instead. A scene
+line broken into short pieces would not be caught by it. Set 1 has no component spanning 60 % either way.
 
-What the batch layer of set 1 holds besides the mark: specks where the subject stood still
+What the batch layer of set 1 holds besides the mark: specks of static subject texture
 across the set (a dilated single pixel is 49 px; median component 98 px). Grown by the 24 px of
 the guess, each becomes a 55 x 55 px square, which is most of the old 15 %. Layer-only sweep of
 `MIN_PIECE_FRAC` on set 1 (components spanning 60 % dropped, groups as above; coverage of the
@@ -237,14 +237,16 @@ Set 1 with `puw-dev guess --real` (Core ML, release build):
 | after (3 guesses) | 1.80 % | 57 | 3 | 8.89-9.46 (mean 9.18) | 20.2 s |
 
 The representative photo of the old sample went from 14.71 % to 9.18 %. The overlay of the new
-representative photo shows every letter of the mark inside the layer. What is left besides the
-mark is two speck clusters that touch letters (hair and shirt) and the detector's own guess.
+representative photo shows every component of the mark inside the layer. What is left besides
+the mark is two clusters of subject-texture specks that touch mark components, and the
+detector's own guess.
 
 The plan's target of at most 3 % is out of reach while the layer grows with the guess: the
 mark's components (with the two speck clusters joined to them), grown by 24 px, cover about
-7.2 % of the photo, because the mark is outline text running almost the full height. Adding the layer after the growth instead of
-before would give about 3.2 % (estimate from the layer and the overlay). That is a change to
-`guess_photo` and needs a removal check on a 3 px border around the strokes first.
+7.2 % of the photo, because the mark spans 0.95 of the photo's height. Adding the layer after
+the growth instead of before would give about 3.2 % (estimate from the layer and the overlay).
+That is a change to `guess_photo` and needs a removal check on a 3 px border around the mark's
+edges first.
 
 Set 2 (1 photo) has no batch layer; its guess stays at 6.40 %.
 
