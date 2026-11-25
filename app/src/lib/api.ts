@@ -3,6 +3,7 @@
 // `UserError`.
 
 import { Channel, convertFileSrc, invoke } from '@tauri-apps/api/core';
+import { listen } from '@tauri-apps/api/event';
 import { getCurrentWebview } from '@tauri-apps/api/webview';
 import { getCurrentWindow } from '@tauri-apps/api/window';
 import { open } from '@tauri-apps/plugin-dialog';
@@ -156,14 +157,27 @@ export const revealItemInDir = (path: string) => reveal(path);
 // The window
 
 /**
- * Holds the window open when the person closes it and calls `onAsk` instead. Resolves with the
- * function that stops it; the window then closes normally again.
+ * Calls `hold` when the person closes the window: the window stays open only when it returns
+ * true (and closes when it throws). Resolves with the function that stops it.
  */
-export async function onCloseRequested(onAsk: () => void): Promise<() => void> {
+export async function onCloseRequested(hold: () => boolean): Promise<() => void> {
   return getCurrentWindow().onCloseRequested((event) => {
-    event.preventDefault();
-    onAsk();
+    let held = false;
+    try {
+      held = hold();
+    } catch {
+      // The window must stay closable.
+    }
+    if (held) event.preventDefault();
   });
+}
+
+/**
+ * Calls `onQuit` when the app was asked to quit (Cmd+Q) during a removal; the app has stayed
+ * open and quits with `closeWindow`. Resolves with the function that stops it.
+ */
+export async function onQuitRequested(onQuit: () => void): Promise<() => void> {
+  return listen('quit-requested', () => onQuit());
 }
 
 /** Closes the window (and so the app) without asking. */

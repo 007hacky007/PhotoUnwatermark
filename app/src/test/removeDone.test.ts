@@ -17,6 +17,7 @@ vi.mock('../lib/api', () => ({
   clearPhotos: vi.fn(),
   revealItemInDir: vi.fn(),
   onCloseRequested: vi.fn(),
+  onQuitRequested: vi.fn(),
   closeWindow: vi.fn(),
   imageUrl: vi.fn(),
 }));
@@ -41,6 +42,7 @@ const m = {
   clearPhotos: vi.mocked(api.clearPhotos),
   revealItemInDir: vi.mocked(api.revealItemInDir),
   onCloseRequested: vi.mocked(api.onCloseRequested),
+  onQuitRequested: vi.mocked(api.onQuitRequested),
   closeWindow: vi.mocked(api.closeWindow),
   imageUrl: vi.mocked(api.imageUrl),
 };
@@ -64,9 +66,12 @@ function pendingRemove(): Job {
   return job;
 }
 
-/** The close handler the screen registered, and its stop function. */
-let closeHandler: (() => void) | null;
+/** The close handler the screen registered (true holds the window open), and its stop function. */
+let closeHandler: (() => boolean) | null;
 let unlisten: ReturnType<typeof vi.fn>;
+/** The handler for a request to quit the app (Cmd+Q), and its stop function. */
+let quitHandler: (() => void) | null;
+let unlistenQuit: ReturnType<typeof vi.fn>;
 
 const status = (platform: string) => ({ modelsReady: true, missingBytes: 0, platform, version: '0.1.0' });
 
@@ -83,6 +88,13 @@ function stepFour(platform = 'windows'): Wizard {
 
 const report = (r: Partial<RemoveReport> = {}): RemoveReport => ({ done: [], failed: [], cancelled: false, ...r });
 const done = (id: number, output = `/photos/Without watermark/p${id}.jpg`) => ({ id, output });
+
+function wizardWith(r: RemoveReport): Wizard {
+  const wizard = createWizard();
+  wizard.report = r;
+  wizard.go('done');
+  return wizard;
+}
 
 function stepFive(r: RemoveReport): Wizard {
   const wizard = createWizard();
@@ -109,6 +121,8 @@ beforeEach(() => {
   vi.resetAllMocks();
   closeHandler = null;
   unlisten = vi.fn();
+  quitHandler = null;
+  unlistenQuit = vi.fn();
   m.appStatus.mockResolvedValue(status('windows'));
   m.deviceStatus.mockResolvedValue({ state: 'gpu', reason: null, details: null, fixes: [] });
   m.checkOutput.mockResolvedValue({ ok: true, unwritable: [] });
@@ -122,6 +136,10 @@ beforeEach(() => {
   m.onCloseRequested.mockImplementation(async (h) => {
     closeHandler = h;
     return unlisten as unknown as () => void;
+  });
+  m.onQuitRequested.mockImplementation(async (h) => {
+    quitHandler = h;
+    return unlistenQuit as unknown as () => void;
   });
   m.imageUrl.mockImplementation((route, id, v) => `puw://${route}/${id}${v === undefined ? '' : `?v=${v}`}`);
 });
@@ -308,24 +326,102 @@ describe('Remove', () => {
     expect(m.onCloseRequested).not.toHaveBeenCalled();
     await fireEvent.click(screen.getByRole('button', { name: copy.remove.chooseFolder }));
     await waitFor(() => expect(closeHandler).not.toBeNull());
-    closeHandler!();
+    expect(closeHandler!()).toBe(true);
     await tick();
     expect(screen.getByRole('dialog', { name: 'Removal is still running. Stop and quit?' })).toBeTruthy();
     await fireEvent.click(screen.getByRole('button', { name: 'Keep going' }));
     expect(screen.queryByRole('dialog')).toBeNull();
     expect(m.cancelJob).not.toHaveBeenCalled();
 
-    closeHandler!();
+    expect(closeHandler!()).toBe(true);
     await tick();
     await fireEvent.click(screen.getByRole('button', { name: 'Stop and quit' }));
     expect(m.cancelJob).toHaveBeenCalledTimes(1);
     await tick();
+    expect(
+      screen.getByRole('progressbar', { name: 'Stopping... the app will close when the current photo is finished.' }),
+    ).toBeTruthy();
     // The window closes only after the run has ended.
     expect(m.closeWindow).not.toHaveBeenCalled();
     job.finish(report({ cancelled: true }));
     await waitFor(() => expect(m.closeWindow).toHaveBeenCalledTimes(1));
     expect(unlisten).toHaveBeenCalledTimes(1);
+    expect(unlistenQuit).toHaveBeenCalledTimes(1);
     expect(wizard.screen).toBe('remove');
+  });
+
+  it('secondCloseWhileQuittingClosesAtOnce', async () => {
+    pendingRemove();
+    stepFour();
+    await waitFor(() => expect(closeHandler).not.toBeNull());
+    expect(closeHandler!()).toBe(true);
+    await tick();
+    await fireEvent.click(screen.getByRole('button', { name: copy.remove.stopAndQuit }));
+    // Still running, but the person asked twice: the window is not held again.
+    expect(closeHandler!()).toBe(false);
+    await tick();
+    expect(screen.queryByRole('dialog')).toBeNull();
+  });
+
+  it('closeAfterRunEndedIsNotHeld', async () => {
+    const job = pendingRemove();
+    const wizard = stepFour();
+    await waitFor(() => expect(closeHandler).not.toBeNull());
+    job.finish(report({ done: [done(1)] }));
+    await waitFor(() => expect(wizard.screen).toBe('done'));
+    // Even if stopping the guard had failed, it lets the window close.
+    expect(closeHandler!()).toBe(false);
+    await tick();
+    expect(screen.queryByRole('dialog')).toBeNull();
+  });
+
+  it('closeAfterStopSaysTheAppWillClose', async () => {
+    const job = pendingRemove();
+    stepFour();
+    await waitFor(() => expect(closeHandler).not.toBeNull());
+    await fireEvent.click(screen.getByRole('button', { name: copy.remove.stop }));
+    await fireEvent.click(within(screen.getByRole('dialog')).getByRole('button', { name: copy.remove.stop }));
+    expect(m.cancelJob).toHaveBeenCalledTimes(1);
+    expect(closeHandler!()).toBe(true);
+    await tick();
+    const dialog = screen.getByRole('dialog', {
+      name: 'Stopping... the app will close when the current photo is finished.',
+    });
+    expect(within(dialog).queryByRole('button', { name: copy.remove.keepGoing })).toBeNull();
+    expect(within(dialog).getAllByRole('button').map((b) => b.textContent?.trim())).toEqual([copy.remove.ok]);
+    assertPlainText(document.body);
+    await fireEvent.click(within(dialog).getByRole('button', { name: copy.remove.ok }));
+    expect(screen.queryByRole('dialog')).toBeNull();
+    expect(m.cancelJob).toHaveBeenCalledTimes(1);
+    job.finish(report({ cancelled: true }));
+    await waitFor(() => expect(m.closeWindow).toHaveBeenCalledTimes(1));
+  });
+
+  it('quitRequestWhileRunningAsksTheSame', async () => {
+    const job = pendingRemove();
+    stepFour();
+    await waitFor(() => expect(quitHandler).not.toBeNull());
+    quitHandler!();
+    await tick();
+    expect(screen.getByRole('dialog', { name: copy.remove.quitTitle })).toBeTruthy();
+    await fireEvent.click(screen.getByRole('button', { name: copy.remove.stopAndQuit }));
+    expect(m.cancelJob).toHaveBeenCalledTimes(1);
+    expect(m.closeWindow).not.toHaveBeenCalled();
+    // Asked again while quitting: quit at once.
+    quitHandler!();
+    expect(m.closeWindow).toHaveBeenCalledTimes(1);
+    job.finish(report({ cancelled: true }));
+    await tick();
+  });
+
+  it('quitRequestAfterRunEndedQuits', async () => {
+    const job = pendingRemove();
+    const wizard = stepFour();
+    await waitFor(() => expect(quitHandler).not.toBeNull());
+    job.finish(report({ done: [done(1)] }));
+    await waitFor(() => expect(wizard.screen).toBe('done'));
+    quitHandler!();
+    expect(m.closeWindow).toHaveBeenCalledTimes(1);
   });
 
   it('closeGuardEndsWithTheRun', async () => {
@@ -336,15 +432,18 @@ describe('Remove', () => {
     job.finish(report({ done: [done(1)] }));
     await waitFor(() => expect(wizard.screen).toBe('done'));
     expect(unlisten).toHaveBeenCalledTimes(1);
+    expect(unlistenQuit).toHaveBeenCalledTimes(1);
   });
 
   it('unmountStopsTheRunAndTheCloseGuard', async () => {
     pendingRemove();
     const view = render(Remove, { wizard: createWizard() });
     await waitFor(() => expect(closeHandler).not.toBeNull());
+    await waitFor(() => expect(quitHandler).not.toBeNull());
     view.unmount();
     expect(m.cancelJob).toHaveBeenCalledTimes(1);
     expect(unlisten).toHaveBeenCalledTimes(1);
+    expect(unlistenQuit).toHaveBeenCalledTimes(1);
   });
 
   it('closeGuardArrivingAfterUnmountIsRemoved', async () => {
@@ -367,6 +466,17 @@ describe('Remove', () => {
     expect(wizard.busy).toBe(false);
     await fireEvent.click(screen.getByRole('button', { name: copy.common.back }));
     expect(wizard.screen).toBe('checkAll');
+  });
+
+  it('quitDialogIsPlainText', async () => {
+    pendingRemove();
+    stepFour();
+    await waitFor(() => expect(closeHandler).not.toBeNull());
+    closeHandler!();
+    await tick();
+    assertPlainText(document.body);
+    await fireEvent.click(screen.getByRole('button', { name: copy.remove.stopAndQuit }));
+    assertPlainText(document.body);
   });
 
   it('noBannedWordsRendered', async () => {
@@ -450,6 +560,38 @@ describe('Done', () => {
     expect(before()).toBe('puw://original/2');
     await fireEvent.keyDown(await screen.findByRole('textbox'), { key: 'ArrowLeft' });
     expect(before()).toBe('puw://original/2');
+  });
+
+  it('announcesBrowsing', async () => {
+    const { container } = render(Done, { wizard: wizardWith(report({ done: [done(1), done(2), done(3)] })) });
+    const live = container.querySelector('[data-testid="announce"]')!;
+    expect(live.getAttribute('aria-live')).toBe('polite');
+    expect(live.textContent).toBe('');
+    await fireEvent.click(screen.getByRole('button', { name: copy.done.next }));
+    expect(live.textContent).toBe('Photo 2 of 3');
+    await fireEvent.keyDown(window, { key: 'ArrowRight' });
+    expect(live.textContent).toBe('Photo 3 of 3');
+  });
+
+  it('keepsSavedAndPositionWhenComingBack', async () => {
+    const wizard = wizardWith(report({ done: [done(1), done(2), done(3)] }));
+    const first = render(Done, { wizard });
+    await screen.findByDisplayValue('Watermark from 2026-11-25');
+    await fireEvent.click(screen.getByRole('button', { name: copy.done.next }));
+    await fireEvent.click(screen.getByRole('button', { name: copy.done.saveWatermark }));
+    expect(await screen.findByText(copy.done.savedWatermark)).toBeTruthy();
+    first.unmount();
+    // Done -> Settings -> Back shows the step again.
+    render(Done, { wizard });
+    expect(screen.getByText(copy.done.savedWatermark)).toBeTruthy();
+    expect(screen.queryByRole('button', { name: copy.done.saveWatermark })).toBeNull();
+    expect(screen.getByText('Photo 2 of 3')).toBeTruthy();
+    expect(screen.getByAltText(copy.beforeAfter.before).getAttribute('src')).toBe('puw://original/2');
+    expect(m.saveWatermark).toHaveBeenCalledTimes(1);
+    await fireEvent.click(screen.getByRole('button', { name: copy.done.startNewSet }));
+    await waitFor(() => expect(wizard.screen).toBe('add'));
+    expect(wizard.watermarkSaved).toBe(false);
+    expect(wizard.resultIndex).toBe(0);
   });
 
   it('saveWatermarkUsesDefaultName', async () => {

@@ -125,6 +125,16 @@ button.danger {
   font-weight: 600;
 }
 
+/* Heard by screen readers, not seen. */
+.visually-hidden {
+  position: absolute;
+  width: 1px;
+  height: 1px;
+  overflow: hidden;
+  clip-path: inset(50%);
+  white-space: nowrap;
+}
+
 button.quiet {
   border-color: transparent;
   background: transparent;

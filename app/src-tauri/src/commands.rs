@@ -32,6 +32,8 @@ pub struct Shell {
     download: Mutex<Option<Arc<AtomicBool>>>,
     /// The local time offset read at start-up, while the process had one thread.
     startup_offset: Option<UtcOffset>,
+    /// True while `remove` runs; quitting then asks first.
+    removing: AtomicBool,
 }
 
 impl Shell {
@@ -43,7 +45,13 @@ impl Shell {
             dirs,
             download: Mutex::new(None),
             startup_offset,
+            removing: AtomicBool::new(false),
         })
+    }
+
+    /// Whether a removal runs.
+    pub fn removing(&self) -> bool {
+        self.removing.load(Ordering::SeqCst)
     }
 
     fn download_slot(&self) -> MutexGuard<'_, Option<Arc<AtomicBool>>> {
@@ -70,6 +78,29 @@ impl Drop for DownloadRun<'_> {
     fn drop(&mut self) {
         *self.0.download_slot() = None;
     }
+}
+
+/// Marks a removal as running until it is dropped, however the removal ends.
+struct RemovalRun<'a>(&'a AtomicBool);
+
+impl<'a> RemovalRun<'a> {
+    fn start(flag: &'a AtomicBool) -> RemovalRun<'a> {
+        flag.store(true, Ordering::SeqCst);
+        RemovalRun(flag)
+    }
+}
+
+impl Drop for RemovalRun<'_> {
+    fn drop(&mut self) {
+        self.0.store(false, Ordering::SeqCst);
+    }
+}
+
+/// Whether the app stays open when asked to quit (`code` is `Some` for Cmd+Q and other
+/// requests to quit, `None` when the last window has gone, with nothing left to ask in).
+/// It stays only during a removal, so the window can ask "Stop and quit?".
+pub fn hold_exit(code: Option<i32>, removing: bool) -> bool {
+    removing && code.is_some()
 }
 
 /// For failures that are the app's own fault (a bad request from the interface, a crash in a
@@ -392,6 +423,7 @@ pub async fn remove(
     on_event: Channel<ProgressEvent>,
 ) -> Res<RemoveReport> {
     let core = shell.core.clone();
+    let _run = RemovalRun::start(&shell.removing);
     blocking(move || core.remove(&sender(&on_event))).await
 }
 
@@ -474,6 +506,25 @@ pub async fn device_fix(shell: State<'_, Shell>, fix: DeviceFix) -> Res<()> {
 mod tests {
     use super::*;
     use tauri::http::{HeaderMap, HeaderValue};
+
+    #[test]
+    fn exit_is_held_only_for_a_quit_during_a_removal() {
+        assert!(hold_exit(Some(0), true));
+        assert!(!hold_exit(Some(0), false));
+        // The last window is gone: holding would leave an app with no window.
+        assert!(!hold_exit(None, true));
+        assert!(!hold_exit(None, false));
+    }
+
+    #[test]
+    fn removal_flag_follows_the_run() {
+        let flag = AtomicBool::new(false);
+        {
+            let _run = RemovalRun::start(&flag);
+            assert!(flag.load(Ordering::SeqCst));
+        }
+        assert!(!flag.load(Ordering::SeqCst));
+    }
 
     #[test]
     fn throttle_passes_one_value_per_gap_and_keeps_the_last() {

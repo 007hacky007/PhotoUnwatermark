@@ -19,6 +19,7 @@
     closeWindow,
     imageUrl,
     onCloseRequested,
+    onQuitRequested,
     remove,
     setOutputOverride,
   } from '../lib/api';
@@ -60,12 +61,13 @@
   let details = $state(false);
   let mac = $state(false);
   let stopping = $state(false);
-  let asking: 'stop' | 'quit' | null = $state(null);
+  /** The open question: stop, quit while running, or "the app will close" after Stop. */
+  let asking: 'stop' | 'quit' | 'closing' | null = $state(null);
   let quitting = false;
 
   let running = false;
   let left = false;
-  let stopGuard: (() => void) | null = null;
+  let stopGuards: (() => void)[] = [];
 
   function message(e: unknown, fallback: string): string {
     const text = (e as Partial<UserError> | null)?.message;
@@ -122,23 +124,42 @@
     await check();
   }
 
-  /** Holds the window open while the run goes on; closing it asks first. */
-  async function guard() {
-    let off: () => void;
-    try {
-      off = await onCloseRequested(() => {
-        if (running && !quitting) asking = 'quit';
-      });
-    } catch {
-      return;
+  /**
+   * The person closed the window or quit the app. Returns true when the app stays open to ask
+   * first: only while the run goes on, and only once (asked again while quitting, it closes).
+   */
+  function closeRequested(): boolean {
+    if (left || !running || quitting) return false;
+    if (stopping) {
+      // Already stopping: close once the current photo is done.
+      quitting = true;
+      sentence = c.quitting;
+      asking = 'closing';
+    } else {
+      asking = 'quit';
     }
-    if (running && !left) stopGuard = off;
-    else off();
+    return true;
+  }
+
+  function quitRequested() {
+    if (!closeRequested()) closeWindow().catch(() => {});
+  }
+
+  /** Makes closing the window and quitting the app ask first while the run goes on. */
+  async function guard() {
+    const keep = (off: () => void) => {
+      if (running && !left) stopGuards.push(off);
+      else off();
+    };
+    await Promise.all([
+      onCloseRequested(closeRequested).then(keep, () => {}),
+      onQuitRequested(quitRequested).then(keep, () => {}),
+    ]);
   }
 
   function unguard() {
-    stopGuard?.();
-    stopGuard = null;
+    for (const off of stopGuards) off();
+    stopGuards = [];
   }
 
   async function run() {
@@ -174,6 +195,7 @@
       return;
     }
     wizard.report = report;
+    wizard.resultIndex = 0;
     wizard.go('done');
   }
 
@@ -214,7 +236,7 @@
   function stop() {
     asking = null;
     stopping = true;
-    sentence = c.stopping;
+    sentence = quitting ? c.quitting : c.stopping;
     cancelJob().catch(() => {
       // The run reports how it ended either way.
     });
@@ -266,7 +288,7 @@
       onCancel={stopping ? undefined : () => (asking = 'stop')}
       cancelLabel={c.stop}
     />
-    <span class="announce" data-testid="announce" aria-live="polite">{announced}</span>
+    <span class="visually-hidden" data-testid="announce" aria-live="polite">{announced}</span>
     <!-- Always there, so the sentence is heard when it appears. -->
     <div class="notice" class:shown={fellBack !== null}>
       <p aria-live="polite">{fellBack === null ? '' : c.fellBack(mac)}</p>
@@ -297,6 +319,13 @@
     {#snippet actions()}
       <button type="button" onclick={() => (asking = null)}>{c.keepGoing}</button>
       <button type="button" class="danger" onclick={stopAndQuit}>{c.stopAndQuit}</button>
+    {/snippet}
+  </Dialog>
+{:else if asking === 'closing'}
+  <Dialog title={c.quitting} onClose={() => (asking = null)}>
+    <p>{c.keptNote}</p>
+    {#snippet actions()}
+      <button type="button" class="primary" onclick={() => (asking = null)}>{c.ok}</button>
     {/snippet}
   </Dialog>
 {/if}
@@ -360,14 +389,5 @@
     white-space: pre-wrap;
     font-size: var(--text-small);
     color: var(--text-muted);
-  }
-  /* Heard, not seen. */
-  .announce {
-    position: absolute;
-    width: 1px;
-    height: 1px;
-    overflow: hidden;
-    clip-path: inset(50%);
-    white-space: nowrap;
   }
 </style>

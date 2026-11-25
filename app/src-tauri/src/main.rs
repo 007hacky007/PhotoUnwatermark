@@ -4,14 +4,55 @@
 mod commands;
 mod protocol;
 
-use tauri::Manager;
+use tauri::{Emitter, Manager, RunEvent};
+
+/// What the window hears when the app is asked to quit during a removal.
+const QUIT_REQUESTED: &str = "quit-requested";
+
+/// The app menu's Quit, which goes through [`RunEvent::ExitRequested`] (the standard item
+/// ends the app at once).
+#[cfg(target_os = "macos")]
+const QUIT_MENU_ID: &str = "quit";
+
+/// The standard Mac menu with its Quit item replaced by one the app can hold back.
+#[cfg(target_os = "macos")]
+fn mac_menu(app: &tauri::AppHandle) -> tauri::Result<tauri::menu::Menu<tauri::Wry>> {
+    use tauri::menu::{Menu, MenuItem};
+    let menu = Menu::default(app)?;
+    let Some(app_menu) = menu
+        .items()?
+        .into_iter()
+        .next()
+        .and_then(|i| i.as_submenu().cloned())
+    else {
+        return Ok(menu);
+    };
+    let items = app_menu.items()?;
+    let quit = items.iter().enumerate().rev().find_map(|(at, item)| {
+        let text = item.as_predefined_menuitem()?.text().ok()?;
+        text.starts_with("Quit").then_some((at, text))
+    });
+    if let Some((at, text)) = quit {
+        app_menu.remove_at(at)?;
+        let item = MenuItem::with_id(app, QUIT_MENU_ID, text, true, Some("CmdOrCtrl+Q"))?;
+        app_menu.insert(&item, at)?;
+    }
+    Ok(menu)
+}
 
 fn main() {
     // Read while the process still has one thread: later reads can fail on macOS and Linux.
     let startup_offset = time::UtcOffset::current_local_offset().ok();
-    tauri::Builder::default()
+    let builder = tauri::Builder::default()
         .plugin(tauri_plugin_dialog::init())
-        .plugin(tauri_plugin_opener::init())
+        .plugin(tauri_plugin_opener::init());
+    #[cfg(target_os = "macos")]
+    let builder = builder.menu(mac_menu).on_menu_event(|app, event| {
+        if event.id() == QUIT_MENU_ID {
+            app.exit(0);
+        }
+    });
+    builder
         .setup(move |app| {
             app.manage(commands::Shell::open(startup_offset)?);
             Ok(())
@@ -53,6 +94,17 @@ fn main() {
             commands::device_status,
             commands::device_fix,
         ])
-        .run(tauri::generate_context!())
-        .expect("error while running PhotoUnwatermark");
+        .build(tauri::generate_context!())
+        .expect("error while running PhotoUnwatermark")
+        .run(|app, event| {
+            if let RunEvent::ExitRequested { code, api, .. } = event {
+                let removing = app
+                    .try_state::<commands::Shell>()
+                    .is_some_and(|s| s.removing());
+                if commands::hold_exit(code, removing) {
+                    api.prevent_exit();
+                    let _ = app.emit(QUIT_REQUESTED, ());
+                }
+            }
+        });
 }

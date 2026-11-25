@@ -252,6 +252,9 @@ export const copy = {
     keptNote: 'Finished photos are kept.',
     keepGoing: 'Keep going',
     stopping: 'Stopping...',
+    /** After "Stop and quit", or a close after Stop. */
+    quitting: 'Stopping... the app will close when the current photo is finished.',
+    ok: 'OK',
     quitTitle: 'Removal is still running. Stop and quit?',
     stopAndQuit: 'Stop and quit',
     /** Shown for the rest of the run when the fast hardware stopped working. */

@@ -35,6 +35,10 @@ export class Wizard {
   outcome: DetectOutcome | null = $state(null);
   /** How the last removal went, for step 5. */
   report: RemoveReport | null = $state(null);
+  /** The result step 5 shows. */
+  resultIndex = $state(0);
+  /** Whether step 5 saved this set's watermark. */
+  watermarkSaved = $state(false);
   #history: Screen[] = $state([]);
 
   get step(): number | null {
@@ -61,6 +65,8 @@ export class Wizard {
   restart(): void {
     this.outcome = null;
     this.report = null;
+    this.resultIndex = 0;
+    this.watermarkSaved = false;
     this.#history = [];
     this.screen = 'add';
   }

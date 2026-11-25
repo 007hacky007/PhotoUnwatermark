@@ -24,15 +24,17 @@
   const version = ++visits;
   const fieldId = $props.id();
 
-  let index = $state(0);
   let name = $state('');
   let saving = $state(false);
-  let saved = $state(false);
+  /** "Photo X of Y" for screen readers, said when the person browses. */
+  let announced = $state('');
   let saveError: string | null = $state(null);
   let error: string | null = $state(null);
   let starting = $state(false);
 
   const count = report.done.length;
+  // The position and "Saved" live in the wizard, so they stay when Settings is visited.
+  const index = $derived(Math.min(wizard.resultIndex, Math.max(0, count - 1)));
   const shown = $derived(report.done[index]);
 
   /** The parts of a path, for either kind of separator. */
@@ -59,7 +61,10 @@
   });
 
   function browse(step: number) {
-    index = Math.min(count - 1, Math.max(0, index + step));
+    const next = Math.min(count - 1, Math.max(0, index + step));
+    if (next === index) return;
+    wizard.resultIndex = next;
+    announced = c.position(next + 1, count);
   }
 
   function keydown(e: KeyboardEvent) {
@@ -92,7 +97,7 @@
     saving = true;
     try {
       await saveWatermark(chosen);
-      saved = true;
+      wizard.watermarkSaved = true;
     } catch (err) {
       saveError = message(err, c.saveFailed);
     } finally {
@@ -132,6 +137,7 @@
           <span>{c.position(index + 1, count)}</span>
           <span class="file">{fileName(shown.output)}</span>
         </span>
+        <span class="visually-hidden" data-testid="announce" aria-live="polite">{announced}</span>
         <button
           type="button"
           aria-label={c.next}
@@ -161,7 +167,7 @@
   {/if}
 
   <div class="keep">
-    {#if saved}
+    {#if wizard.watermarkSaved}
       <p class="saved" role="status">{c.savedWatermark}</p>
     {:else}
       <form onsubmit={save}>
