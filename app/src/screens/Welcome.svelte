@@ -11,9 +11,31 @@
   let pausing = false;
   let doneBytes = $state(0);
   let error: string | null = $state(null);
+  /** Seconds the rest should take at the speed so far; null until that speed is known. */
+  let secondsLeft: number | null = $state(null);
+  /** Where the speed is measured from: the first report of this download (resumed bytes count as there already). */
+  let since: { at: number; bytes: number } | null = null;
 
   const total = DOWNLOAD_MEGABYTES;
   const megabytes = $derived(Math.min(total, Math.floor(doneBytes / 1_000_000)));
+  /** The speed is trusted after this long and this much. */
+  const MEASURE_MS = 2000;
+  const MEASURE_BYTES = 1_000_000;
+
+  function onProgress(p: DownloadProgress) {
+    doneBytes = p.doneBytes;
+    const now = Date.now();
+    if (since === null) {
+      since = { at: now, bytes: p.doneBytes };
+      return;
+    }
+    const ms = now - since.at;
+    const bytes = p.doneBytes - since.bytes;
+    if (ms >= MEASURE_MS && bytes >= MEASURE_BYTES) {
+      const perSecond = bytes / (ms / 1000);
+      secondsLeft = Math.max(0, (p.totalBytes - p.doneBytes) / perSecond);
+    }
+  }
 
   function messageOf(e: unknown): string {
     const message = (e as Partial<UserError> | null)?.message;
@@ -25,11 +47,11 @@
     error = null;
     pausing = false;
     downloading = true;
+    secondsLeft = null;
+    since = null;
     wizard.busy = true;
     try {
-      await downloadModels((p: DownloadProgress) => {
-        doneBytes = p.doneBytes;
-      });
+      await downloadModels(onProgress);
       wizard.busy = false;
       wizard.go('add');
     } catch (e) {
@@ -56,7 +78,7 @@
     <Waiting
       sentence={copy.welcome.downloading}
       fraction={doneBytes / (total * 1_000_000)}
-      detail={copy.welcome.progress(megabytes)}
+      detail={copy.welcome.progressLeft(megabytes, secondsLeft === null ? null : copy.remove.timeLeft(secondsLeft))}
       onCancel={pause}
       cancelLabel={copy.welcome.pause}
     />

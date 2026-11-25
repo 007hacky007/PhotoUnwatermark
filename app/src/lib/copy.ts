@@ -11,6 +11,8 @@ export const copy = {
   /** The progress line: "1 Add photos > 2 Check the watermark > ...". */
   steps: ['Add photos', 'Check the watermark', 'Check all photos', 'Remove', 'Done'],
   common: {
+    /** When files the app downloaded are missing: back to the download. */
+    downloadAgain: 'Download again',
     back: 'Back',
     cancel: 'Cancel',
     close: 'Close',
@@ -26,11 +28,14 @@ export const copy = {
     folderName: 'Folder name',
     /** Also the app's default (crates/puw-app/src/settings.rs). */
     defaultFolderName: 'Without watermark',
+    /** The same rule as the app's (crates/puw-app/src/settings.rs, `valid_folder_name`). */
+    badFolderName:
+      'A folder cannot have that name. Use a name without / \\ : * ? " < > | that does not end with a dot or a space.',
     alwaysFolder: 'Always save to...',
     chooseFolder: 'Choose a folder...',
     detail: 'Detail vs speed',
     best: 'Best detail',
-    bestHelp: 'Best detail. Takes about three times as long as Faster.',
+    bestHelp: 'Best detail. More than twice as long as Faster.',
     balanced: 'Balanced',
     balancedHelp: 'A middle ground.',
     faster: 'Faster',
@@ -78,10 +83,11 @@ export const copy = {
     responsibleUse: 'Intended for photos you own or have permission to edit.',
     credits: 'Credits and licences',
     finder: 'Watermark finder: watermark-remover by DevynLabs (christophernavas/watermark-remover), Apache License 2.0.',
-    remover: 'Watermark remover: LaMa (big-lama) by Samsung Research (advimman/lama), Apache License 2.0.',
+    remover:
+      'Watermark remover: LaMa (big-lama) by Samsung Research (advimman/lama), Apache License 2.0, in the Carve export (huggingface.co/Carve) as published in ravetools/watermark-remover on Hugging Face.',
     removerWeights:
       'The LaMa weights have no licence of their own; their authors point to the Apache License 2.0. If they publish other terms for the weights, those terms apply.',
-    faces: 'Face finder: YuNet from OpenCV Zoo, MIT License.',
+    faces: 'Face finder: YuNet by Shiqi Yu, from OpenCV Zoo, MIT License, Copyright (c) 2020 Shiqi Yu.',
     app: 'PhotoUnwatermark itself: MIT License.',
     newVersions: 'New versions are on the',
     releases: 'Releases page',
@@ -97,6 +103,9 @@ export const copy = {
     tryAgain: 'Try again',
     downloading: 'Downloading the watermark remover...',
     progress: (done: number) => `${done} MB of ${DOWNLOAD_MEGABYTES} MB`,
+    /** The size and, once the speed is known, the time left: "440 MB of 690 MB - about 2 minutes left". */
+    progressLeft: (done: number, left: string | null) =>
+      left === null ? `${done} MB of ${DOWNLOAD_MEGABYTES} MB` : `${done} MB of ${DOWNLOAD_MEGABYTES} MB - ${left}`,
     failed: 'The download did not finish.',
   },
   loading: {
@@ -119,6 +128,13 @@ export const copy = {
     find: 'Find the watermark →',
     removeFailed: 'The photo could not be removed from the list.',
     addFailed: 'The photos could not be added.',
+    /** While the app checks the new photos against the saved watermarks; the buttons stay usable. */
+    checkingSaved: 'Checking your saved watermarks...',
+  },
+  /** A photo that turned out to be unreadable after it was added. */
+  photoProblem: {
+    gone: 'This photo is no longer there. It may have been moved or deleted.',
+    damaged: 'This photo could not be opened.',
   },
   finding: {
     neutral: 'Looking for the watermark...',
@@ -248,12 +264,12 @@ export const copy = {
     folderFailed: 'That folder could not be used.',
     failed: 'The watermark could not be removed.',
     stop: 'Stop',
-    stopTitle: 'Stop after discarding the current photo?',
+    stopTitle: 'Stop now? The photo being worked on is left unfinished.',
     keptNote: 'Finished photos are kept.',
     keepGoing: 'Keep going',
     stopping: 'Stopping...',
     /** After "Stop and quit", or a close after Stop. */
-    quitting: 'Stopping... the app will close when the current photo is finished.',
+    quitting: 'Stopping... the app will close in a moment.',
     ok: 'OK',
     quitTitle: 'Removal is still running. Stop and quit?',
     stopAndQuit: 'Stop and quit',

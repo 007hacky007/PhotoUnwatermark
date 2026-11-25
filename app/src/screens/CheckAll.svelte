@@ -14,7 +14,7 @@
   import { cancelJob, imageUrl, listPhotos, matchAll, photoStates, removalBlockers, setIncluded } from '../lib/api';
   import Waiting from '../lib/components/Waiting.svelte';
   import { copy } from '../lib/copy';
-  import type { PhotoId, PhotoInfo, PhotoState, UserError } from '../lib/types';
+  import type { PhotoId, PhotoInfo, PhotoProblem, PhotoState, UserError } from '../lib/types';
   import type { Wizard } from '../lib/wizard.svelte';
   import CheckWatermark from './CheckWatermark.svelte';
 
@@ -23,6 +23,8 @@
   const c = copy.checkAll;
 
   let names: Map<PhotoId, string> = $state(new Map());
+  /** Why a photo that cannot be read cannot be used. */
+  let problems: Map<PhotoId, PhotoProblem> = $state(new Map());
   let states: PhotoState[] = $state([]);
   let blockers: PhotoId[] = $state([]);
   let versions: Record<PhotoId, number> = $state({});
@@ -40,7 +42,9 @@
   let leaving = false;
 
   const included = $derived(states.filter((s) => s.included).length);
-  const found = $derived(states.filter((s) => s.status === 'found' || s.status === 'edited').length);
+  // The app's own rule (MatchSummary): a photo with its own area counts as found only when that
+  // area is not empty.
+  const found = $derived(states.filter((s) => s.status === 'found' || (s.status === 'edited' && s.hasArea)).length);
   const blocked = $derived(blockers.length > 0);
 
   function message(e: unknown, fallback: string): string {
@@ -59,6 +63,7 @@
   async function refresh() {
     const [list, now, stuck] = await Promise.all([listPhotos(), photoStates(), removalBlockers()]);
     names = new Map(list.map((p: PhotoInfo) => [p.id, p.name]));
+    problems = new Map(list.flatMap((p: PhotoInfo) => (p.problem ? [[p.id, p.problem] as const] : [])));
     for (const s of now) if (versions[s.id] === undefined) bump(s.id);
     states = now;
     blockers = stuck;
@@ -182,7 +187,7 @@
           : null;
 </script>
 
-<div class="all" bind:this={root}>
+<div class="all" class:single={open !== null} bind:this={root}>
   {#if open !== null}
     {@const id = open}
     <CheckWatermark {wizard} mode="photo" photoId={id} onDone={(saved) => closed(id, saved)} />
@@ -219,32 +224,40 @@
         {#each states as s (s.id)}
           {@const name = names.get(s.id) ?? ''}
           {@const kind = badge(s)}
+          {@const unreadable = s.status === 'unreadable'}
+          {@const reason = unreadable ? copy.photoProblem[problems.get(s.id) ?? 'damaged'] : c.noAreaTip}
           <li class="tile" class:unsure={kind === 'unsure'}>
-            <button
-              type="button"
-              class="open"
-              aria-label={c.openPhoto(name, kind)}
-              onclick={() => openPhoto(s.id)}
-            >
-              <img src={imageUrl('grid', s.id, versions[s.id])} alt={name} loading="lazy" decoding="async" />
-            </button>
-            {#if kind === 'unsure'}
-              <span class="badge unsure" aria-hidden="true">{c.badgeUnsure}</span>
-            {:else if kind === 'notFound'}
-              <span class="badge notFound" aria-hidden="true">{c.badgeNotFound}</span>
-            {:else if kind === 'edited'}
-              <span class="badge edited" aria-hidden="true">{c.badgeEdited}</span>
-            {/if}
+            <div class="pic">
+              {#if unreadable}
+                <div class="problem" role="img" aria-label={name}>{name}</div>
+              {:else}
+                <button
+                  type="button"
+                  class="open"
+                  aria-label={c.openPhoto(name, kind)}
+                  onclick={() => openPhoto(s.id)}
+                >
+                  <img src={imageUrl('grid', s.id, versions[s.id])} alt={name} loading="lazy" decoding="async" />
+                </button>
+              {/if}
+              {#if kind === 'unsure'}
+                <span class="badge unsure" aria-hidden="true">{c.badgeUnsure}</span>
+              {:else if kind === 'notFound'}
+                <span class="badge notFound" aria-hidden="true">{c.badgeNotFound}</span>
+              {:else if kind === 'edited'}
+                <span class="badge edited" aria-hidden="true">{c.badgeEdited}</span>
+              {/if}
+            </div>
             <input
               type="checkbox"
               aria-label={c.include(name)}
               checked={s.included}
-              disabled={!s.included && !s.hasArea}
-              title={!s.included && !s.hasArea ? c.noAreaTip : undefined}
+              disabled={unreadable || (!s.included && !s.hasArea)}
+              title={unreadable || (!s.included && !s.hasArea) ? reason : undefined}
               onchange={(e) => tick(s, e.currentTarget)}
             />
-            {#if !s.included && !s.hasArea}
-              <span class="why">{c.noAreaTip}</span>
+            {#if unreadable || (!s.included && !s.hasArea)}
+              <span class="why">{reason}</span>
             {/if}
           </li>
         {/each}
@@ -263,6 +276,10 @@
 </div>
 
 <style>
+  /* The single-photo editor takes the whole height, like step 2. */
+  .all.single {
+    height: 100%;
+  }
   .grid-page {
     display: flex;
     flex-direction: column;
@@ -308,6 +325,24 @@
   }
   .tile.unsure {
     border-color: var(--warning);
+  }
+  /* The photo and its badge; the reason below it never sits under the badge. */
+  .pic {
+    position: relative;
+  }
+  .problem {
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    box-sizing: border-box;
+    aspect-ratio: 1;
+    padding: var(--space-2);
+    overflow: hidden;
+    background: var(--track);
+    color: var(--text-muted);
+    font-size: var(--text-small);
+    overflow-wrap: anywhere;
+    text-align: center;
   }
   .open {
     display: block;

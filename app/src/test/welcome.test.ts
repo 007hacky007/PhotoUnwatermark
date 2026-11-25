@@ -81,6 +81,21 @@ describe('Welcome', () => {
     assertPlainText(container);
   });
 
+  it('progressShowsTimeLeftOnceTheSpeedIsKnown', async () => {
+    const now = vi.spyOn(Date, 'now');
+    now.mockReturnValue(1_000_000);
+    const dl = openDownload();
+    await start();
+    await fireEvent.click(screen.getByRole('button', { name: copy.welcome.download }));
+    // A resumed download starts from what is there already.
+    dl.emit(progress(440_000_000));
+    expect(await screen.findByText('440 MB of 690 MB')).toBeTruthy();
+    // 10 MB in 2 s: the remaining 240 MB take about 48 s.
+    now.mockReturnValue(1_002_000);
+    dl.emit(progress(450_000_000));
+    expect(await screen.findByText(`450 MB of 690 MB - ${copy.remove.timeLeft(48)}`)).toBeTruthy();
+  });
+
   it('pauseStopsAndResumeContinues', async () => {
     const first = openDownload();
     await start();

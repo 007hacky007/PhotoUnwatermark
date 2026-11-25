@@ -2,6 +2,7 @@
   import { onMount } from 'svelte';
   import {
     addPaths,
+    cancelJob,
     chooseFolder,
     choosePhotos,
     detect,
@@ -14,7 +15,7 @@
   } from '../lib/api';
   import { copy } from '../lib/copy';
   import type { DetectOutcome, PhotoInfo, ProgressEvent, Skipped, Suggestion, UserError } from '../lib/types';
-  import type { Wizard } from '../lib/wizard.svelte';
+  import { sameSet, type Wizard } from '../lib/wizard.svelte';
   import Finding from './Finding.svelte';
 
   let { wizard }: { wizard: Wizard } = $props();
@@ -24,7 +25,10 @@
   let suggestion: Suggestion | null = $state(null);
   let error: string | null = $state(null);
   let hovering = $state(false);
+  /** True while photos are added or removed; the list must not change twice at once. */
   let adding = $state(false);
+  /** True while the saved watermarks are checked; nothing waits for it. */
+  let checking = $state(false);
   /** The running job, or null while this screen is the one showing. */
   type Run = (onEvent: (e: ProgressEvent) => void) => Promise<DetectOutcome>;
   let job: { run: Run; first?: string } | null = $state(null);
@@ -54,32 +58,68 @@
     };
   });
 
-  async function refreshOffer() {
+  /**
+   * Checks the photos against the saved watermarks in the background: the buttons stay usable,
+   * and adding or removing photos or finding the watermark stops the check first.
+   */
+  function refreshOffer() {
     const mine = ++asked;
     suggestion = null;
-    try {
-      const found = await suggestSaved();
-      if (mine === asked) suggestion = found;
-    } catch {
-      // The offer is a bonus; without it the person just finds the watermark.
-    }
+    checking = true;
+    suggestSaved()
+      .then((found) => {
+        if (mine === asked) suggestion = found;
+      })
+      .catch(() => {
+        // The offer is a bonus; without it the person just finds the watermark.
+      })
+      .finally(() => {
+        if (mine === asked) checking = false;
+      });
+  }
+
+  /** Stops a check that is still running; its answer is dropped. */
+  function stopCheck() {
+    asked++;
+    suggestion = null;
+    if (!checking) return;
+    checking = false;
+    // The check is the job started last, so this stops it and nothing else.
+    Promise.resolve()
+      .then(() => cancelJob())
+      .catch(() => {});
+  }
+
+  /** Reads the list again after a picture failed to load, to show why. */
+  let rechecking = false;
+  function pictureFailed() {
+    if (rechecking) return;
+    rechecking = true;
+    queueMicrotask(() => {
+      listPhotos()
+        .then((list) => (photos = list))
+        .catch(() => {})
+        .finally(() => (rechecking = false));
+    });
   }
 
   async function add(paths: string[]) {
     if (adding || job !== null || paths.length === 0) return;
+    stopCheck();
     adding = true;
     error = null;
+    let added = false;
     try {
       const result = await addPaths(paths);
       skipped = result.skipped;
       photos = await listPhotos();
-      if (result.added.length > 0) await refreshOffer();
-      else suggestion = null;
+      added = result.added.length > 0;
     } catch (e) {
       error = (e as Partial<UserError> | null)?.message || copy.addPhotos.addFailed;
     } finally {
       adding = false;
     }
+    if (added) refreshOffer();
   }
 
   async function choose() {
@@ -92,25 +132,41 @@
   }
 
   async function remove(photo: PhotoInfo) {
+    if (adding || job !== null) return;
+    stopCheck();
+    adding = true;
     try {
       await removePhoto(photo.id);
       photos = photos.filter((p) => p.id !== photo.id);
     } catch (e) {
       error = (e as Partial<UserError> | null)?.message || copy.addPhotos.removeFailed;
       return;
+    } finally {
+      adding = false;
     }
-    if (photos.length > 0) await refreshOffer();
-    else {
-      asked++;
-      suggestion = null;
-    }
+    if (photos.length > 0) refreshOffer();
   }
 
   function begin(run: Run, first?: string) {
-    asked++;
-    suggestion = null;
+    stopCheck();
     wizard.busy = true;
     job = { run, first };
+  }
+
+  /** Step 2 again as it was when the photos did not change, else a new search. */
+  function find() {
+    if (sameSet(wizard, photos.map((p) => p.id))) {
+      stopCheck();
+      wizard.go('check');
+      return;
+    }
+    begin(detect);
+  }
+
+  function downloadAgain() {
+    wizard.busy = false;
+    job = null;
+    wizard.go('welcome');
   }
 
   function useSuggested() {
@@ -126,6 +182,7 @@
 
   function done(outcome: DetectOutcome) {
     wizard.outcome = outcome;
+    wizard.outcomePhotos = photos.map((p) => p.id);
     wizard.busy = false;
     job = null;
     wizard.go('check');
@@ -133,7 +190,7 @@
 </script>
 
 {#if job !== null}
-  <Finding run={job.run} first={job.first} onDone={done} onBack={leave} />
+  <Finding run={job.run} first={job.first} onDone={done} onBack={leave} onDownload={downloadAgain} />
 {:else}
   <section class="add">
     <div class="drop" class:hovering role="group" aria-label={copy.addPhotos.drop}>
@@ -159,6 +216,10 @@
       </div>
     {/if}
 
+    {#if checking}
+      <p class="checking" role="status">{copy.addPhotos.checkingSaved}</p>
+    {/if}
+
     {#if suggestion !== null}
       <div class="offer" role="status">
         <p>{copy.addPhotos.offer(suggestion.name)}</p>
@@ -174,8 +235,21 @@
       <ul class="grid">
         {#each photos as photo (photo.id)}
           <li>
-            <img src={imageUrl('thumb', photo.id)} alt={photo.name} loading="lazy" />
-            <button type="button" class="remove" aria-label={copy.addPhotos.remove(photo.name)} onclick={() => remove(photo)}>
+            {#if photo.problem}
+              <div class="problem" role="img" aria-label={photo.name}>
+                <span class="name">{photo.name}</span>
+                <span>{copy.photoProblem[photo.problem]}</span>
+              </div>
+            {:else}
+              <img src={imageUrl('thumb', photo.id)} alt={photo.name} loading="lazy" onerror={pictureFailed} />
+            {/if}
+            <button
+              type="button"
+              class="remove"
+              aria-label={copy.addPhotos.remove(photo.name)}
+              disabled={adding}
+              onclick={() => remove(photo)}
+            >
               ×
             </button>
           </li>
@@ -189,7 +263,7 @@
         type="button"
         class="primary"
         disabled={photos.length === 0 || adding}
-        onclick={() => begin(detect)}
+        onclick={find}
       >
         {copy.addPhotos.find}
       </button>
@@ -241,6 +315,30 @@
   .error {
     margin: 0;
     color: var(--danger);
+  }
+  .checking {
+    margin: 0;
+    color: var(--text-muted);
+  }
+  .problem {
+    display: flex;
+    flex-direction: column;
+    justify-content: center;
+    gap: var(--space-1);
+    box-sizing: border-box;
+    width: 100%;
+    aspect-ratio: 1;
+    padding: var(--space-2);
+    overflow: hidden;
+    border-radius: var(--radius);
+    background: var(--track);
+    color: var(--text-muted);
+    font-size: var(--text-small);
+    overflow-wrap: anywhere;
+  }
+  .problem .name {
+    color: var(--text);
+    font-weight: 600;
   }
   .grid {
     display: grid;

@@ -4,6 +4,7 @@
   import DeviceChip from '../lib/components/DeviceChip.svelte';
   import Dialog from '../lib/components/Dialog.svelte';
   import { copy } from '../lib/copy';
+  import { validFolderName } from '../lib/folderName';
   import type { Detail, Settings, UserError } from '../lib/types';
   import type { Wizard } from '../lib/wizard.svelte';
 
@@ -118,10 +119,13 @@
 
   function renameFolder() {
     const name = folderName.trim();
-    if (name === '') {
+    if (!validFolderName(name)) {
+      // The saved name stays, and the person hears why.
+      error = copy.settings.badFolderName;
       folderName = savedFolderName();
       return;
     }
+    error = null;
     folderName = name;
     if (name === savedFolderName() && settings !== null && kindOf(settings) === 'next') return;
     void save((s) => ({ ...s, output: { nextToOriginals: { folderName: name } } }));

@@ -13,15 +13,18 @@
     onDone: (outcome: DetectOutcome) => void;
     /** Leaves the wait: after Back, or after a failure. */
     onBack: () => void;
+    /** Files the app downloaded are missing: goes to the download. */
+    onDownload?: () => void;
   };
 
-  let { run, first, onDone, onBack }: Props = $props();
+  let { run, first, onDone, onBack, onDownload }: Props = $props();
 
   // Detection begins by getting the models ready; using a saved watermark loads none.
   // svelte-ignore state_referenced_locally
   let sentence: string = $state(first ?? copy.loading.finder);
   let fraction: number | null = $state(null);
   let error: string | null = $state(null);
+  let missingData = $state(false);
   let left = false;
 
   function onEvent(e: ProgressEvent) {
@@ -46,6 +49,7 @@
       if (left) return;
       const message = (e as Partial<UserError> | null)?.message;
       error = typeof message === 'string' && message !== '' ? message : copy.finding.failed;
+      missingData = (e as Partial<UserError> | null)?.missingData === true;
     }
   });
 
@@ -63,7 +67,12 @@
 <section class="finding">
   {#if error !== null}
     <p class="error" role="alert">{error}</p>
-    <button type="button" onclick={onBack}>{copy.common.back}</button>
+    <div class="buttons">
+      <button type="button" onclick={onBack}>{copy.common.back}</button>
+      {#if missingData && onDownload}
+        <button type="button" class="primary" onclick={onDownload}>{copy.common.downloadAgain}</button>
+      {/if}
+    </div>
   {:else}
     <Waiting {sentence} {fraction} onCancel={back} cancelLabel={copy.common.back} />
   {/if}
@@ -80,5 +89,9 @@
   .error {
     margin: 0;
     color: var(--danger);
+  }
+  .buttons {
+    display: flex;
+    gap: var(--space-2);
   }
 </style>

@@ -69,6 +69,29 @@ describe('Check all photos', () => {
     expect(await screen.findByText('Found in 118 of 120 photos. 2 need a look.')).toBeTruthy();
   });
 
+  it('foundCountsEditedOnlyWithAnArea', async () => {
+    // The app's rule: an own area that is empty is "not found".
+    setup([st(1, 'found'), st(2, 'edited'), st(3, 'edited', { hasArea: false, included: false })]);
+    expect(await screen.findByText('Found in 2 of 3 photos.')).toBeTruthy();
+  });
+
+  it('unreadablePhotoSaysWhyAndCannotBeUsed', async () => {
+    setup([st(1, 'found'), st(2, 'unreadable', { hasArea: false, included: false }), st(3, 'unreadable', { hasArea: false, included: false })]);
+    listPhotos.mockResolvedValue([info(1), { ...info(2), problem: 'gone' }, { ...info(3), problem: 'damaged' }]);
+    await primary();
+    expect(screen.getByText(copy.photoProblem.gone)).toBeTruthy();
+    expect(screen.getByText(copy.photoProblem.damaged)).toBeTruthy();
+    for (const id of [2, 3]) {
+      const box = screen.getByRole('checkbox', { name: `Include p${id}.jpg` }) as HTMLInputElement;
+      expect(box.disabled).toBe(true);
+      // Not offered for opening, and never "Not found".
+      expect(screen.queryByRole('button', { name: new RegExp(`^Open p${id}\\.jpg`) })).toBeNull();
+    }
+    expect(screen.queryByText(copy.checkAll.badgeNotFound)).toBeNull();
+    expect(screen.queryByText(copy.checkAll.noAreaTip)).toBeNull();
+    expect(screen.getByText('Found in 1 of 3 photos.')).toBeTruthy();
+  });
+
   it('summaryOmitsNeedLookAtZero', async () => {
     setup([st(1, 'found'), st(2, 'notFound')]);
     expect(await screen.findByText('Found in 1 of 2 photos.')).toBeTruthy();

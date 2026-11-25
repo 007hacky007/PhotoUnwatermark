@@ -32,6 +32,7 @@
   import {
     cancelJob,
     confirmSetArea,
+    dropDraft,
     editSize,
     getArea,
     imageUrl,
@@ -80,6 +81,8 @@
   let loaded = $state(false);
   let hint = $state(false);
   let error: string | null = $state(null);
+  /** The error was files the app downloaded that are missing: offer the download. */
+  let missingData = $state(false);
   /** The photo whose area could not be read; "Try again" reads it again. */
   let failed: PhotoId | null = $state(null);
   /** edit: painting; previewing: the preview runs; preview: before/after shown. */
@@ -111,6 +114,7 @@
   });
 
   function message(e: unknown, fallback: string): string {
+    missingData = (e as Partial<UserError> | null)?.missingData === true;
     const text = (e as Partial<UserError> | null)?.message;
     return typeof text === 'string' && text !== '' ? text : fallback;
   }
@@ -240,8 +244,21 @@
   }
 
   function back() {
-    if (single) close(false);
-    else wizard.back();
+    if (single) {
+      // Nothing of this visit is kept: the area sent for a preview goes too.
+      const id = current;
+      if (id !== null) {
+        Promise.resolve()
+          .then(() => dropDraft(id))
+          .catch(() => {});
+      }
+      close(false);
+    } else wizard.back();
+  }
+
+  function downloadAgain() {
+    setBusy(false);
+    wizard.go('welcome');
   }
 
   const editing = $derived(phase === 'edit');
@@ -257,7 +274,15 @@
         {@const again = failed}
         <button type="button" onmousedown={keepFocus} onclick={() => show(again)}>{c.tryAgain}</button>
       {/if}
+      {#if missingData}
+        <button type="button" onmousedown={keepFocus} onclick={downloadAgain}>{copy.common.downloadAgain}</button>
+      {/if}
     </div>
+  {/if}
+
+  {#if !editing}
+    <!-- Above the photo, so it never covers the photo or its labels. -->
+    <div class="chip"><DeviceChip refresh={chip} /></div>
   {/if}
 
   <div class="work">
@@ -280,9 +305,6 @@
           >{c.backToEditing}</button
         >
       </div>
-    {/if}
-    {#if !editing}
-      <div class="chip"><DeviceChip refresh={chip} /></div>
     {/if}
   </div>
 
@@ -379,9 +401,9 @@
     max-width: 100%;
   }
   .chip {
-    position: absolute;
-    top: 0;
-    right: 0;
+    display: flex;
+    justify-content: flex-end;
+    min-height: 1.5rem;
   }
   .strip {
     display: flex;

@@ -136,6 +136,9 @@ export const putDraft = (id: PhotoId, width: number, height: number, area: Uint8
     headers: { 'x-photo-id': String(id), 'x-width': String(width), 'x-height': String(height) },
   });
 
+/** Forgets the area sent for a photo whose editor was left without saving. */
+export const dropDraft = (id: PhotoId) => invoke<void>('drop_draft', { id });
+
 export const confirmSetArea = (id: PhotoId) => invoke<void>('confirm_set_area', { id, job: ticket() });
 
 export const preview = (id: PhotoId, onEvent: (e: ProgressEvent) => void) =>

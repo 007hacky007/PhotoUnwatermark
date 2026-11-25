@@ -94,6 +94,24 @@ describe('Settings', () => {
     await fireEvent.change(field);
     expect(setSettings).toHaveBeenCalledTimes(1);
     expect(field.value).toBe('Clean');
+    expect(screen.getByText(copy.settings.badFolderName)).toBeTruthy();
+  });
+
+  it('badFolderNamesAreRefusedWithAReason', async () => {
+    const { validFolderName } = await import('../lib/folderName');
+    for (const ok of ['Without watermark', 'Out', 'a.b', '.hidden']) expect(validFolderName(ok), ok).toBe(true);
+    for (const bad of ['', '.', '..', 'a/b', 'a\\b', 'x:', 'a*', 'q?', '<x>', '"q"', 'p|q', 'end.', 'end ', 'CON', 'con.txt', 'COM1', 'lpt9.x', 'tab\there']) {
+      expect(validFolderName(bad), JSON.stringify(bad)).toBe(false);
+    }
+    await openSettings();
+    const field = screen.getByRole('textbox', { name: copy.settings.folderName }) as HTMLInputElement;
+    for (const bad of ['..', 'a/b', 'Out:1']) {
+      await fireEvent.input(field, { target: { value: bad } });
+      await fireEvent.change(field);
+      expect(field.value).toBe('Without watermark');
+      expect(screen.getByRole('alert').textContent).toBe(copy.settings.badFolderName);
+    }
+    expect(setSettings).not.toHaveBeenCalled();
   });
 
   it('alwaysSaveToAsksForAFolder', async () => {

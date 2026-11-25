@@ -1,7 +1,7 @@
 import { render } from '@testing-library/svelte';
 import { describe, expect, it } from 'vitest';
 import ProgressLine from '../lib/components/ProgressLine.svelte';
-import { createWizard } from '../lib/wizard.svelte';
+import { createWizard, sameSet } from '../lib/wizard.svelte';
 import { assertPlainText } from './plainText';
 
 describe('wizard', () => {
@@ -25,6 +25,19 @@ describe('wizard', () => {
     expect(w.step).toBeNull();
     w.go('about');
     expect(w.step).toBeNull();
+  });
+
+  it('sameSetNeedsTheSamePhotos', () => {
+    const w = createWizard();
+    expect(sameSet(w, [])).toBe(false);
+    w.outcome = { sample: [1], representative: 1 };
+    w.outcomePhotos = [1, 2];
+    expect(sameSet(w, [1, 2])).toBe(true);
+    expect(sameSet(w, [1])).toBe(false);
+    expect(sameSet(w, [2, 1])).toBe(false);
+    expect(sameSet(w, [1, 3])).toBe(false);
+    w.restart();
+    expect(sameSet(w, [1, 2])).toBe(false);
   });
 
   it('backKeepsState', () => {

@@ -6,6 +6,8 @@ export type PhotoId = number;
 export interface UserError {
   message: string;
   details: string;
+  /** Files the app downloaded are missing: offer the download again. */
+  missingData?: boolean;
 }
 
 export interface AppStatus {
@@ -41,6 +43,9 @@ export type ProgressEvent =
   | { phase: 'preview'; fraction: number }
   | { phase: 'fellBackToProcessor'; reason: string };
 
+/** Why a photo cannot be used: it is no longer there, or it cannot be opened. */
+export type PhotoProblem = 'gone' | 'damaged';
+
 /** Width and height are the upright size. */
 export interface PhotoInfo {
   id: PhotoId;
@@ -48,6 +53,8 @@ export interface PhotoInfo {
   folder: string;
   width: number;
   height: number;
+  /** Set once reading the photo failed. */
+  problem?: PhotoProblem | null;
 }
 
 export interface Skipped {
@@ -83,7 +90,7 @@ export interface MatchSummary {
   total: number;
 }
 
-export type AreaStatus = 'found' | 'unsure' | 'notFound' | 'edited' | 'pending';
+export type AreaStatus = 'found' | 'unsure' | 'notFound' | 'edited' | 'pending' | 'unreadable';
 
 export interface PhotoState {
   id: PhotoId;

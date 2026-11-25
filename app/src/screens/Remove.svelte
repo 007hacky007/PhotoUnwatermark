@@ -40,6 +40,8 @@
   let phase: Phase = $state('checking');
   let unwritable: string[] = $state([]);
   let error: string | null = $state(null);
+  /** The run failed because files the app downloaded are missing: offer the download. */
+  let missingData = $state(false);
   let picking = $state(false);
 
   // The run.
@@ -173,7 +175,10 @@
     try {
       report = await remove(onEvent);
     } catch (e) {
-      if (!left) error = message(e, c.failed);
+      if (!left) {
+        error = message(e, c.failed);
+        missingData = (e as Partial<UserError> | null)?.missingData === true;
+      }
     } finally {
       running = false;
       asking = null;
@@ -269,6 +274,9 @@
       <p class="error" role="alert">{error}</p>
       <div class="buttons">
         <button type="button" onclick={() => wizard.back()}>{copy.common.back}</button>
+        {#if missingData}
+          <button type="button" class="primary" onclick={() => wizard.go('welcome')}>{copy.common.downloadAgain}</button>
+        {/if}
       </div>
     </div>
   {:else}

@@ -10,6 +10,7 @@ vi.mock('../lib/api', () => ({
   editSize: vi.fn(),
   getArea: vi.fn(),
   putDraft: vi.fn(),
+  dropDraft: vi.fn(),
   preview: vi.fn(),
   confirmSetArea: vi.fn(),
   openPhoto: vi.fn(),
@@ -285,6 +286,8 @@ describe('Check the watermark', () => {
     expect(onDone).toHaveBeenCalledWith(false);
     expect(putDraft).not.toHaveBeenCalled();
     expect(savePhotoArea).not.toHaveBeenCalled();
+    // An area sent for a preview is dropped too.
+    await waitFor(() => expect(vi.mocked(api.dropDraft)).toHaveBeenCalledWith(7));
   });
 
   it('noBannedWordsRendered', async () => {

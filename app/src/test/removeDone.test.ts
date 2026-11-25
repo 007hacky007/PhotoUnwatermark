@@ -260,7 +260,7 @@ describe('Remove', () => {
     await waitFor(() => expect(m.remove).toHaveBeenCalled());
     job.emit(removing(0, 3, 1, 0.2, null));
     await fireEvent.click(await screen.findByRole('button', { name: 'Stop' }));
-    const dialog = screen.getByRole('dialog', { name: 'Stop after discarding the current photo?' });
+    const dialog = screen.getByRole('dialog', { name: 'Stop now? The photo being worked on is left unfinished.' });
     expect(dialog.textContent).toContain('Finished photos are kept.');
     expect(m.cancelJob).not.toHaveBeenCalled();
     await fireEvent.click(screen.getByRole('button', { name: 'Keep going' }));
@@ -339,7 +339,7 @@ describe('Remove', () => {
     expect(m.cancelJob).toHaveBeenCalledTimes(1);
     await tick();
     expect(
-      screen.getByRole('progressbar', { name: 'Stopping... the app will close when the current photo is finished.' }),
+      screen.getByRole('progressbar', { name: 'Stopping... the app will close in a moment.' }),
     ).toBeTruthy();
     // The window closes only after the run has ended.
     expect(m.closeWindow).not.toHaveBeenCalled();
@@ -385,7 +385,7 @@ describe('Remove', () => {
     expect(closeHandler!()).toBe(true);
     await tick();
     const dialog = screen.getByRole('dialog', {
-      name: 'Stopping... the app will close when the current photo is finished.',
+      name: 'Stopping... the app will close in a moment.',
     });
     expect(within(dialog).queryByRole('button', { name: copy.remove.keepGoing })).toBeNull();
     expect(within(dialog).getAllByRole('button').map((b) => b.textContent?.trim())).toEqual([copy.remove.ok]);

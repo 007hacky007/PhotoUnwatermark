@@ -1,7 +1,7 @@
 // Which screen the app shows, and the way back. State the screens share lives here, so going
 // back never loses work.
 
-import type { DetectOutcome, RemoveReport } from './types';
+import type { DetectOutcome, PhotoId, RemoveReport } from './types';
 
 export type Screen =
   | 'welcome'
@@ -33,6 +33,8 @@ export class Wizard {
   busy = $state(false);
   /** The photos found in step 1, for the step-2 editor. */
   outcome: DetectOutcome | null = $state(null);
+  /** The photo list `outcome` was found on: with the same list, step 2 opens again as it was. */
+  outcomePhotos: PhotoId[] = [];
   /** How the last removal went, for step 5. */
   report: RemoveReport | null = $state(null);
   /** The result step 5 shows. */
@@ -64,12 +66,19 @@ export class Wizard {
   /** A new set: Add photos, with nothing from the last set and no way back to it. */
   restart(): void {
     this.outcome = null;
+    this.outcomePhotos = [];
     this.report = null;
     this.resultIndex = 0;
     this.watermarkSaved = false;
     this.#history = [];
     this.screen = 'add';
   }
+}
+
+/** True when `photos` is the list `wizard.outcome` was found on, in the same order. */
+export function sameSet(wizard: Wizard, photos: PhotoId[]): boolean {
+  const was = wizard.outcomePhotos;
+  return wizard.outcome !== null && was.length === photos.length && was.every((id, i) => id === photos[i]);
 }
 
 export function createWizard(): Wizard {

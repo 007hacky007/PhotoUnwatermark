@@ -273,6 +273,114 @@ describe('Add photos', () => {
     await screen.findByText(copy.addPhotos.drop);
   });
 
+  /** Adds photo 2 to photo 1 with the saved-watermark check left running. */
+  async function checkRunning() {
+    const view = await start([photo(1)]);
+    let answer: (v: { id: string; name: string } | null) => void = () => {};
+    suggestSaved.mockImplementationOnce(() => new Promise((r) => (answer = r)));
+    choosePhotos.mockResolvedValueOnce(['/a/2.jpg']);
+    addPaths.mockResolvedValueOnce({ added: [photo(2)], skipped: [] });
+    listPhotos.mockResolvedValue([photo(1), photo(2)]);
+    await fireEvent.click(screen.getByRole('button', { name: copy.addPhotos.choosePhotos }));
+    await screen.findByText(copy.addPhotos.checkingSaved);
+    return { ...view, answer: (v: { id: string; name: string } | null) => answer(v) };
+  }
+
+  it('savedCheckDoesNotBlockTheButtons', async () => {
+    const { container, answer } = await checkRunning();
+    for (const name of [copy.addPhotos.choosePhotos, copy.addPhotos.chooseFolder, copy.addPhotos.find]) {
+      expect((screen.getByRole('button', { name }) as HTMLButtonElement).disabled, name).toBe(false);
+    }
+    assertPlainText(container);
+    answer(null);
+    await waitFor(() => expect(screen.queryByText(copy.addPhotos.checkingSaved)).toBeNull());
+    expect(cancelJob).not.toHaveBeenCalled();
+  });
+
+  it('findStopsTheSavedCheck', async () => {
+    const job = openJob();
+    detect.mockImplementation(job.impl);
+    cancelJob.mockResolvedValue();
+    const { answer } = await checkRunning();
+    await fireEvent.click(screen.getByRole('button', { name: copy.addPhotos.find }));
+    await waitFor(() => expect(cancelJob).toHaveBeenCalledTimes(1));
+    expect(detect).toHaveBeenCalledTimes(1);
+    // A late answer of the stopped check offers nothing.
+    answer({ id: 's1', name: 'Studio' });
+    await screen.findByText(copy.loading.finder);
+    expect(screen.queryByText('These look like Studio. Use it?')).toBeNull();
+  });
+
+  it('addingStopsTheSavedCheck', async () => {
+    cancelJob.mockResolvedValue();
+    await checkRunning();
+    chooseFolder.mockResolvedValueOnce('/b');
+    addPaths.mockResolvedValueOnce({ added: [], skipped: [] });
+    await fireEvent.click(screen.getByRole('button', { name: copy.addPhotos.chooseFolder }));
+    await waitFor(() => expect(cancelJob).toHaveBeenCalledTimes(1));
+    await waitFor(() => expect(screen.queryByText(copy.addPhotos.checkingSaved)).toBeNull());
+  });
+
+  it('removeWaitsForAdding', async () => {
+    await start([photo(1), photo(2)]);
+    let added: (v: { added: PhotoInfo[]; skipped: [] }) => void = () => {};
+    addPaths.mockImplementationOnce(() => new Promise((r) => (added = r)));
+    choosePhotos.mockResolvedValueOnce(['/a/3.jpg']);
+    await fireEvent.click(screen.getByRole('button', { name: copy.addPhotos.choosePhotos }));
+    await waitFor(() => expect(addPaths).toHaveBeenCalled());
+    const x = screen.getByRole('button', { name: copy.addPhotos.remove('p1.jpg') }) as HTMLButtonElement;
+    expect(x.disabled).toBe(true);
+    await fireEvent.click(x);
+    expect(removePhoto).not.toHaveBeenCalled();
+    added({ added: [], skipped: [] });
+    await waitFor(() => expect(x.disabled).toBe(false));
+  });
+
+  it('sameListGoesBackToStepTwo', async () => {
+    const job = openJob();
+    detect.mockImplementation(job.impl);
+    const { wizard } = await start([photo(1), photo(2)]);
+    await fireEvent.click(screen.getByRole('button', { name: copy.addPhotos.find }));
+    job.finish();
+    await waitFor(() => expect(wizard.screen).toBe('check'));
+    wizard.back();
+    await screen.findByText(copy.addPhotos.drop);
+    await screen.findByAltText('p2.jpg');
+    // The same photos: straight back to step 2 with what was found, no new search.
+    await fireEvent.click(screen.getByRole('button', { name: copy.addPhotos.find }));
+    expect(wizard.screen).toBe('check');
+    expect(detect).toHaveBeenCalledTimes(1);
+    wizard.back();
+    await screen.findByText(copy.addPhotos.drop);
+    // A changed list looks again.
+    removePhoto.mockResolvedValueOnce();
+    await fireEvent.click(await screen.findByRole('button', { name: copy.addPhotos.remove('p2.jpg') }));
+    await waitFor(() => expect(screen.queryByAltText('p2.jpg')).toBeNull());
+    await fireEvent.click(screen.getByRole('button', { name: copy.addPhotos.find }));
+    expect(detect).toHaveBeenCalledTimes(2);
+  });
+
+  it('unreadablePhotoSaysWhy', async () => {
+    const { container } = await start([photo(1), photo(2)]);
+    const img = (await screen.findByAltText('p2.jpg')) as HTMLImageElement;
+    listPhotos.mockResolvedValue([photo(1), { ...photo(2), problem: 'damaged' }]);
+    await fireEvent.error(img);
+    expect(await screen.findByText(copy.photoProblem.damaged)).toBeTruthy();
+    expect(screen.queryByAltText('p2.jpg')).toBeNull();
+    // It can still be taken out of the list.
+    expect(screen.getByRole('button', { name: copy.addPhotos.remove('p2.jpg') })).toBeTruthy();
+    assertPlainText(container);
+  });
+
+  it('missingDataOffersTheDownload', async () => {
+    detect.mockRejectedValueOnce({ message: 'Some files are missing.', details: 'raw', missingData: true });
+    const { wizard } = await start([photo(1)]);
+    await fireEvent.click(screen.getByRole('button', { name: copy.addPhotos.find }));
+    await fireEvent.click(await screen.findByRole('button', { name: copy.common.downloadAgain }));
+    expect(wizard.screen).toBe('welcome');
+    expect(wizard.busy).toBe(false);
+  });
+
   it('noBannedWordsRendered', async () => {
     const { container } = await start([photo(1)]);
     assertPlainText(container);
