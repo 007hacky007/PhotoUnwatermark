@@ -10,6 +10,8 @@ pub struct DataDirs {
     pub root: PathBuf,
     pub models: PathBuf,
     pub watermarks: PathBuf,
+    /// Compiled-model cache, rebuilt on demand.
+    pub cache: PathBuf,
     /// The settings file.
     pub settings: PathBuf,
 }
@@ -32,13 +34,14 @@ impl DataDirs {
             root: root.to_path_buf(),
             models: root.join("models"),
             watermarks: root.join("watermarks"),
+            cache: root.join("cache"),
             settings: root.join("settings.json"),
         }
     }
 
     /// Create the folders that do not exist yet.
     pub fn ensure(&self) -> Result<()> {
-        for dir in [&self.root, &self.models, &self.watermarks] {
+        for dir in [&self.root, &self.models, &self.watermarks, &self.cache] {
             std::fs::create_dir_all(dir).map_err(Error::Io)?;
         }
         Ok(())
@@ -54,6 +57,7 @@ mod tests {
         let d = DataDirs::at(Path::new("/x"));
         assert_eq!(d.models, Path::new("/x/models"));
         assert_eq!(d.watermarks, Path::new("/x/watermarks"));
+        assert_eq!(d.cache, Path::new("/x/cache"));
         assert_eq!(d.settings, Path::new("/x/settings.json"));
     }
 
@@ -62,7 +66,7 @@ mod tests {
         let t = tempfile::tempdir().unwrap();
         let d = DataDirs::at(&t.path().join("data"));
         d.ensure().unwrap();
-        assert!(d.models.is_dir() && d.watermarks.is_dir());
+        assert!(d.models.is_dir() && d.watermarks.is_dir() && d.cache.is_dir());
         d.ensure().unwrap();
     }
 

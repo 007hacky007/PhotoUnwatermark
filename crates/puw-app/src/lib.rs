@@ -1,5 +1,6 @@
 //! App logic for PhotoUnwatermark, free of any UI toolkit.
 
+pub mod download;
 pub mod estimate;
 pub mod messages;
 pub mod paths;

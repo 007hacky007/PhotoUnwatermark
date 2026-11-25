@@ -1,10 +1,11 @@
 //! Plain-language error messages for the people using the app.
 
+use crate::download::DownloadError;
 use puw_core::Error;
 use serde::Serialize;
 use std::io::ErrorKind;
 
-/// Everything that can go wrong in the app. Download errors join in later.
+/// Everything that can go wrong in the app.
 #[derive(Debug, thiserror::Error)]
 pub enum AppError {
     #[error(transparent)]
@@ -17,6 +18,8 @@ pub enum AppError {
     NotReady,
     #[error("busy")]
     Busy,
+    #[error(transparent)]
+    Download(#[from] DownloadError),
 }
 
 /// What the interface shows: a short message and the raw text for "Show details".
@@ -49,8 +52,28 @@ pub fn user_message(err: &AppError) -> String {
             "The watermark remover is not ready yet. Please wait a moment and try again."
         }
         AppError::Busy => "The app is still working on your photos. Please wait until it finishes.",
+        AppError::Download(e) => return download_message(e),
     };
     text.to_string()
+}
+
+fn download_message(e: &DownloadError) -> String {
+    match e {
+        DownloadError::Network(_) => {
+            "The download was interrupted. Check the internet connection and try again."
+        }
+        DownloadError::Verify { .. } => {
+            "The downloaded file arrived damaged. Please try the download again."
+        }
+        DownloadError::Disk(_) => {
+            "The download could not be saved. Check that the disk has enough free space and try again."
+        }
+        DownloadError::Cancelled => "Download stopped. It will carry on where it left off next time.",
+        DownloadError::BadName(_) => {
+            "The download list is not valid. Please install the latest version of the app."
+        }
+    }
+    .to_string()
 }
 
 fn core_message(e: &Error) -> String {
@@ -109,6 +132,11 @@ mod tests {
             AppError::NothingToRemove,
             AppError::NotReady,
             AppError::Busy,
+            DownloadError::Network("x".into()).into(),
+            DownloadError::Verify { name: "x".into() }.into(),
+            DownloadError::Disk("x".into()).into(),
+            DownloadError::Cancelled.into(),
+            DownloadError::BadName("x".into()).into(),
         ]);
         v
     }
@@ -154,6 +182,17 @@ mod tests {
             m(Error::Model("x".into())),
             "The watermark remover could not run on this photo."
         );
+    }
+
+    #[test]
+    fn download_messages_are_specific() {
+        let m = |e: DownloadError| user_message(&e.into());
+        assert_eq!(
+            m(DownloadError::Network("dns".into())),
+            "The download was interrupted. Check the internet connection and try again."
+        );
+        assert!(m(DownloadError::Disk("x".into())).contains("free space"));
+        assert!(m(DownloadError::Cancelled).contains("stopped"));
     }
 
     #[test]
