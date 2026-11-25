@@ -14,6 +14,7 @@ use std::time::Instant;
 
 use clap::{Args, Parser, Subcommand};
 use image::RgbImage;
+use puw_core::MatchBasis;
 use puw_core::detect::predict_prob;
 use puw_core::image_io::upright_size;
 use puw_core::mask;
@@ -22,7 +23,7 @@ use puw_core::template::{FOUND, UNSURE};
 use puw_core::{
     Engine, EngineOptions, Guess, GuessOptions, LoadedPhoto, Mask, MatchStatus, ModelKind,
     ModelPaths, Progress, SetLayers, WORK_LONG_SIDE, build_set_layers, build_template, find,
-    guess_photo, load, pick_representative, remove_one, representative_sample,
+    guess_photo, load, match_photo, pick_representative, remove_one, representative_sample,
 };
 
 type BoxResult<T> = Result<T, Box<dyn std::error::Error>>;
@@ -964,6 +965,9 @@ fn sweep_real(synthetic: Vec<(String, RgbImage)>, all_refs: bool) -> BoxResult<(
                 };
                 let (mut pos, mut real_neg, mut synth_neg) = (Vec::new(), Vec::new(), Vec::new());
                 let mut secs = Vec::new();
+                // Photos where `match_photo` (the set position prior) gives Found, and how many
+                // of those rest on the prior.
+                let (mut prior_pos, mut prior_pos_set, mut prior_neg) = (0, 0, 0);
                 for &r in &refs {
                     let mut tmpl = build_template(&set[r].rgb, &layer);
                     let pieces: Vec<String> = tmpl
@@ -1003,6 +1007,9 @@ fn sweep_real(synthetic: Vec<(String, RgbImage)>, all_refs: bool) -> BoxResult<(
                             m.confidence,
                             iou.map_or("-".into(), |v| format!("{v:.3}"))
                         );
+                        let pm = match_photo(&tmpl, &p.rgb, &set_layers);
+                        prior_pos += (pm.status == MatchStatus::Found) as usize;
+                        prior_pos_set += (pm.basis == MatchBasis::SetPosition) as usize;
                         pos.push(Case::of(&m, iou));
                     }
                     for (j, other) in photos.iter().enumerate().filter(|(j, _)| *j != k) {
@@ -1015,6 +1022,8 @@ fn sweep_real(synthetic: Vec<(String, RgbImage)>, all_refs: bool) -> BoxResult<(
                                 m.status,
                                 m.confidence
                             );
+                            let pm = match_photo(&tmpl, &p.rgb, &set_layers);
+                            prior_neg += (pm.status == MatchStatus::Found) as usize;
                             real_neg.push(Case::of(&m, None));
                         }
                     }
@@ -1028,6 +1037,18 @@ fn sweep_real(synthetic: Vec<(String, RgbImage)>, all_refs: bool) -> BoxResult<(
                     refs.len()
                 );
                 println!("find time s: {}", summary(&secs, 2));
+                println!(
+                    "  find Found {} / match_photo Found {} ({} on the set position) of {} \
+                     positives; match_photo Found {} of {} other-set negatives",
+                    pos.iter()
+                        .filter(|c| c.status == MatchStatus::Found)
+                        .count(),
+                    prior_pos,
+                    prior_pos_set,
+                    pos.len(),
+                    prior_neg,
+                    real_neg.len()
+                );
                 report_sweep(
                     &format!("{label}: other real sets as negatives"),
                     &pos,

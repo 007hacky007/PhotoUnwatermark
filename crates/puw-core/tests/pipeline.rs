@@ -12,9 +12,11 @@ use puw_core::batch::{BATCH_HIGH, BATCH_LOW, batch_lines, filter_layer, median_g
 use puw_core::detect::{GuessOptions, guess_single};
 use puw_core::faces::{detect_faces_near, drop_eye_components, guard};
 use puw_core::mask::{self, Mask, is_empty};
+use puw_core::template::MatchBasis;
 use puw_core::{
-    Engine, Error, LoadedPhoto, ModelPaths, Progress, build_set_layers, guess_photo, load,
-    output_dir_for, pick_representative, remove_one, representative_sample,
+    Engine, Error, LoadedPhoto, MatchStatus, ModelPaths, Progress, SetLayers, build_set_layers,
+    build_template, find, guess_photo, load, match_photo, output_dir_for, pick_representative,
+    remove_one, representative_sample,
 };
 
 fn engine() -> Option<&'static Engine> {
@@ -443,4 +445,119 @@ fn remove_one_never_touches_original() {
         .into();
     assert_eq!(names_in(dir.path()), want);
     assert_ne!(file_hash(&second), hash);
+}
+
+const FIXED_ALPHA: f32 = 0.25;
+
+/// The fixed set re-blended at `alpha` (the stored photos carry the mark at 0.25): the faint
+/// photos, their ground-truth masks and the photos written as PNGs into `dir`.
+fn faint_fixed(alpha: f32, dir: &Path) -> (Vec<RgbImage>, Vec<Mask>, Vec<PathBuf>) {
+    let set = common::synth_dir().join("fixed");
+    let (mut photos, mut gts, mut paths) = (Vec::new(), Vec::new(), Vec::new());
+    for i in 0..8 {
+        let clean = open_rgb(&set.join("clean").join(format!("0{i}.png")));
+        let mut marked = open_rgb(&set.join("marked").join(format!("0{i}.png")));
+        for (m, c) in marked.pixels_mut().zip(clean.pixels()) {
+            for ch in 0..3 {
+                let d = m.0[ch] as f32 - c.0[ch] as f32;
+                m.0[ch] = (c.0[ch] as f32 + d * alpha / FIXED_ALPHA).round() as u8;
+            }
+        }
+        let path = dir.join(format!("f{i}.png"));
+        marked.save(&path).expect("save");
+        photos.push(marked);
+        gts.push(open_mask(&set.join("mask").join(format!("0{i}.png"))));
+        paths.push(path);
+    }
+    (photos, gts, paths)
+}
+
+fn no_progress_layers(paths: &[PathBuf]) -> SetLayers {
+    build_set_layers(paths, &Progress::none()).expect("layers")
+}
+
+#[test]
+fn prior_finds_faint_fixed_mark() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let (photos, gts, paths) = faint_fixed(0.12, dir.path());
+    let layers = no_progress_layers(&paths);
+    assert!(layers.get(1536, 1024).is_some(), "the set has a layer");
+    let tmpl = build_template(&photos[0], &gts[0]);
+    let free: Vec<MatchStatus> = photos.iter().map(|p| find(&tmpl, p).status).collect();
+    assert!(
+        free.iter().any(|&s| s != MatchStatus::Found),
+        "premise: free search misses at least one photo, got {free:?}"
+    );
+    for (i, p) in photos.iter().enumerate() {
+        let m = match_photo(&tmpl, p, &layers);
+        assert_eq!(m.status, MatchStatus::Found, "photo {i}");
+        let q = iou(&m.mask, &gts[i]);
+        assert!(q >= 0.8, "photo {i}: iou {q:.3}");
+    }
+}
+
+#[test]
+fn prior_ignored_without_support() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let (photos, gts, _) = faint_fixed(0.12, dir.path());
+    // Another set whose strong mark sits 400 px higher than the template's.
+    let set = common::synth_dir().join("fixed");
+    let moved_dir = tempfile::tempdir().expect("tempdir");
+    let mut moved = Vec::new();
+    for i in 0..4 {
+        let clean = open_rgb(&set.join("clean").join(format!("0{i}.png")));
+        let marked = open_rgb(&set.join("marked").join(format!("0{i}.png")));
+        let mut out = clean.clone();
+        let (w, h) = clean.dimensions();
+        for y in 400..h {
+            for x in 0..w {
+                let (m, c) = (marked.get_pixel(x, y), clean.get_pixel(x, y));
+                if m != c {
+                    out.put_pixel(x, y - 400, *m);
+                }
+            }
+        }
+        let path = moved_dir.path().join(format!("m{i}.png"));
+        out.save(&path).expect("save");
+        moved.push(path);
+    }
+    let elsewhere = no_progress_layers(&moved);
+    assert!(
+        elsewhere.get(1536, 1024).is_some(),
+        "the other layer exists"
+    );
+    let tmpl = build_template(&photos[0], &gts[0]);
+    for p in &photos {
+        let (a, b) = (find(&tmpl, p), match_photo(&tmpl, p, &elsewhere));
+        assert_eq!((a.status, a.confidence), (b.status, b.confidence));
+        assert_eq!(a.mask, b.mask);
+        assert_eq!(b.basis, MatchBasis::Search);
+    }
+}
+
+#[test]
+fn prior_ignored_for_other_size() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let (photos, gts, paths) = faint_fixed(0.12, dir.path());
+    let layers = no_progress_layers(&paths);
+    let tmpl = build_template(&photos[0], &gts[0]);
+    let small = imageops::resize(&photos[1], 1200, 800, imageops::FilterType::Triangle);
+    let m = match_photo(&tmpl, &small, &layers);
+    assert_eq!(m.basis, MatchBasis::Search);
+}
+
+#[test]
+fn negatives_stay_not_found() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let (photos, gts, _) = faint_fixed(0.12, dir.path());
+    let tmpl = build_template(&photos[0], &gts[0]);
+    let layers = SetLayers::none();
+    let neg = common::synth_dir().join("negative/marked");
+    for e in fs::read_dir(neg).expect("read dir") {
+        let img = open_rgb(&e.expect("entry").path());
+        let img = imageops::resize(&img, 1536, 1024, imageops::FilterType::Triangle);
+        let m = match_photo(&tmpl, &img, &layers);
+        assert_ne!(m.status, MatchStatus::Found);
+        assert_eq!(m.basis, MatchBasis::Search);
+    }
 }

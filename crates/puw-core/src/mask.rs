@@ -82,6 +82,14 @@ pub fn dilate(m: &Mask, radius: u32) -> Mask {
     GrayImage::from_raw(w, h, out).expect("buffer size matches dimensions")
 }
 
+/// Copy of `m` with every non-zero pixel set to 255.
+pub fn binarize(m: &Mask) -> Mask {
+    let mut out = m.clone();
+    out.pixels_mut()
+        .for_each(|p| p.0[0] = if p.0[0] != 0 { 255 } else { 0 });
+    out
+}
+
 /// Pixel-wise maximum. Both masks must have the same size; the result has the
 /// size of `a` (checked with `debug_assert_eq!`).
 pub fn union(a: &Mask, b: &Mask) -> Mask {
@@ -291,6 +299,12 @@ pub fn group_near(comps: &[Component], near: f32) -> Vec<Vec<usize>> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn binarize_any_nonzero() {
+        let m = GrayImage::from_raw(5, 1, vec![0, 1, 127, 128, 255]).unwrap();
+        assert_eq!(binarize(&m).into_raw(), vec![0, 255, 255, 255, 255]);
+    }
 
     fn blank(w: u32, h: u32) -> Mask {
         GrayImage::new(w, h)

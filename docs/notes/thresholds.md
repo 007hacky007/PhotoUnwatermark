@@ -253,3 +253,18 @@ Set 2 (1 photo) has no batch layer; its guess stays at 6.40 %.
 Synthetic: the stored layer of the fixed set covers 99.8 % of the mark (coverage 1.90 %), and a
 layer made of the fixed mark plus a full-width and a full-height 1 px line keeps all of the mark
 and none of the lines.
+
+## Position prior (`match_photo`)
+
+`match_photo` calls `find`; when that is not `Found`, the photo has the template's size and the
+set has a batch layer for it, the saved placement counts as `Found` if at least 50 % of its
+pixels lie inside the layer grown by `grow_for(w, h, 0.004)`. The confidence stays `find`'s.
+
+Synthetic: the fixed set re-blended at alpha 0.12 (stored photos carry 0.25) leaves free search
+below `Found` on at least one photo; with the prior all 8 are `Found` at IoU >= 0.8. Negative
+photos resized to the template size with no layer never reach `Found`.
+
+Real set-a (7 photos besides the reference, `puw-dev match-sweep --real`, template built from
+the batch layer, so the layer supports its own placement by construction): `find` Found 0 / 7
+(4 Unsure, 3 NotFound); `match_photo` Found 7 / 7, all on the set position. The one photo of
+the other real set (different size) stays not `Found` (the prior does not apply).

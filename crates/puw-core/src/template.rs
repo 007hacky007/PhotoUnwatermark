@@ -89,6 +89,16 @@ pub enum MatchStatus {
     NotFound,
 }
 
+/// Where a [`MatchResult`]'s placement came from.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MatchBasis {
+    /// Found by [`find`]'s template search.
+    Search,
+    /// The template's saved position, trusted because the set's batch layer supports it (see
+    /// `pipeline::match_photo`).
+    SetPosition,
+}
+
 #[derive(Debug, Clone)]
 pub struct MatchResult {
     pub status: MatchStatus,
@@ -98,6 +108,7 @@ pub struct MatchResult {
     /// Image-size mask with the piece shapes at the found placement(s); empty (all 0) for
     /// [`MatchStatus::NotFound`].
     pub mask: Mask,
+    pub basis: MatchBasis,
 }
 
 /// Learn the watermark under `mask` (non-zero = mark) in `img`.
@@ -198,6 +209,7 @@ pub fn find(t: &WatermarkTemplate, img: &RgbImage) -> MatchResult {
         status: MatchStatus::NotFound,
         confidence,
         mask: GrayImage::new(w, h),
+        basis: MatchBasis::Search,
     };
     if w == 0 || h == 0 || t.ref_w == 0 || t.ref_h == 0 || t.pieces.is_empty() {
         return not_found(0.0);
@@ -245,13 +257,42 @@ pub fn find(t: &WatermarkTemplate, img: &RgbImage) -> MatchResult {
     };
     let mut out = GrayImage::new(w, h);
     for (i, p) in &best.places {
-        paste(&mut out, &pieces[*i], p, &target);
+        paste(
+            &mut out,
+            &pieces[*i],
+            p,
+            (target.nw, target.nh),
+            (target.w, target.h),
+        );
     }
     MatchResult {
         status,
         confidence,
         mask: out,
+        basis: MatchBasis::Search,
     }
+}
+
+/// The template's pieces drawn at their saved position and scale 1 into a `t.ref_w` x `t.ref_h`
+/// mask. `None` for a damaged template.
+pub(crate) fn saved_placement(t: &WatermarkTemplate) -> Option<Mask> {
+    let (w, h) = (t.ref_w, t.ref_h);
+    if w == 0 || h == 0 || t.pieces.is_empty() {
+        return None;
+    }
+    let (ww, wh) = ref_dims(w, h);
+    let mut out = GrayImage::new(w, h);
+    for p in &t.pieces {
+        let p = Prepared::new(p, w, h)?;
+        let pl = Placement {
+            k: 1.0,
+            x: p.ox,
+            y: p.oy,
+            score: 1.0,
+        };
+        paste(&mut out, &p, &pl, (w, h), (ww, wh));
+    }
+    Some(out)
 }
 
 /// Size of an image of native size `w` x `h` in the reference space (long side 1536).
@@ -806,12 +847,15 @@ fn refine(target: &Target, tm: &Tmpl, start: Placement, claimed: &[[f32; 4]]) ->
 }
 
 /// Paste piece `p`'s shape for an edge-crop placement `pl` into the image-size mask `out`.
-fn paste(out: &mut Mask, p: &Prepared, pl: &Placement, target: &Target) {
+fn paste(
+    out: &mut Mask,
+    p: &Prepared,
+    pl: &Placement,
+    (nw, nh): (u32, u32),
+    (tw, th): (usize, usize),
+) {
     // k-space -> target reference space (x k) -> native (x native / reference size).
-    let (fx, fy) = (
-        pl.k * target.nw as f32 / target.w as f32,
-        pl.k * target.nh as f32 / target.h as f32,
-    );
+    let (fx, fy) = (pl.k * nw as f32 / tw as f32, pl.k * nh as f32 / th as f32);
     let x = ((pl.x as f32 + p.ox_f - p.ox as f32) * fx).round() as i64;
     let y = ((pl.y as f32 + p.oy_f - p.oy as f32) * fy).round() as i64;
     let w = (p.shape.width() as f32 * p.s_ref * fx).round().max(1.0) as u32;

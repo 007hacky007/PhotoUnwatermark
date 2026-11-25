@@ -38,7 +38,11 @@ use crate::faces::{Face, detect_faces_near, drop_eye_components, guard};
 use crate::image_io::{LoadedPhoto, load, save_result, upright_size};
 use crate::inpaint::{Progress, inpaint};
 use crate::mask::{self, Mask, is_empty};
+use crate::template::{
+    MatchBasis, MatchResult, MatchStatus, WatermarkTemplate, find, saved_placement,
+};
 use crate::{Error, Result};
+use image::RgbImage;
 
 /// Photos of one size needed before the batch layer is computed for them.
 pub const MIN_BATCH_PHOTOS: usize = 3;
@@ -232,6 +236,49 @@ pub fn build_set_layers(paths: &[PathBuf], progress: &Progress) -> Result<SetLay
     }
     (progress.on_fraction)(1.0);
     Ok(SetLayers { layers })
+}
+
+/// Share of the saved placement's pixels that must lie in the grown batch layer.
+const PRIOR_SUPPORT: f64 = 0.5;
+/// Growth of the batch layer for the support check, as a fraction of the long side.
+const PRIOR_GROW: f32 = 0.004;
+
+/// [`find`] with a position prior for marks stamped at the same place on every photo.
+///
+/// When `find` does not return `Found`, `img` has exactly the template's reference size and
+/// `layers` has a layer for that size, the template's pieces are placed at their saved
+/// position and scale 1. If at least half of those pixels lie inside the layer grown by
+/// [`mask::grow_for`] (0.004), the result is `Found` with that placement, `find`'s confidence
+/// and [`MatchBasis::SetPosition`]. In every other case the `find` result is returned as is.
+pub fn match_photo(t: &WatermarkTemplate, img: &RgbImage, layers: &SetLayers) -> MatchResult {
+    let found = find(t, img);
+    let (w, h) = img.dimensions();
+    if found.status == MatchStatus::Found || (w, h) != (t.ref_w, t.ref_h) {
+        return found;
+    }
+    let Some(layer) = layers.get(w, h) else {
+        return found;
+    };
+    let Some(placed) = saved_placement(t) else {
+        return found;
+    };
+    let grown = mask::dilate(layer, mask::grow_for(w, h, PRIOR_GROW));
+    let (mut total, mut inside) = (0u64, 0u64);
+    for (p, g) in placed.pixels().zip(grown.pixels()) {
+        if p.0[0] != 0 {
+            total += 1;
+            inside += (g.0[0] != 0) as u64;
+        }
+    }
+    if total == 0 || (inside as f64) < PRIOR_SUPPORT * total as f64 {
+        return found;
+    }
+    MatchResult {
+        status: MatchStatus::Found,
+        confidence: found.confidence,
+        mask: mask::binarize(&placed),
+        basis: MatchBasis::SetPosition,
+    }
 }
 
 /// Automatic first guess for one photo.
