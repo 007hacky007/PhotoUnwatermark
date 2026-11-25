@@ -111,6 +111,20 @@ fn scan_skips_output_folder() {
     assert!(r.added.is_empty() && r.skipped.is_empty());
     assert!(list.infos().is_empty());
 
+    let nested = out.join("x");
+    fs::create_dir(&nested).unwrap();
+    write_jpeg(&nested.join("a.jpg"), &plain(10, 10), None);
+    let r = list.add_paths(&[nested.join("a.jpg"), nested.clone()], OUT);
+    assert!(r.added.is_empty() && r.skipped.is_empty());
+
+    #[cfg(unix)]
+    {
+        let link = dir.path().join("link");
+        std::os::unix::fs::symlink(&out, &link).unwrap();
+        let r = list.add_paths(&[link], OUT);
+        assert!(r.added.is_empty() && r.skipped.is_empty());
+    }
+
     if cfg!(any(target_os = "macos", windows)) {
         let r = list.add_paths(&[out.join("done.jpg")], "WITHOUT WATERMARK");
         assert!(r.added.is_empty());

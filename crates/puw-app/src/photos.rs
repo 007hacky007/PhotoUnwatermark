@@ -65,10 +65,7 @@ fn file_name(p: &Path) -> String {
         .unwrap_or_else(|| p.to_string_lossy().into_owned())
 }
 
-fn is_output_dir(p: &Path, output_folder_name: &str) -> bool {
-    let Some(name) = p.file_name().map(|n| n.to_string_lossy()) else {
-        return false;
-    };
+fn same_name(name: &str, output_folder_name: &str) -> bool {
     if cfg!(any(target_os = "macos", windows)) {
         name.to_lowercase() == output_folder_name.to_lowercase()
     } else {
@@ -76,9 +73,16 @@ fn is_output_dir(p: &Path, output_folder_name: &str) -> bool {
     }
 }
 
-fn in_output_dir(p: &Path, output_folder_name: &str) -> bool {
-    p.parent()
-        .is_some_and(|d| is_output_dir(d, output_folder_name))
+/// True when the path, or any folder above it, is the output folder. Meant for canonical paths.
+fn inside_output(p: &Path, output_folder_name: &str) -> bool {
+    p.components().any(|c| match c {
+        std::path::Component::Normal(n) => same_name(&n.to_string_lossy(), output_folder_name),
+        _ => false,
+    })
+}
+
+fn real_inside_output(p: &Path, output_folder_name: &str) -> bool {
+    fs::canonicalize(p).is_ok_and(|r| inside_output(&r, output_folder_name))
 }
 
 impl PhotoList {
@@ -89,7 +93,7 @@ impl PhotoList {
         let mut candidates: Vec<PathBuf> = Vec::new();
         for p in paths {
             if p.is_dir() {
-                if is_output_dir(p, output_folder_name) {
+                if real_inside_output(p, output_folder_name) {
                     continue;
                 }
                 let Ok(rd) = fs::read_dir(p) else {
@@ -106,7 +110,7 @@ impl PhotoList {
                     .collect();
                 files.sort();
                 candidates.extend(files);
-            } else if in_output_dir(p, output_folder_name) {
+            } else if real_inside_output(p, output_folder_name) {
                 continue;
             } else if !has_supported_extension(p) {
                 result.skipped.push(Skipped {
@@ -128,6 +132,9 @@ impl PhotoList {
         for c in candidates {
             match fs::canonicalize(&c) {
                 Ok(real) => {
+                    if inside_output(&real, output_folder_name) {
+                        continue;
+                    }
                     if seen.insert(real.clone()) {
                         fresh.push(real);
                     }
