@@ -1,4 +1,5 @@
-//! The session: detection, the saved-watermark shortcut and the step-2 watermark area.
+//! The session: detection, the saved-watermark shortcut, the step-2 watermark area and
+//! finding it in every photo (step 3).
 //!
 //! Tests that need models read them from `PUW_MODELS_DIR` and return early with a message when
 //! it is not set. They run the models as the app ships them (Core ML on Macs, the processor
@@ -9,13 +10,14 @@ mod common;
 
 use std::path::{Path, PathBuf};
 use std::sync::mpsc;
-use std::sync::{Mutex, MutexGuard, PoisonError};
+use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 use std::time::{Duration, Instant};
 
 use image::{GrayImage, Rgb, RgbImage};
-use puw_app::images::jpeg;
+use puw_app::images::{GRID_LONG_SIDE, jpeg, thumbnail};
 use puw_app::{
-    AppCore, AppError, DataDirs, LoadPurpose, ProgressEvent, Settings, Suggestion, user_message,
+    AppCore, AppError, AreaStatus, DataDirs, LoadPurpose, MatchSummary, PhotoState, ProgressEvent,
+    Settings, Suggestion, user_message,
 };
 use puw_core::{Library, MatchStatus, ModelKind, SavedWatermark, build_template, find};
 
@@ -234,6 +236,7 @@ fn second_job_is_busy() {
         assert!(matches!(core.remove_photo(0), Err(AppError::Busy)));
         assert!(matches!(core.clear_photos(), Err(AppError::Busy)));
         assert!(matches!(core.confirm_set_area(0), Err(AppError::Busy)));
+        assert!(matches!(core.match_all(&noop), Err(AppError::Busy)));
         first.join().unwrap().unwrap();
     });
     // The slot is free again once the job is done.
@@ -575,4 +578,466 @@ fn detect_leaves_out_unreadable_photo() {
     let out = f.core.detect(&noop).unwrap();
     assert_eq!(out.sample, vec![1, 6]);
     assert!(out.sample.contains(&out.representative));
+}
+
+// ---- Step 3: finding the set's watermark in every photo ----
+
+fn synth(set: &str) -> PathBuf {
+    common::synth_dir().join(set)
+}
+
+/// Adds the marked photos `names` of synthetic set `set`; returns their ids in the same order.
+fn add_synth(core: &AppCore, set: &str, names: &[&str]) -> Vec<u32> {
+    let paths: Vec<PathBuf> = names
+        .iter()
+        .map(|n| synth(set).join("marked").join(format!("{n}.png")))
+        .collect();
+    let added = core.add_paths(&paths).unwrap();
+    assert_eq!(added.added.len(), names.len(), "{:?}", added.skipped);
+    added.added.iter().map(|p| p.id).collect()
+}
+
+fn synth_names(set: &str) -> Vec<String> {
+    let mut v: Vec<String> = std::fs::read_dir(synth(set).join("marked"))
+        .unwrap()
+        .map(|e| e.unwrap().path())
+        .filter(|p| p.extension().is_some_and(|e| e == "png"))
+        .map(|p| p.file_stem().unwrap().to_string_lossy().into_owned())
+        .collect();
+    v.sort();
+    v
+}
+
+fn synth_truth(set: &str, name: &str) -> GrayImage {
+    image::open(synth(set).join("mask").join(format!("{name}.png")))
+        .unwrap()
+        .to_luma8()
+}
+
+/// Confirms the ground truth of `name` (photo `id`) as the set area. Synthetic photos are
+/// below the edit size, so the edit size is the photo size.
+fn confirm_truth(core: &AppCore, set: &str, name: &str, id: u32) {
+    let gt = synth_truth(set, name);
+    core.put_draft(id, gt.width(), gt.height(), gt.into_raw())
+        .unwrap();
+    core.confirm_set_area(id).unwrap();
+}
+
+/// Marks that change the luma under their ground truth by less than this on average are
+/// invisible (the same rule as puw-core's `random_set` test; only `random/02` is below it).
+const MIN_VISIBLE: f32 = 10.0;
+
+fn visibility(set: &str, name: &str) -> f32 {
+    let open = |sub: &str| {
+        image::open(synth(set).join(sub).join(format!("{name}.png")))
+            .unwrap()
+            .to_rgb8()
+    };
+    let (m, c, g) = (open("marked"), open("clean"), synth_truth(set, name));
+    let luma = |p: &Rgb<u8>| 0.299 * p.0[0] as f32 + 0.587 * p.0[1] as f32 + 0.114 * p.0[2] as f32;
+    let (mut sum, mut n) = (0f32, 0f32);
+    for ((a, b), q) in m.pixels().zip(c.pixels()).zip(g.pixels()) {
+        if q.0[0] != 0 {
+            sum += (luma(a) - luma(b)).abs();
+            n += 1.0;
+        }
+    }
+    sum / n.max(1.0)
+}
+
+fn iou(truth: &GrayImage, area: &[u8]) -> f64 {
+    assert_eq!(truth.as_raw().len(), area.len());
+    let (mut inter, mut uni) = (0u64, 0u64);
+    for (t, a) in truth.as_raw().iter().zip(area) {
+        let (t, a) = (*t != 0, *a != 0);
+        inter += (t && a) as u64;
+        uni += (t || a) as u64;
+    }
+    if uni == 0 {
+        0.0
+    } else {
+        inter as f64 / uni as f64
+    }
+}
+
+fn state(core: &AppCore, id: u32) -> PhotoState {
+    core.photo_states()
+        .into_iter()
+        .find(|s| s.id == id)
+        .expect("photo in the states")
+}
+
+fn matching(events: &[ProgressEvent]) -> Vec<(u32, u32)> {
+    events
+        .iter()
+        .filter_map(|e| match e {
+            ProgressEvent::Matching { done, total } => Some((*done, *total)),
+            _ => None,
+        })
+        .collect()
+}
+
+/// An edit-size area (row-major, 0/255) with the rectangle `x0..x1` x `y0..y1` painted.
+fn rect_area(w: u32, h: u32, x0: u32, y0: u32, x1: u32, y1: u32) -> Vec<u8> {
+    let mut v = vec![0u8; (w * h) as usize];
+    for y in y0..y1 {
+        v[(y * w + x0) as usize..(y * w + x1) as usize].fill(255);
+    }
+    v
+}
+
+#[test]
+fn match_random_set() {
+    let f = fixture(None);
+    let names = synth_names("random");
+    assert_eq!(names.len(), 12);
+    let refs: Vec<&str> = names.iter().map(String::as_str).collect();
+    let ids = add_synth(&f.core, "random", &refs);
+    confirm_truth(&f.core, "random", &names[0], ids[0]);
+    let negatives = synth_names("negative");
+    let refs: Vec<&str> = negatives.iter().map(String::as_str).collect();
+    let neg_ids = add_synth(&f.core, "negative", &refs);
+    assert_eq!(state(&f.core, neg_ids[0]).status, AreaStatus::Pending);
+
+    let rec = Recorder::default();
+    let t = Instant::now();
+    let summary = f.core.match_all(&|e| rec.push(e)).unwrap();
+    eprintln!("match_all of 17 photos took {:.2?}", t.elapsed());
+
+    let m = matching(&rec.events());
+    assert_eq!(m.first(), Some(&(0, 17)), "{m:?}");
+    assert_eq!(m.last(), Some(&(17, 17)), "{m:?}");
+    assert!(m.windows(2).all(|p| p[0].0 + 1 == p[1].0), "{m:?}");
+
+    // The confirmed photo is found with its confirmed area.
+    let s0 = state(&f.core, ids[0]);
+    assert_eq!(s0.status, AreaStatus::Found);
+    assert!(s0.included && s0.has_area);
+
+    let (mut visible, mut found) = (0, 0);
+    for (name, &id) in names.iter().zip(&ids).skip(1) {
+        let s = state(&f.core, id);
+        let v = iou(&synth_truth("random", name), &f.core.area(id).unwrap());
+        eprintln!("random {name}: {:?} iou {v:.3}", s.status);
+        if s.status == AreaStatus::Found {
+            assert!(v >= 0.6, "{name}: found in the wrong place, iou {v:.3}");
+        }
+        if visibility("random", name) >= MIN_VISIBLE {
+            visible += 1;
+            found += (s.status == AreaStatus::Found) as u32;
+        }
+    }
+    assert!(visible >= 10, "only {visible} visible");
+    assert!(found * 100 >= visible * 95, "found {found} of {visible}");
+    for &id in &neg_ids {
+        assert_ne!(
+            state(&f.core, id).status,
+            AreaStatus::Found,
+            "negative {id}"
+        );
+    }
+
+    let states = f.core.photo_states();
+    let count = |st: AreaStatus| states.iter().filter(|s| s.status == st).count() as u32;
+    assert_eq!(
+        summary,
+        MatchSummary {
+            found: count(AreaStatus::Found),
+            unsure: count(AreaStatus::Unsure),
+            not_found: count(AreaStatus::NotFound),
+            total: 18,
+        }
+    );
+    assert_eq!(count(AreaStatus::Pending), 0);
+
+    // Every photo has a result now: running it again matches nothing.
+    let rec = Recorder::default();
+    f.core.match_all(&|e| rec.push(e)).unwrap();
+    assert_eq!(matching(&rec.events()), vec![(0, 0)]);
+}
+
+#[test]
+fn match_needs_confirmed_area() {
+    let f = fixture(None);
+    add_synth(&f.core, "random", &["00"]);
+    assert!(matches!(
+        f.core.match_all(&noop),
+        Err(AppError::NothingToRemove)
+    ));
+}
+
+#[test]
+fn unsure_blocks_until_opened_or_unticked() {
+    let f = fixture(None);
+    // With the set area from random/05, random/10 scores 0.432: unsure
+    // (docs/notes/thresholds.md).
+    let ids = add_synth(&f.core, "random", &["05", "10"]);
+    let (five, ten) = (ids[0], ids[1]);
+    confirm_truth(&f.core, "random", "05", five);
+    f.core.match_all(&noop).unwrap();
+
+    let s = state(&f.core, ten);
+    assert_eq!(s.status, AreaStatus::Unsure);
+    assert!(s.included && !s.reviewed && s.has_area, "{s:?}");
+    assert_eq!(f.core.removal_blockers(), vec![ten]);
+    assert_eq!(f.core.to_remove(), vec![five, ten]);
+
+    // Opening it in the editor is enough.
+    f.core.open_photo(ten).unwrap();
+    assert!(state(&f.core, ten).reviewed);
+    assert!(f.core.removal_blockers().is_empty());
+    assert_eq!(f.core.to_remove(), vec![five, ten]);
+
+    // Confirming the set area again starts over: the photo needs a look again.
+    f.core.confirm_set_area(five).unwrap();
+    assert_eq!(state(&f.core, ten).status, AreaStatus::Pending);
+    f.core.match_all(&noop).unwrap();
+    let s = state(&f.core, ten);
+    assert_eq!(s.status, AreaStatus::Unsure);
+    assert!(!s.reviewed);
+    assert_eq!(f.core.removal_blockers(), vec![ten]);
+
+    // Unticking it is the other way.
+    f.core.set_included(ten, false).unwrap();
+    assert!(f.core.removal_blockers().is_empty());
+    assert_eq!(f.core.to_remove(), vec![five]);
+    assert!(f.core.open_photo(99).is_err());
+}
+
+#[test]
+fn not_found_unticked_by_default() {
+    let f = fixture(None);
+    let ids = add_synth(&f.core, "random", &["00"]);
+    let neg = add_synth(&f.core, "negative", &["00"])[0];
+    confirm_truth(&f.core, "random", "00", ids[0]);
+    let summary = f.core.match_all(&noop).unwrap();
+    assert_eq!(
+        summary,
+        MatchSummary {
+            found: 1,
+            unsure: 0,
+            not_found: 1,
+            total: 2
+        }
+    );
+    let s = state(&f.core, neg);
+    assert_eq!(s.status, AreaStatus::NotFound);
+    assert!(!s.included && !s.has_area, "{s:?}");
+    assert!(f.core.area(neg).unwrap().iter().all(|&v| v == 0));
+    // Not found photos do not hold up removal; they are just left out.
+    assert!(f.core.removal_blockers().is_empty());
+    assert_eq!(f.core.to_remove(), vec![ids[0]]);
+}
+
+#[test]
+fn painting_not_found_ticks_it() {
+    let f = fixture(None);
+    let ids = add_synth(&f.core, "random", &["00"]);
+    let neg = add_synth(&f.core, "negative", &["00"])[0];
+    confirm_truth(&f.core, "random", "00", ids[0]);
+    f.core.match_all(&noop).unwrap();
+    assert_eq!(state(&f.core, neg).status, AreaStatus::NotFound);
+    let template = f.core.confirmed_template().unwrap();
+
+    f.core.open_photo(neg).unwrap();
+    let (w, h) = f.core.edit_size(neg).unwrap();
+    let painted = rect_area(w, h, 100, 200, 300, 260);
+    f.core.put_draft(neg, w, h, painted.clone()).unwrap();
+    f.core.save_photo_area(neg).unwrap();
+
+    let s = state(&f.core, neg);
+    assert_eq!(s.status, AreaStatus::Edited);
+    assert!(s.included && s.reviewed && s.has_area, "{s:?}");
+    assert!(
+        f.core.area(neg).unwrap() == painted,
+        "the saved area is not the painted one"
+    );
+    assert_eq!(f.core.to_remove(), vec![ids[0], neg]);
+    assert!(f.core.removal_blockers().is_empty());
+    // The set's watermark is untouched.
+    assert!(Arc::ptr_eq(
+        &template,
+        &f.core.confirmed_template().unwrap()
+    ));
+}
+
+#[test]
+fn photo_edit_does_not_change_set() {
+    let f = fixture(None);
+    let ids = add_synth(&f.core, "random", &["00", "01", "03", "04"]);
+    confirm_truth(&f.core, "random", "00", ids[0]);
+    f.core.match_all(&noop).unwrap();
+    let template = f.core.confirmed_template().unwrap();
+
+    // Photo 3 (random/04) gets an area of its own somewhere else.
+    let three = ids[3];
+    let (w, h) = f.core.edit_size(three).unwrap();
+    let own = rect_area(w, h, 10, 10, 60, 40);
+    f.core.put_draft(three, w, h, own.clone()).unwrap();
+    f.core.save_photo_area(three).unwrap();
+    assert!(Arc::ptr_eq(
+        &template,
+        &f.core.confirmed_template().unwrap()
+    ));
+
+    // A photo added now waits for matching and holds up removal until then.
+    let new = add_synth(&f.core, "random", &["11"])[0];
+    assert_eq!(state(&f.core, new).status, AreaStatus::Pending);
+    assert_eq!(f.core.removal_blockers(), vec![new]);
+
+    let rec = Recorder::default();
+    f.core.match_all(&|e| rec.push(e)).unwrap();
+    assert_eq!(matching(&rec.events()).last(), Some(&(1, 1)));
+    // Found with the set's watermark, where random/11 has it, not where photo 3 was edited.
+    assert_eq!(state(&f.core, new).status, AreaStatus::Found);
+    let v = iou(&synth_truth("random", "11"), &f.core.area(new).unwrap());
+    assert!(v >= 0.6, "iou {v:.3}");
+    assert_eq!(state(&f.core, three).status, AreaStatus::Edited);
+    assert!(f.core.area(three).unwrap() == own);
+    assert!(f.core.removal_blockers().is_empty());
+}
+
+#[test]
+fn reconfirm_clears_matches_keeps_edits() {
+    let f = fixture(None);
+    let ids = add_synth(&f.core, "random", &["00", "01", "04"]);
+    confirm_truth(&f.core, "random", "00", ids[0]);
+    f.core.match_all(&noop).unwrap();
+    assert_eq!(state(&f.core, ids[1]).status, AreaStatus::Found);
+
+    let (w, h) = f.core.edit_size(ids[1]).unwrap();
+    let own = rect_area(w, h, 5, 5, 50, 50);
+    f.core.put_draft(ids[1], w, h, own.clone()).unwrap();
+    f.core.save_photo_area(ids[1]).unwrap();
+
+    // A new set area from photo 2: earlier results go, the photo's own area stays.
+    confirm_truth(&f.core, "random", "04", ids[2]);
+    assert_eq!(state(&f.core, ids[0]).status, AreaStatus::Pending);
+    assert!(!state(&f.core, ids[0]).included);
+    let edited = state(&f.core, ids[1]);
+    assert_eq!(edited.status, AreaStatus::Edited);
+    assert!(edited.included && edited.reviewed);
+    assert!(f.core.area(ids[1]).unwrap() == own);
+    assert_eq!(state(&f.core, ids[2]).status, AreaStatus::Found);
+    assert_eq!(f.core.removal_blockers(), vec![ids[0]]);
+
+    let rec = Recorder::default();
+    f.core.match_all(&|e| rec.push(e)).unwrap();
+    assert_eq!(matching(&rec.events()).last(), Some(&(1, 1)));
+    assert_eq!(state(&f.core, ids[0]).status, AreaStatus::Found);
+    assert!(f.core.area(ids[1]).unwrap() == own);
+}
+
+#[test]
+fn empty_area_cannot_be_included() {
+    let f = fixture(None);
+    let ids = add_synth(&f.core, "random", &["00", "01"]);
+    let neg = add_synth(&f.core, "negative", &["00"])[0];
+    confirm_truth(&f.core, "random", "00", ids[0]);
+    f.core.match_all(&noop).unwrap();
+
+    assert!(matches!(
+        f.core.set_included(neg, true),
+        Err(AppError::NothingToRemove)
+    ));
+    assert!(!state(&f.core, neg).included);
+
+    // Erasing the whole area of a found photo leaves it out.
+    let one = ids[1];
+    let (w, h) = f.core.edit_size(one).unwrap();
+    f.core
+        .put_draft(one, w, h, vec![0; (w * h) as usize])
+        .unwrap();
+    f.core.save_photo_area(one).unwrap();
+    let s = state(&f.core, one);
+    assert_eq!(s.status, AreaStatus::Edited);
+    assert!(!s.included && !s.has_area, "{s:?}");
+    assert!(matches!(
+        f.core.set_included(one, true),
+        Err(AppError::NothingToRemove)
+    ));
+    assert_eq!(f.core.to_remove(), vec![ids[0]]);
+
+    // A photo with an area can be left out and taken back.
+    f.core.set_included(ids[0], false).unwrap();
+    assert!(f.core.to_remove().is_empty());
+    f.core.set_included(ids[0], true).unwrap();
+    assert_eq!(f.core.to_remove(), vec![ids[0]]);
+    assert!(f.core.set_included(99, false).is_err());
+}
+
+#[test]
+fn grid_image_is_jpeg() {
+    let f = fixture(None);
+    let ids = add_synth(&f.core, "random", &["00"]);
+    let neg = add_synth(&f.core, "negative", &["00"])[0];
+    confirm_truth(&f.core, "random", "00", ids[0]);
+    f.core.match_all(&noop).unwrap();
+
+    let path = synth("random").join("marked/00.png");
+    let plain = thumbnail(&path, GRID_LONG_SIDE).unwrap();
+    let bytes = f.core.grid_image(ids[0]).unwrap();
+    assert!(bytes.starts_with(&[0xFF, 0xD8]));
+    let grid = image::load_from_memory(&bytes).unwrap().to_rgb8();
+    assert_eq!(grid.dimensions(), plain.dimensions());
+    assert_eq!(grid.width().max(grid.height()), GRID_LONG_SIDE);
+
+    // The found area is tinted red: inside its box the grid is redder than the photo.
+    let gt = synth_truth("random", "00");
+    let scale = GRID_LONG_SIDE as f64 / gt.width().max(gt.height()) as f64;
+    let redness = |img: &RgbImage| {
+        let (mut sum, mut n) = (0f64, 0f64);
+        for (x, y, p) in gt.enumerate_pixels() {
+            let (gx, gy) = ((x as f64 * scale) as u32, (y as f64 * scale) as u32);
+            if p.0[0] != 0 && gx < img.width() && gy < img.height() {
+                let q = img.get_pixel(gx, gy).0;
+                sum += q[0] as f64 - q[1] as f64;
+                n += 1.0;
+            }
+        }
+        sum / n
+    };
+    let (r_grid, r_plain) = (redness(&grid), redness(&plain));
+    assert!(
+        r_grid > r_plain + 30.0,
+        "grid {r_grid:.1}, photo {r_plain:.1}"
+    );
+
+    // A photo where nothing was found is shown as it is.
+    let neg_grid = image::load_from_memory(&f.core.grid_image(neg).unwrap()).unwrap();
+    assert_eq!(neg_grid.width().max(neg_grid.height()), GRID_LONG_SIDE);
+    assert!(f.core.grid_image(99).is_err());
+}
+
+#[test]
+fn cancel_match_keeps_results() {
+    let f = fixture(None);
+    let names = synth_names("random");
+    let refs: Vec<&str> = names.iter().map(String::as_str).collect();
+    let ids = add_synth(&f.core, "random", &refs);
+    confirm_truth(&f.core, "random", &names[0], ids[0]);
+    let core = &f.core;
+    let err = core
+        .match_all(&|e| {
+            if matches!(e, ProgressEvent::Matching { done: 2, .. }) {
+                core.cancel();
+            }
+        })
+        .unwrap_err();
+    assert_eq!(user_message(&err), "Stopped.");
+
+    let pending = |c: &AppCore| {
+        c.photo_states()
+            .iter()
+            .filter(|s| s.status == AreaStatus::Pending)
+            .count() as u32
+    };
+    let left = pending(core);
+    assert!(left > 0 && left <= 9, "{left} photos left");
+
+    // The results so far are kept; the next run matches only the rest.
+    let rec = Recorder::default();
+    core.match_all(&|e| rec.push(e)).unwrap();
+    assert_eq!(matching(&rec.events()).last(), Some(&(left, left)));
+    assert_eq!(pending(core), 0);
 }

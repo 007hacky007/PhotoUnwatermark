@@ -12,7 +12,7 @@ pub mod photos;
 mod session;
 pub mod settings;
 
-pub use crate::core::{AppCore, DetectOutcome, Suggestion};
+pub use crate::core::{AppCore, AreaStatus, DetectOutcome, MatchSummary, PhotoState, Suggestion};
 pub use estimate::{Eta, load_fraction};
 pub use jobs::{Events, LoadPurpose, ProgressEvent};
 pub use messages::{AppError, UserError, user_message};

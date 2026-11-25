@@ -8,13 +8,19 @@
 //! nesting is `engine` -> `settings` (reading `prefer_gpu` while the engine is created); nothing
 //! takes them the other way round, so the locks cannot deadlock.
 //!
-//! A long call (detection, model loading, the saved-watermark search, adding, removing or
-//! clearing photos, confirming the set area) holds the job slot from start to end, so only one
+//! [`AppCore::match_all`] also has a counter lock of its own, held while each `Matching` event
+//! is sent so that events go out one at a time. A worker takes it only after it has released the
+//! session, and no `AppCore` lock is ever held when it is taken, so a callback that calls back
+//! into `AppCore` (to cancel, say) cannot deadlock either.
+//!
+//! A long call (detection, model loading, the saved-watermark search, matching, adding, removing
+//! or clearing photos, confirming the set area) holds the job slot from start to end, so only one
 //! runs at a time and another one gets [`AppError::Busy`]. It locks the session to copy its
-//! inputs, works without it, and locks it again to store the results. Because the photo list
-//! changes only inside the job slot, the photos a job read are still there when it stores the
-//! results. Everything else (the photo list, areas, drafts, images, settings) answers while a job
-//! runs.
+//! inputs, works without it, and locks it again to store the results (matching stores each
+//! photo's result as soon as it is ready). Because the photo list changes only inside the job
+//! slot, the photos a job read are still there when it stores the results. Everything else (the
+//! photo list, areas, drafts, photo states and edits, images, settings) answers while a job runs;
+//! a match result never replaces an area the person saved for that photo in the meantime.
 
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
@@ -24,23 +30,25 @@ use image::RgbImage;
 use puw_core::mask::{self, Mask};
 use puw_core::{
     Engine, EngineOptions, Error, Guess, GuessOptions, Library, MatchStatus, ModelKind, ModelPaths,
-    Progress, WatermarkTemplate, build_set_layers, build_template, find, guess_photo, load,
-    pick_representative, representative_sample,
+    Progress, SetLayers, WatermarkTemplate, build_set_layers, build_template, find, guess_photo,
+    load, match_photo, pick_representative, representative_sample,
 };
+use rayon::prelude::*;
 use serde::Serialize;
 
 use crate::download::model_assets;
 use crate::image_cache::ImageCache;
-use crate::images::{self, area_from_edit, area_to_edit};
+use crate::images::{self, GRID_LONG_SIDE, area_from_edit, jpeg, overlay, thumbnail};
 use crate::jobs::{Events, Job, JobSlot, LoadPurpose, ProgressEvent, with_ticker};
 use crate::photos::{AddResult, PhotoId, PhotoInfo};
-use crate::session::{Draft, Session};
+use crate::session::{Area, Draft, Matched, Session, Unmatched};
 use crate::{AppError, DataDirs, OutputRule, Result, Settings, load_fraction};
 
 /// Load speed assumed for a model that was never loaded on this computer.
 const LOAD_BYTES_PER_SECOND: f32 = 20_000_000.0;
 /// Photos a saved watermark is tried on before it is offered.
 const SUGGEST_PHOTOS: usize = 5;
+const GRID_QUALITY: u8 = 85;
 
 /// The photos the step-2 editor can show, and the one it opens first.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
@@ -56,6 +64,45 @@ pub struct DetectOutcome {
 pub struct Suggestion {
     pub id: String,
     pub name: String,
+}
+
+/// How finding the set's watermark went, over all photos. A photo with an area of its own
+/// counts as found, or as not found when that area is empty; a photo not looked for yet
+/// counts only in `total`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct MatchSummary {
+    pub found: u32,
+    pub unsure: u32,
+    pub not_found: u32,
+    pub total: u32,
+}
+
+/// What step 3 shows about a photo.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub enum AreaStatus {
+    Found,
+    Unsure,
+    NotFound,
+    /// The person saved an area for this photo alone.
+    Edited,
+    /// Not looked for yet (no set area, or added after matching).
+    Pending,
+}
+
+/// One photo as step 3 shows it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PhotoState {
+    pub id: PhotoId,
+    pub status: AreaStatus,
+    /// Ticked for removal.
+    pub included: bool,
+    /// Opened in the editor since its result came.
+    pub reviewed: bool,
+    /// Its current area is not empty.
+    pub has_area: bool,
 }
 
 /// The app's session: settings, engine, photos, areas and cached images.
@@ -331,8 +378,9 @@ impl AppCore {
     }
 
     /// Finds the watermark on a few photos ([`representative_sample`], leaving out any that
-    /// cannot be read) after loading the detection models and reading the set. The guesses
-    /// become those photos' areas; every step-2 guess and draft from before is dropped.
+    /// cannot be read) after loading the detection models and reading the set (its batch layers
+    /// are kept). The guesses become those photos' areas; every step-2 guess and draft from
+    /// before is dropped.
     pub fn detect(&self, ev: Events) -> Result<DetectOutcome> {
         let job = self.jobs.start()?;
         let (ids, paths) = self.photo_files();
@@ -345,12 +393,7 @@ impl AppCore {
             LoadPurpose::Finder,
             ev,
         )?;
-        let on_reading = |fraction: f32| ev(ProgressEvent::Reading { fraction });
-        let progress = Progress {
-            on_fraction: &on_reading,
-            cancel: job.flag(),
-        };
-        let layers = build_set_layers(&paths, &progress)?;
+        let layers = self.read_layers(&job, ev)?;
 
         let opts = GuessOptions::default();
         let looked = self.look_at_sample(&job, &ids, &paths, ev, |photo| {
@@ -359,9 +402,7 @@ impl AppCore {
         let (sample, guesses): (Vec<PhotoId>, Vec<Guess>) = looked.into_iter().unzip();
         let representative = sample[pick_representative(&guesses)];
 
-        let mut s = self.session();
-        s.layers = Some(Arc::new(layers));
-        s.set_guesses(
+        self.session().set_guesses(
             sample
                 .iter()
                 .copied()
@@ -404,6 +445,19 @@ impl AppCore {
             sample,
             representative,
         })
+    }
+
+    /// Reads the whole set for its batch layers ([`ProgressEvent::Reading`]) and keeps them.
+    fn read_layers(&self, job: &Job, ev: Events) -> Result<Arc<SetLayers>> {
+        let (ids, paths) = self.photo_files();
+        let on_reading = |fraction: f32| ev(ProgressEvent::Reading { fraction });
+        let progress = Progress {
+            on_fraction: &on_reading,
+            cancel: job.flag(),
+        };
+        let layers = Arc::new(build_set_layers(&paths, &progress)?);
+        self.session().set_layers(layers.clone(), &ids);
+        Ok(layers)
     }
 
     /// Runs `look` on each photo of the [`representative_sample`], one at a time, reporting
@@ -455,7 +509,7 @@ impl AppCore {
             (s.area(id), images::edit_size(info.width, info.height))
         };
         Ok(match area {
-            Some(a) => area_to_edit(&a, ew, eh),
+            Some(a) => a.resized(ew, eh).into_raw(),
             None => vec![0; ew as usize * eh as usize],
         })
     }
@@ -496,7 +550,7 @@ impl AppCore {
         };
         let area = match (draft, current) {
             (Some(d), _) => area_from_edit(&d.bytes, d.w, d.h, w, h)?,
-            (None, Some(a)) => mask::binarize(&a),
+            (None, Some(a)) => a.to_full(),
             (None, None) => Mask::new(w, h),
         };
         if mask::is_empty(&area) {
@@ -516,13 +570,188 @@ impl AppCore {
         if template.pieces.is_empty() {
             return Err(AppError::NothingToRemove);
         }
-        self.session().confirm(id, template, area);
+        self.session().confirm(id, template, &area);
         Ok(())
     }
 
     /// What the confirmed set area looks like, once there is one.
     pub fn confirmed_template(&self) -> Option<Arc<WatermarkTemplate>> {
         self.session().template.clone()
+    }
+
+    /// Finds the set's watermark on every photo that has neither a result nor an area of its
+    /// own, reporting [`ProgressEvent::Matching`] (starting with `done: 0`). The set is read
+    /// first ([`ProgressEvent::Reading`]) when it has no batch layers yet (a saved watermark
+    /// was used) or photos of a size without a layer were added since.
+    ///
+    /// Photos are matched in parallel on at most half the cores; each worker reads, matches
+    /// and drops one photo before the next. Every result is stored as soon as it is ready, so a
+    /// cancelled run keeps the photos it finished. A photo that cannot be read counts as not
+    /// found. Fails with [`AppError::NothingToRemove`] before a set area is confirmed.
+    pub fn match_all(&self, ev: Events) -> Result<MatchSummary> {
+        let job = self.jobs.start()?;
+        let (template, layers, todo) = {
+            let s = self.session();
+            let template = s.template.clone().ok_or(AppError::NothingToRemove)?;
+            let layers = if s.layers_stale() {
+                None
+            } else {
+                s.layers.clone()
+            };
+            (template, layers, s.unmatched())
+        };
+        let layers = match layers {
+            Some(l) => l,
+            None if todo.is_empty() => Arc::new(SetLayers::none()),
+            None => self.read_layers(&job, ev)?,
+        };
+        self.match_photos(&job, &template, &layers, &todo, ev)?;
+        Ok(self.summary())
+    }
+
+    fn match_photos(
+        &self,
+        job: &Job,
+        template: &WatermarkTemplate,
+        layers: &SetLayers,
+        todo: &[Unmatched],
+        ev: Events,
+    ) -> Result<()> {
+        let total = todo.len() as u32;
+        // Held while the event is sent, so events go out one at a time with `done` growing.
+        let done = Mutex::new(0u32);
+        ev(ProgressEvent::Matching { done: 0, total });
+        let one = |(id, path, (w, h)): &Unmatched| -> Result<()> {
+            job.check()?;
+            let matched = match load(path) {
+                Ok(photo) => Matched::new(&match_photo(template, &photo.rgb, layers)),
+                // Nothing can be removed from a photo that cannot be read.
+                Err(_) => Matched {
+                    status: MatchStatus::NotFound,
+                    area: Arc::new(Area::empty(*w, *h)),
+                },
+            };
+            self.session().set_match(*id, matched);
+            let mut done = lock(&done);
+            *done += 1;
+            ev(ProgressEvent::Matching { done: *done, total });
+            Ok(())
+        };
+        let threads = std::thread::available_parallelism().map_or(1, |n| n.get()) / 2;
+        match rayon::ThreadPoolBuilder::new()
+            .num_threads(threads.max(1))
+            .build()
+        {
+            Ok(pool) => pool.install(|| todo.par_iter().try_for_each(one)),
+            Err(_) => todo.iter().try_for_each(&one),
+        }
+    }
+
+    /// See [`MatchSummary`].
+    fn summary(&self) -> MatchSummary {
+        let states = self.photo_states();
+        let mut sum = MatchSummary {
+            found: 0,
+            unsure: 0,
+            not_found: 0,
+            total: states.len() as u32,
+        };
+        for st in &states {
+            match st.status {
+                AreaStatus::Found => sum.found += 1,
+                AreaStatus::Edited if st.has_area => sum.found += 1,
+                AreaStatus::Unsure => sum.unsure += 1,
+                AreaStatus::NotFound | AreaStatus::Edited => sum.not_found += 1,
+                AreaStatus::Pending => {}
+            }
+        }
+        sum
+    }
+
+    /// Every photo's step-3 state, in list order.
+    pub fn photo_states(&self) -> Vec<PhotoState> {
+        self.session().states()
+    }
+
+    /// Notes that photo `id` was opened in the editor, which settles an unsure result.
+    pub fn open_photo(&self, id: PhotoId) -> Result<()> {
+        let mut s = self.session();
+        s.photos.get(id).ok_or_else(|| no_photo(id))?;
+        s.data.entry(id).or_default().reviewed = true;
+        Ok(())
+    }
+
+    /// Makes the draft of photo `id` (or, without one, its current area) the area of this
+    /// photo alone: status [`AreaStatus::Edited`], reviewed, and ticked when the area is not
+    /// empty. The set's watermark stays as it is.
+    pub fn save_photo_area(&self, id: PhotoId) -> Result<()> {
+        let ((w, h), draft, current) = {
+            let mut s = self.session();
+            let info = &s.photos.get(id).ok_or_else(|| no_photo(id))?.info;
+            let size = (info.width, info.height);
+            let draft = s.data.get_mut(&id).and_then(|d| d.draft.take());
+            (size, draft, s.area(id))
+        };
+        // The full-size area is made without the lock.
+        let area = match (draft, current) {
+            (Some(d), _) => Arc::new(Area::from_mask(&area_from_edit(&d.bytes, d.w, d.h, w, h)?)),
+            (None, Some(a)) => a,
+            (None, None) => Arc::new(Area::empty(w, h)),
+        };
+        let mut s = self.session();
+        s.photos.get(id).ok_or_else(|| no_photo(id))?;
+        s.save_own(id, area);
+        Ok(())
+    }
+
+    /// Ticks or unticks photo `id` for removal. A photo whose area is empty cannot be ticked
+    /// ([`AppError::NothingToRemove`]).
+    pub fn set_included(&self, id: PhotoId, included: bool) -> Result<()> {
+        let mut s = self.session();
+        s.photos.get(id).ok_or_else(|| no_photo(id))?;
+        if included && !s.has_area(id) {
+            return Err(AppError::NothingToRemove);
+        }
+        s.data.entry(id).or_default().included = included;
+        Ok(())
+    }
+
+    /// The photos that keep removal from starting, in list order: ticked unsure photos nobody
+    /// opened, and photos the watermark was not looked for on yet.
+    pub fn removal_blockers(&self) -> Vec<PhotoId> {
+        self.photo_states()
+            .into_iter()
+            .filter(|st| {
+                st.status == AreaStatus::Pending
+                    || (st.status == AreaStatus::Unsure && st.included && !st.reviewed)
+            })
+            .map(|st| st.id)
+            .collect()
+    }
+
+    /// The ticked photos with an area, in list order.
+    pub fn to_remove(&self) -> Vec<PhotoId> {
+        self.photo_states()
+            .into_iter()
+            .filter(|st| st.included && st.has_area)
+            .map(|st| st.id)
+            .collect()
+    }
+
+    /// JPEG of photo `id` for the step-3 grid (long side [`GRID_LONG_SIDE`]) with its current
+    /// area tinted. Made on every call: the area may have changed.
+    pub fn grid_image(&self, id: PhotoId) -> Result<Vec<u8>> {
+        let (path, area) = {
+            let s = self.session();
+            let path = s.photos.get(id).ok_or_else(|| no_photo(id))?.path.clone();
+            (path, s.area(id))
+        };
+        let thumb = thumbnail(&path, GRID_LONG_SIDE)?;
+        let img = match area {
+            Some(a) if !a.is_empty() => overlay(&thumb, &a.resized(thumb.width(), thumb.height())),
+            _ => thumb,
+        };
+        Ok(jpeg(&img, GRID_QUALITY))
     }
 
     /// Small JPEG of photo `id` (long side [`images::THUMB_LONG_SIDE`]), kept in memory.
