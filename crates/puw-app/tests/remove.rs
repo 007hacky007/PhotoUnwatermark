@@ -754,7 +754,7 @@ fn preview_loads_remover_once() {
     assert!(is_jpeg(&bytes));
     let shown = decode(&bytes);
     assert_eq!(shown.dimensions(), edit_size(1536, 1024));
-    assert_eq!(PREVIEW_LONG_SIDE, 1536);
+    assert_eq!(PREVIEW_LONG_SIDE, 1024);
     let orig = decode(&f.core.edit_image(id).unwrap());
     let (x, y, w, h) = (680, 768, 393, 78);
     assert!(block_diff(&orig, &shown, x + w / 2 - 16, y + h / 2 - 16, 32) > 0.5);

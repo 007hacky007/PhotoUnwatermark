@@ -20,7 +20,7 @@ use crate::session::Area;
 use crate::{AppError, Eta, OutputRule, Result, user_message};
 
 /// Long side, in pixels, that a preview is worked at.
-pub const PREVIEW_LONG_SIDE: u32 = 1536;
+pub const PREVIEW_LONG_SIDE: u32 = 1024;
 const IMAGE_QUALITY: u8 = 90;
 
 /// Whether the results can be saved where they should go.
