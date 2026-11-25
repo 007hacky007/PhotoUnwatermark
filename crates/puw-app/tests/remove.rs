@@ -16,7 +16,7 @@ use std::time::Instant;
 use image::{GrayImage, Rgb, RgbImage};
 use puw_app::images::{edit_size, jpeg};
 use puw_app::{
-    AppCore, AppError, DataDirs, LoadPurpose, PREVIEW_LONG_SIDE, ProgressEvent, Settings,
+    AppCore, AppError, DataDirs, Detail, LoadPurpose, PREVIEW_LONG_SIDE, ProgressEvent, Settings,
     default_watermark_name, user_message,
 };
 use puw_core::{ModelKind, load};
@@ -341,6 +341,29 @@ fn removes_into_output_folder() {
     assert_eq!(names_in(&out), ["00 (2).png", "00.png", "01.png"]);
     assert_eq!(fs::read(out.join("00.png")).unwrap(), first);
     assert_eq!(bytes_of(&paths), before);
+
+    // Another detail setting makes new results, as does another output folder.
+    f.core
+        .set_settings(Settings {
+            detail: Detail::Faster,
+            ..f.core.settings()
+        })
+        .unwrap();
+    let again = f.core.remove(&|_| {}).unwrap();
+    assert_eq!(again.done.len(), 2);
+    assert_eq!(
+        names_in(&out),
+        ["00 (2).png", "00 (3).png", "00.png", "01 (2).png", "01.png"]
+    );
+    let elsewhere = tmp.path().join("elsewhere");
+    f.core.set_output_override(Some(elsewhere.clone()));
+    let again = f.core.remove(&|_| {}).unwrap();
+    assert_eq!(again.done.len(), 2);
+    assert_eq!(names_in(&elsewhere), ["00.png", "01.png"]);
+    assert_eq!(names_in(&out).len(), 5);
+    // Nothing changed since: nothing is done again.
+    f.core.remove(&|_| {}).unwrap();
+    assert_eq!(names_in(&elsewhere).len(), 2);
 }
 
 /// True when a pixel of `m` within `r` of (x, y) is set.

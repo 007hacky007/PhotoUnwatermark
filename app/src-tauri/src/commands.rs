@@ -232,16 +232,13 @@ pub async fn download_models(
     .await
 }
 
-/// Asks the job (or download) started with ticket `job` to stop; without a ticket, whatever
-/// runs.
+/// Asks the job (or download) started with ticket `job` to stop, and nothing else. When it
+/// returns, the stop is recorded: a job started after it waits for the stopped one to end.
 #[tauri::command]
-pub async fn cancel_job(shell: State<'_, Shell>, job: Option<u64>) -> Res<()> {
-    match job {
-        Some(t) => shell.core.cancel_ticket(t),
-        None => shell.core.cancel(),
-    }
+pub async fn cancel_job(shell: State<'_, Shell>, job: u64) -> Res<()> {
+    shell.core.cancel_ticket(job);
     if let Some((flag, ticket)) = shell.download_slot().as_ref()
-        && (job.is_none() || *ticket == job)
+        && *ticket == Some(job)
     {
         flag.store(true, Ordering::Relaxed);
     }

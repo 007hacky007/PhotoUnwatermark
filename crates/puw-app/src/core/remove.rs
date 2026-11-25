@@ -16,7 +16,7 @@ use crate::images::{self, jpeg};
 use crate::jobs::{Events, LoadPurpose, ProgressEvent};
 use crate::output::{output_dirs, remove_stale_partials};
 use crate::photos::{PhotoId, Problem};
-use crate::session::Area;
+use crate::session::{Area, Made};
 use crate::{AppError, Eta, OutputRule, Result, user_message};
 
 /// Long side, in pixels, that a preview is worked at.
@@ -211,8 +211,9 @@ impl AppCore {
     /// saves the results in the output folders (the originals are never written).
     ///
     /// The photos and their areas are taken when the run starts; changes made in step 3 while
-    /// it runs count from the next run on. A photo an earlier run finished with the same area
-    /// (and whose result is still there) is not done again: it is listed in
+    /// it runs count from the next run on. A photo an earlier run finished with the same area,
+    /// the same output folder rule and the same detail setting (and whose result is still
+    /// there) is not done again: it is listed in
     /// [`RemoveReport::done`] with that result, so starting again after a stop or a failure
     /// only works on the unfinished photos. Refuses with [`AppError::NotReady`] while
     /// [`AppCore::removal_blockers`] is not empty, with [`AppError::NothingToRemove`] when no
@@ -229,6 +230,8 @@ impl AppCore {
     /// [`ProgressEvent::FellBackToProcessor`] is sent once, with the error text.
     pub fn remove(&self, ev: Events) -> Result<RemoveReport> {
         let job = self.jobs.start()?;
+        let rule = self.output_rule();
+        let detail = self.settings().detail;
         let (blocked, todo, finished) = {
             let s = self.session();
             let states = s.states();
@@ -240,8 +243,8 @@ impl AppCore {
                     let e = s.photos.get(st.id)?;
                     let area = s.area(st.id)?;
                     if let Some(d) = s.data.get(&st.id)
-                        && let (Some(out), Some(done_area)) = (&d.result, &d.result_area)
-                        && Arc::ptr_eq(done_area, &area)
+                        && let (Some(out), Some(made)) = (&d.result, &d.result_made)
+                        && made.same(&area, &rule, detail)
                         && out.is_file()
                     {
                         finished.push(Done {
@@ -273,8 +276,7 @@ impl AppCore {
             });
         }
         let paths: Vec<PathBuf> = todo.iter().map(|t| t.path.clone()).collect();
-        let dirs =
-            output_dirs(&paths, &self.output_rule()).map_err(|_| AppError::NoWritableOutput)?;
+        let dirs = output_dirs(&paths, &rule).map_err(|_| AppError::NoWritableOutput)?;
         let mut cleaned: Vec<&PathBuf> = dirs.values().collect();
         cleaned.sort();
         cleaned.dedup();
@@ -295,7 +297,7 @@ impl AppCore {
             other => other?,
         };
         self.announce_fallback(&engine, ev);
-        let work_long_side = self.settings().detail.work_long_side();
+        let work_long_side = detail.work_long_side();
         let total = todo.len() as u32;
         let mut eta = Eta::new(todo.len());
         for (i, t) in todo.iter().enumerate() {
@@ -346,7 +348,11 @@ impl AppCore {
                 Ok(saved) => {
                     if let Some(d) = self.session().data.get_mut(&t.id) {
                         d.result = Some(saved.clone());
-                        d.result_area = Some(t.area.clone());
+                        d.result_made = Some(Made {
+                            area: t.area.clone(),
+                            output: rule.clone(),
+                            detail,
+                        });
                     }
                     report.done.push(Done {
                         id: t.id,

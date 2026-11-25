@@ -9,6 +9,7 @@ use puw_core::{Mask, MatchResult, MatchStatus, SetLayers, WatermarkTemplate};
 
 use crate::core::{AreaStatus, PhotoState};
 use crate::photos::{PhotoId, PhotoList};
+use crate::{Detail, OutputRule};
 
 /// An area as the editor sent it, at the photo's edit size, not yet confirmed.
 #[derive(Debug, Clone)]
@@ -169,9 +170,26 @@ pub(crate) struct PhotoData {
     pub reviewed: bool,
     /// The last preview, JPEG at edit size.
     pub preview: Option<Arc<Vec<u8>>>,
-    /// The file the last removal run saved for this photo, and the area it removed.
+    /// The file the last removal run saved for this photo, and how it was made: the area it
+    /// removed, where results went and how much detail was kept.
     pub result: Option<PathBuf>,
-    pub result_area: Option<Arc<Area>>,
+    pub result_made: Option<Made>,
+}
+
+/// How a result was made; a photo is done again when any of it changes.
+#[derive(Debug, Clone)]
+pub(crate) struct Made {
+    pub area: Arc<Area>,
+    pub output: OutputRule,
+    pub detail: Detail,
+}
+
+impl Made {
+    /// The same area (the very one, not a copy that happens to be equal), output rule and
+    /// detail.
+    pub fn same(&self, area: &Arc<Area>, output: &OutputRule, detail: Detail) -> bool {
+        Arc::ptr_eq(&self.area, area) && self.output == *output && self.detail == detail
+    }
 }
 
 /// The photo the set's watermark area was confirmed on, and that area.
