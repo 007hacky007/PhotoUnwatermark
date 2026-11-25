@@ -15,6 +15,19 @@ jobs:
       PUW_MODELS_DIR: ${{ github.workspace }}/models
     steps:
       - uses: actions/checkout@v4
+      - uses: pnpm/action-setup@v4
+        with:
+          package_json_file: app/package.json
+      - uses: actions/setup-node@v4
+        with:
+          node-version: lts/*
+          cache: pnpm
+          cache-dependency-path: app/pnpm-lock.yaml
+      - run: pnpm -C app install --frozen-lockfile
+      - run: pnpm -C app check
+      - run: pnpm -C app test
+      # The Tauri crate embeds app/dist, so the cargo steps need it built.
+      - run: pnpm -C app build
       - uses: dtolnay/rust-toolchain@stable
         with:
           components: rustfmt, clippy

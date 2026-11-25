@@ -1,0 +1,23 @@
+[package]
+name = "photounwatermark"
+description = "Removes a watermark from a set of photos"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[build-dependencies]
+tauri-build = { version = "2", features = [] }
+
+[dependencies]
+puw-app = { path = "../../crates/puw-app" }
+puw-core = { path = "../../crates/puw-core" }
+serde = { version = "1", features = ["derive"] }
+tauri = { version = "2", features = [] }
+tauri-plugin-dialog = "2"
+tauri-plugin-opener = "2"
+time = { version = "0.3", features = ["local-offset"] }
+
+[dev-dependencies]
+image = { version = "0.25", default-features = false, features = ["jpeg"] }
+tempfile = "3"

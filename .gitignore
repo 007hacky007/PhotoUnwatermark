@@ -10,5 +10,8 @@ __pycache__/
 node_modules/
 target/
 dist/
+/app/node_modules/
+/app/dist/
+/app/src-tauri/gen/
 /models/
 .DS_Store

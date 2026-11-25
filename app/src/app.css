@@ -1,0 +1,124 @@
+/* Design tokens. Light by default, dark when the system asks for it. */
+:root {
+  color-scheme: light dark;
+
+  --bg: #f6f7f9;
+  --surface: #ffffff;
+  --text: #1c1f24;
+  --text-muted: #5b6270;
+  --text-faint: #9aa1ad;
+  --border: #dde1e7;
+  --track: #e4e7ec;
+  --accent: #2f6fde;
+  --accent-hover: #2560c4;
+  --on-accent: #ffffff;
+  --warning: #f2b822;
+  --danger: #c93a3a;
+  /* The red layer that shows the watermark area. */
+  --area: rgb(255 59 48 / 45%);
+  --focus: 0 0 0 3px rgb(47 111 222 / 40%);
+
+  --font: system-ui, -apple-system, 'Segoe UI', Roboto, sans-serif;
+  --text-small: 0.8125rem;
+  --text-normal: 0.9375rem;
+  --text-large: 1.125rem;
+  --text-title: 1.5rem;
+
+  --space-1: 4px;
+  --space-2: 8px;
+  --space-3: 12px;
+  --space-4: 16px;
+  --space-5: 24px;
+  --space-6: 40px;
+  --radius: 8px;
+}
+
+@media (prefers-color-scheme: dark) {
+  :root {
+    --bg: #16181c;
+    --surface: #1f2228;
+    --text: #e8eaee;
+    --text-muted: #a3aab6;
+    --text-faint: #6c7380;
+    --border: #2f343c;
+    --track: #2f343c;
+    --accent: #5b8ff0;
+    --accent-hover: #73a1f3;
+    --on-accent: #0d1117;
+    --warning: #f5c542;
+    --danger: #ef6b6b;
+    --focus: 0 0 0 3px rgb(91 143 240 / 45%);
+  }
+}
+
+*,
+*::before,
+*::after {
+  box-sizing: border-box;
+}
+
+html,
+body {
+  height: 100%;
+  margin: 0;
+}
+
+body {
+  background: var(--bg);
+  color: var(--text);
+  font-family: var(--font);
+  font-size: var(--text-normal);
+  line-height: 1.45;
+  -webkit-font-smoothing: antialiased;
+}
+
+#app {
+  height: 100%;
+}
+
+h1 {
+  margin: 0 0 var(--space-3);
+  font-size: var(--text-title);
+  font-weight: 600;
+}
+
+button {
+  padding: var(--space-2) var(--space-4);
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  background: var(--surface);
+  color: var(--text);
+  font: inherit;
+  cursor: pointer;
+}
+
+button:hover:not(:disabled) {
+  border-color: var(--text-faint);
+}
+
+button:focus-visible {
+  outline: none;
+  box-shadow: var(--focus);
+}
+
+button:disabled {
+  opacity: 0.5;
+  cursor: default;
+}
+
+button.primary {
+  border-color: var(--accent);
+  background: var(--accent);
+  color: var(--on-accent);
+  font-weight: 600;
+}
+
+button.primary:hover:not(:disabled) {
+  border-color: var(--accent-hover);
+  background: var(--accent-hover);
+}
+
+button.quiet {
+  border-color: transparent;
+  background: transparent;
+}
