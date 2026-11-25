@@ -17,6 +17,9 @@ const RELEASE_URL: &str =
 /// Waits before the second and third attempt at a file.
 const BACKOFF: [Duration; 2] = [Duration::from_secs(1), Duration::from_secs(3)];
 
+/// How long a download may go without receiving any data before it counts as stalled.
+const READ_TIMEOUT: Duration = Duration::from_secs(30);
+
 const CHUNK: usize = 64 * 1024;
 
 /// A file to download.
@@ -150,6 +153,19 @@ pub fn download_with_backoff(
     cancel: &AtomicBool,
     backoff: &[Duration],
 ) -> std::result::Result<(), DownloadError> {
+    download_with_options(dir, assets, on_progress, cancel, backoff, READ_TIMEOUT)
+}
+
+/// [`download_with_backoff`] with an explicit stall limit: a connection that delivers
+/// nothing for `read_timeout` fails as a network error (and is retried and resumed).
+pub fn download_with_options(
+    dir: &Path,
+    assets: &[Asset],
+    on_progress: &(dyn Fn(DownloadProgress) + Sync),
+    cancel: &AtomicBool,
+    backoff: &[Duration],
+    read_timeout: Duration,
+) -> std::result::Result<(), DownloadError> {
     for a in assets {
         check_name(a.name)?;
     }
@@ -163,6 +179,7 @@ pub fn download_with_backoff(
         .user_agent(concat!("PhotoUnwatermark/", env!("CARGO_PKG_VERSION")))
         .timeout_connect(Some(Duration::from_secs(20)))
         .timeout_recv_response(Some(Duration::from_secs(30)))
+        .timeout_per_read(Some(read_timeout))
         .build()
         .into();
 

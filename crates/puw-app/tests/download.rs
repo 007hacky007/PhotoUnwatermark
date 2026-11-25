@@ -2,8 +2,8 @@
 
 use puw_app::DataDirs;
 use puw_app::download::{
-    Asset, DownloadError, DownloadProgress, download, download_with_backoff, missing,
-    model_assets_at, remove_downloaded_data,
+    Asset, DownloadError, DownloadProgress, download, download_with_backoff, download_with_options,
+    missing, model_assets_at, remove_downloaded_data,
 };
 use sha2::{Digest, Sha256};
 use std::collections::HashMap;
@@ -60,6 +60,9 @@ struct Server {
     behavior: Arc<Mutex<Behavior>>,
     /// How many of the next responses are cut off after half of the body.
     cut_next: Arc<AtomicUsize>,
+    /// Like `cut_next`, but the connection goes silent instead of closing.
+    stall_next: Arc<AtomicUsize>,
+    release: Arc<AtomicBool>,
     server: Arc<tiny_http::Server>,
     thread: Option<std::thread::JoinHandle<()>>,
 }
@@ -69,11 +72,22 @@ struct Cut {
     inner: io::Cursor<Vec<u8>>,
     limit: usize,
     sent: usize,
+    /// Go silent at the limit instead of failing, until released.
+    stall: Option<Arc<AtomicBool>>,
 }
 
 impl Read for Cut {
     fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
         if self.sent >= self.limit {
+            if let Some(release) = &self.stall {
+                // Silent but connected; bounded so a broken test cannot hang.
+                for _ in 0..500 {
+                    if release.load(Ordering::SeqCst) {
+                        break;
+                    }
+                    std::thread::sleep(Duration::from_millis(10));
+                }
+            }
             return Err(io::Error::new(io::ErrorKind::ConnectionAborted, "cut"));
         }
         let max = buf.len().min(self.limit - self.sent);
@@ -94,12 +108,16 @@ impl Server {
         let requests = Arc::new(Mutex::new(Vec::new()));
         let behavior = Arc::new(Mutex::new(Behavior::default()));
         let cut_next = Arc::new(AtomicUsize::new(0));
+        let stall_next = Arc::new(AtomicUsize::new(0));
+        let release = Arc::new(AtomicBool::new(false));
         let thread = {
-            let (server, requests, behavior, cut_next) = (
+            let (server, requests, behavior, cut_next, stall_next, release) = (
                 server.clone(),
                 requests.clone(),
                 behavior.clone(),
                 cut_next.clone(),
+                stall_next.clone(),
+                release.clone(),
             );
             std::thread::spawn(move || {
                 for request in server.incoming_requests() {
@@ -151,11 +169,13 @@ impl Server {
                         );
                     }
                     let cut = take_one(&cut_next);
-                    let limit = if cut { len / 2 } else { len };
+                    let stall = take_one(&stall_next);
+                    let limit = if cut || stall { len / 2 } else { len };
                     let reader = Cut {
                         inner: io::Cursor::new(part),
                         limit,
                         sent: 0,
+                        stall: stall.then(|| release.clone()),
                     };
                     let response = tiny_http::Response::new(
                         tiny_http::StatusCode(status),
@@ -164,7 +184,10 @@ impl Server {
                         Some(len),
                         None,
                     );
-                    let _ = request.respond(response);
+                    // Own thread, so a stalled response does not block the next request.
+                    std::thread::spawn(move || {
+                        let _ = request.respond(response);
+                    });
                 }
             })
         };
@@ -173,6 +196,8 @@ impl Server {
             requests,
             behavior,
             cut_next,
+            stall_next,
+            release,
             server,
             thread: Some(thread),
         }
@@ -185,6 +210,7 @@ impl Server {
 
 impl Drop for Server {
     fn drop(&mut self) {
+        self.release.store(true, Ordering::SeqCst);
         self.server.unblock();
         if let Some(t) = self.thread.take() {
             let _ = t.join();
@@ -616,4 +642,53 @@ fn remove_downloaded_data_keeps_settings() {
     assert_eq!(std::fs::read_to_string(&dirs.settings).unwrap(), "{}");
     // Nothing there is fine too.
     remove_downloaded_data(&dirs).unwrap();
+}
+
+const SHORT: Duration = Duration::from_millis(300);
+
+#[test]
+fn stalled_connection_fails_and_keeps_part() {
+    let a = data(200_000, 3);
+    let s = Server::start(vec![("a.bin", a.clone())]);
+    s.stall_next.store(1, Ordering::SeqCst);
+    let assets = [asset(&s, "a.bin", &a)];
+    let t = tempfile::tempdir().unwrap();
+    let started = std::time::Instant::now();
+    let err = download_with_options(
+        t.path(),
+        &assets,
+        &no_progress,
+        &AtomicBool::new(false),
+        &[],
+        SHORT,
+    )
+    .unwrap_err();
+    assert!(matches!(err, DownloadError::Network(_)), "{err:?}");
+    assert!(started.elapsed() < Duration::from_secs(5));
+    let part = std::fs::metadata(t.path().join("a.bin.part"))
+        .unwrap()
+        .len();
+    assert!(part > 0 && part < a.len() as u64, "part = {part}");
+}
+
+#[test]
+fn stalled_connection_is_retried_and_resumed() {
+    let a = data(200_000, 3);
+    let s = Server::start(vec![("a.bin", a.clone())]);
+    s.stall_next.store(1, Ordering::SeqCst);
+    let assets = [asset(&s, "a.bin", &a)];
+    let t = tempfile::tempdir().unwrap();
+    download_with_options(
+        t.path(),
+        &assets,
+        &no_progress,
+        &AtomicBool::new(false),
+        &[NONE],
+        SHORT,
+    )
+    .unwrap();
+    let reqs = s.requests();
+    assert_eq!(reqs.len(), 2);
+    assert!(reqs[1].range.is_some());
+    assert_eq!(std::fs::read(t.path().join("a.bin")).unwrap(), a);
 }
