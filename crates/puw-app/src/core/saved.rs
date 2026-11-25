@@ -42,15 +42,20 @@ pub fn default_watermark_name(today: Date) -> String {
 }
 
 impl AppCore {
-    /// Saves the set's confirmed watermark under `name` (trimmed; an empty name is refused)
-    /// and returns its id. Its picture is the confirmed photo around the watermark (the parts
+    /// Saves the current group's confirmed watermark under `name` (trimmed; an empty name is
+    /// refused) and returns its id. Its picture is the confirmed photo around the watermark (the parts
     /// matching looks for, see [`main_bbox`], plus 10 % on each side) with the area tinted, at most 256 px long, as PNG. Fails with
-    /// [`AppError::NothingToRemove`] before a set area is confirmed.
+    /// [`AppError::NothingToRemove`] while there is no group, or when the current group has no
+    /// confirmed area (a saved watermark used as it is).
     pub fn save_watermark(&self, name: &str) -> Result<String> {
         let _job = self.jobs.start()?;
         let (template, confirmed) = {
             let s = self.session();
-            (s.template.clone(), s.confirmed.clone())
+            let g = s.current();
+            (
+                g.map(|g| g.template.clone()),
+                g.and_then(|g| g.confirmed.clone()),
+            )
         };
         let (Some(template), Some(confirmed)) = (template, confirmed) else {
             return Err(AppError::NothingToRemove);

@@ -261,7 +261,12 @@ impl AppCore {
                     })
                 })
                 .collect();
-            (states.iter().any(|st| st.blocks_removal()), todo, finished)
+            let open = s.matching_open();
+            (
+                states.iter().any(|st| st.blocks_removal(open)),
+                todo,
+                finished,
+            )
         };
         if blocked {
             return Err(AppError::NotReady);

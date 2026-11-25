@@ -10,77 +10,19 @@ mod common;
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU32, Ordering};
-use std::sync::{Mutex, MutexGuard, PoisonError};
 use std::time::Instant;
 
+use common::{Recorder, fixture, model_fixture, rect_area};
 use image::{GrayImage, Rgb, RgbImage};
 use puw_app::images::{edit_size, jpeg};
 use puw_app::{
-    AppCore, AppError, DataDirs, Detail, LoadPurpose, PREVIEW_LONG_SIDE, ProgressEvent, Settings,
+    AppCore, AppError, Detail, LoadPurpose, PREVIEW_LONG_SIDE, ProgressEvent, Settings,
     default_watermark_name, user_message,
 };
 use puw_core::{ModelKind, load};
 use time::{Date, Month};
 
-/// Model tests run one at a time (see tests/session.rs).
-static MODEL_TESTS: Mutex<()> = Mutex::new(());
-
 const OUT: &str = "Without watermark";
-
-struct Fixture {
-    core: AppCore,
-    dirs: DataDirs,
-    _tmp: tempfile::TempDir,
-    _serial: Option<MutexGuard<'static, ()>>,
-}
-
-/// A core with its own data folder. `models` replaces the data folder's (empty) models folder.
-fn fixture(models: Option<PathBuf>) -> Fixture {
-    let serial = models
-        .as_ref()
-        .map(|_| MODEL_TESTS.lock().unwrap_or_else(PoisonError::into_inner));
-    let tmp = tempfile::tempdir().unwrap();
-    let mut dirs = DataDirs::at(tmp.path());
-    if let Some(m) = models {
-        dirs.models = m;
-        dirs.cache = common::model_cache_dir();
-    }
-    Settings {
-        prefer_gpu: cfg!(target_os = "macos"),
-        ..Settings::default()
-    }
-    .save(&dirs.settings)
-    .unwrap();
-    Fixture {
-        core: AppCore::new(dirs.clone()).unwrap(),
-        dirs,
-        _tmp: tmp,
-        _serial: serial,
-    }
-}
-
-fn model_fixture() -> Option<Fixture> {
-    match common::models_dir() {
-        Some(m) => Some(fixture(Some(m))),
-        None => {
-            eprintln!("skipped: PUW_MODELS_DIR not set");
-            None
-        }
-    }
-}
-
-#[derive(Default)]
-struct Recorder(Mutex<Vec<ProgressEvent>>);
-
-impl Recorder {
-    fn push(&self, e: ProgressEvent) {
-        self.0.lock().unwrap().push(e);
-    }
-
-    fn events(&self) -> Vec<ProgressEvent> {
-        self.0.lock().unwrap().clone()
-    }
-}
 
 fn fixed() -> PathBuf {
     common::synth_dir().join("fixed")
@@ -130,22 +72,19 @@ fn confirm_and_match(core: &AppCore, id: u32) {
     assert!(core.removal_blockers().is_empty());
 }
 
-/// An edit-size area (row-major, 0/255) with the rectangle `x0..x1` x `y0..y1` painted.
-fn rect_area(w: u32, h: u32, x0: u32, y0: u32, x1: u32, y1: u32) -> Vec<u8> {
-    let mut v = vec![0u8; (w * h) as usize];
-    for y in y0..y1 {
-        v[(y * w + x0) as usize..(y * w + x1) as usize].fill(255);
-    }
-    v
-}
-
-/// Gives photo `id` an area of its own: the rectangle `x0..x1` x `y0..y1` at edit size.
+/// Gives photo `id` the rectangle `x0..x1` x `y0..y1` (edit size) as its area: as an area of
+/// its own, or, while there is no group yet, as group 1's watermark (an area of its own needs
+/// a group to belong to).
 fn paint(core: &AppCore, id: u32, rect: (u32, u32, u32, u32)) {
     let (w, h) = core.edit_size(id).unwrap();
     let (x0, y0, x1, y1) = rect;
     core.put_draft(id, w, h, rect_area(w, h, x0, y0, x1, y1))
         .unwrap();
-    core.save_photo_area(id).unwrap();
+    if core.groups().current.is_none() {
+        core.confirm_set_area(id).unwrap();
+    } else {
+        core.save_photo_area(id).unwrap();
+    }
 }
 
 /// A smooth photo with a bright block at `block` (upright pixels).
@@ -607,7 +546,8 @@ fn damaged_photos_are_failures() {
     fs::write(&png, &bytes).unwrap();
 
     let ids = add(&f.core, &[cut, good, png]);
-    for &id in &ids {
+    // The readable photo first: it starts the group.
+    for id in [ids[1], ids[0], ids[2]] {
         paint(&f.core, id, (10, 10, 90, 70));
     }
     let report = f.core.remove(&|_| {}).unwrap();

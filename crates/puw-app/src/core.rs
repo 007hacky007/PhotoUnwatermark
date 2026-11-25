@@ -14,15 +14,16 @@
 //! into `AppCore` (to cancel, say) cannot deadlock either.
 //!
 //! A long call (detection, model loading, the saved-watermark search, matching, adding, removing or
-//! clearing photos, confirming the set area, the preview, the removal run, saving the watermark,
-//! removing the downloaded data) holds the job slot from start to end, so only one runs at a time
-//! and another one gets [`AppError::Busy`]. It locks the session to copy its inputs, works without
-//! it, and locks it again to store the results (matching stores each photo's result as soon as it
-//! is ready, and so does the removal run). Because the photo list changes only inside the job slot,
-//! the photos a job read are still there when it stores the results. Everything else (the photo
-//! list, areas, drafts, photo states and edits, images, settings, the saved-watermark list) answers
-//! while a job runs; a match result never replaces an area the person saved for that photo in the
-//! meantime, and the removal run works with the photos and areas it copied when it started.
+//! clearing photos, confirming a group's area, clearing the groups, the preview, the removal run,
+//! saving the watermark, removing the downloaded data) holds the job slot from start to end, so
+//! only one runs at a time and another one gets [`AppError::Busy`]. It locks the session to copy
+//! its inputs, works without it, and locks it again to store the results (matching stores each
+//! photo's result as soon as it is ready, and so does the removal run). Because the photo list
+//! changes only inside the job slot, the photos a job read are still there when it stores the
+//! results. Everything else (the photo list, areas, drafts, photo states and edits, images,
+//! settings, the saved-watermark list) answers while a job runs; a match result never replaces an
+//! area the person saved for that photo in the meantime, and the removal run works with the photos
+//! and areas it copied when it started.
 
 use std::collections::HashSet;
 use std::path::PathBuf;
@@ -53,7 +54,7 @@ mod step3;
 
 pub use remove::{Done, Failed, OutputCheck, PREVIEW_LONG_SIDE, RemoveReport};
 pub use saved::{SavedInfo, default_watermark_name};
-pub use step3::{AreaStatus, MatchSummary, PhotoState};
+pub use step3::{AreaStatus, GroupInfo, GroupsState, MatchSummary, PhotoState};
 
 /// Load speed assumed for a model that was never loaded on this computer.
 const LOAD_BYTES_PER_SECOND: f32 = 20_000_000.0;
@@ -251,19 +252,30 @@ impl AppCore {
     }
 
     /// Adds files and folders. Results of earlier runs (in the output folder) are left out.
+    /// When a photo is added, every group is cleared ([`AppCore::clear_groups`]).
     pub fn add_paths(&self, paths: &[PathBuf]) -> Result<AddResult> {
         let _job = self.jobs.start()?;
         let rule = self.settings().output;
         // Photo files are read without the lock; the job slot keeps the list from changing.
         let mut list = self.session().photos.clone();
         let result = list.add_paths(paths, &rule);
-        self.session().photos = list;
+        let mut s = self.session();
+        s.photos = list;
+        if !result.added.is_empty() && !s.groups.is_empty() {
+            s.clear_groups();
+        }
         Ok(result)
     }
 
+    /// Removes photo `id` from the list; every group is cleared ([`AppCore::clear_groups`]).
     pub fn remove_photo(&self, id: PhotoId) -> Result<()> {
         let _job = self.jobs.start()?;
-        self.session().remove(id);
+        let mut s = self.session();
+        s.remove(id);
+        if !s.groups.is_empty() {
+            s.clear_groups();
+        }
+        drop(s);
         self.images.remove(id);
         Ok(())
     }
@@ -413,8 +425,8 @@ impl AppCore {
 
     /// Finds the watermark on a few photos ([`representative_sample`], leaving out any that
     /// cannot be read) after loading the detection models and reading the set (its batch layers
-    /// are kept). The guesses become those photos' areas; every step-2 guess and draft from
-    /// before is dropped.
+    /// are kept). The guesses become those photos' step-2 areas ([`AppCore::start_area`]);
+    /// every step-2 guess and draft from before is dropped.
     pub fn detect(&self, ev: Events) -> Result<DetectOutcome> {
         let job = self.jobs.start()?;
         let (ids, paths) = self.photo_files();
@@ -427,7 +439,7 @@ impl AppCore {
             LoadPurpose::Finder,
             ev,
         )?;
-        let layers = self.read_layers(&job, ev)?;
+        let layers = self.read_layers(&job, ev, &ids, &paths)?;
 
         let opts = GuessOptions::default();
         let looked = self.look_at_sample(&job, &ids, &paths, ev, |photo| {
@@ -436,17 +448,21 @@ impl AppCore {
         let (sample, guesses): (Vec<PhotoId>, Vec<Guess>) = looked.into_iter().unzip();
         let representative = sample[pick_representative(&guesses)];
 
-        self.session().set_guesses(
-            sample
+        let outcome = DetectOutcome {
+            sample,
+            representative,
+        };
+        let mut s = self.session();
+        s.set_guesses(
+            outcome
+                .sample
                 .iter()
                 .copied()
                 .zip(guesses.into_iter().map(|g| g.mask))
                 .collect(),
         );
-        Ok(DetectOutcome {
-            sample,
-            representative,
-        })
+        s.last_detect = Some(outcome.clone());
+        Ok(outcome)
     }
 
     /// Looks for saved watermark `id` on the same photos [`AppCore::detect`] would use, without
@@ -473,24 +489,32 @@ impl AppCore {
             .max_by(|a, b| a.1.confidence.total_cmp(&b.1.confidence))
             .map_or(sample[0], |(id, _)| *id);
 
-        self.session()
-            .set_guesses(results.into_iter().map(|(id, r)| (id, r.mask)).collect());
-        Ok(DetectOutcome {
+        let outcome = DetectOutcome {
             sample,
             representative,
-        })
+        };
+        let mut s = self.session();
+        s.set_guesses(results.into_iter().map(|(id, r)| (id, r.mask)).collect());
+        s.last_detect = Some(outcome.clone());
+        Ok(outcome)
     }
 
-    /// Reads the whole set for its batch layers ([`ProgressEvent::Reading`]) and keeps them.
-    fn read_layers(&self, job: &Job, ev: Events) -> Result<Arc<SetLayers>> {
-        let (ids, paths) = self.photo_files();
+    /// Reads photos `ids` (files `paths`) for their batch layers ([`ProgressEvent::Reading`])
+    /// and keeps them, built from those photos.
+    fn read_layers(
+        &self,
+        job: &Job,
+        ev: Events,
+        ids: &[PhotoId],
+        paths: &[PathBuf],
+    ) -> Result<Arc<SetLayers>> {
         let on_reading = |fraction: f32| ev(ProgressEvent::Reading { fraction });
         let progress = Progress {
             on_fraction: &on_reading,
             cancel: job.flag(),
         };
-        let layers = Arc::new(build_set_layers(&paths, &progress)?);
-        self.session().set_layers(layers.clone(), &ids);
+        let layers = Arc::new(build_set_layers(paths, &progress)?);
+        self.session().set_layers(layers.clone(), ids);
         Ok(layers)
     }
 
@@ -540,13 +564,27 @@ impl AppCore {
         Ok(images::edit_size(info.width, info.height))
     }
 
-    /// The photo's current area at edit size, one byte per pixel (0 or 255), row by row: its
-    /// own area, else where the set's watermark was found, else the step-2 guess, else empty.
+    /// The photo's area at edit size, one byte per pixel (0 or 255), row by row: its own area,
+    /// else where its group's watermark was found, else empty.
     pub fn area(&self, id: PhotoId) -> Result<Vec<u8>> {
+        self.area_at_edit_size(id, Session::area)
+    }
+
+    /// The area step 2 starts from, at edit size like [`AppCore::area`]: the step-2 guess when
+    /// the photo has one and is in no group, else its area.
+    pub fn start_area(&self, id: PhotoId) -> Result<Vec<u8>> {
+        self.area_at_edit_size(id, Session::start_area)
+    }
+
+    fn area_at_edit_size(
+        &self,
+        id: PhotoId,
+        which: fn(&Session, PhotoId) -> Option<Arc<Area>>,
+    ) -> Result<Vec<u8>> {
         let (area, (ew, eh)) = {
             let s = self.session();
             let info = &s.photos.get(id).ok_or_else(|| no_photo(id))?.info;
-            (s.area(id), images::edit_size(info.width, info.height))
+            (which(&s, id), images::edit_size(info.width, info.height))
         };
         Ok(match area {
             Some(a) => a.resized(ew, eh).into_raw(),
@@ -579,13 +617,41 @@ impl AppCore {
         }
     }
 
-    /// Makes the draft of photo `id` (or, without one, its current area) the set's watermark
-    /// area and learns what it looks like. Fails with [`AppError::NothingToRemove`] when the
-    /// area is empty. Confirming the area that is already the set's watermark, on the same
-    /// photo, changes nothing (step 3 keeps its results).
+    /// Makes the draft of photo `id` (or, without one, its step-2 area, see
+    /// [`AppCore::start_area`]) the current group's watermark area and learns what it looks
+    /// like; with no group yet, this makes group 1. Every photo whose result came from the
+    /// current group waits for matching again (areas saved for single photos stay, and so do
+    /// earlier groups). Fails with [`AppError::NothingToRemove`] when the area is empty.
+    /// Confirming, on a photo the current group found and that has no area of its own, the
+    /// very area it was found with changes nothing (step 3 keeps its results).
     pub fn confirm_set_area(&self, id: PhotoId) -> Result<()> {
+        self.confirm_area(id, false)
+    }
+
+    /// Like [`AppCore::confirm_set_area`], but makes the next group (group 1 when there is
+    /// none), which becomes the current one. Every photo in no group is reset first; the
+    /// photos of earlier groups stay as they are. Fails with [`AppError::NotReady`] until the
+    /// current group's matching has finished and no unsure photo holds it up.
+    pub fn confirm_new_group(&self, id: PhotoId) -> Result<()> {
+        self.confirm_area(id, true)
+    }
+
+    /// `Ok` when the next group can start: there is no group, or the current group's matching
+    /// has finished and [`AppCore::removal_blockers`] is empty. Else [`AppError::NotReady`].
+    fn ready_for_next_group(&self) -> Result<()> {
+        if self.session().ready_for_next_group() {
+            Ok(())
+        } else {
+            Err(AppError::NotReady)
+        }
+    }
+
+    fn confirm_area(&self, id: PhotoId, new_group: bool) -> Result<()> {
         let _job = self.jobs.start()?;
-        let (path, (w, h), draft, current) = {
+        if new_group {
+            self.ready_for_next_group()?;
+        }
+        let (path, (w, h), draft, start) = {
             let s = self.session();
             let entry = s.photos.get(id).ok_or_else(|| no_photo(id))?;
             let d = s.data.get(&id);
@@ -593,10 +659,10 @@ impl AppCore {
                 entry.path.clone(),
                 (entry.info.width, entry.info.height),
                 d.and_then(|d| d.draft.clone()),
-                s.area(id),
+                s.start_area(id),
             )
         };
-        let area = match (draft, current) {
+        let area = match (draft, start) {
             (Some(d), _) => area_from_edit(&d.bytes, d.w, d.h, w, h)?,
             (None, Some(a)) => a.to_full(),
             (None, None) => Mask::new(w, h),
@@ -606,9 +672,9 @@ impl AppCore {
         }
         // The same area confirmed again (step 3, Back, "Looks right" unchanged): nothing to
         // learn, and every match, tick and look in step 3 stays as it is.
-        if area.dimensions() == (w, h) {
+        if !new_group && area.dimensions() == (w, h) {
             let mut s = self.session();
-            if s.is_confirmed(id, &Area::from_mask(&area)) {
+            if s.confirms_nothing_new(id, &Area::from_mask(&area)) {
                 if let Some(d) = s.data.get_mut(&id) {
                     d.draft = None;
                 }
@@ -629,13 +695,22 @@ impl AppCore {
         if template.pieces.is_empty() {
             return Err(AppError::NothingToRemove);
         }
-        self.session().confirm(id, template, &area);
+        let mut s = self.session();
+        if new_group {
+            // Ticks and opens do not need the job slot; check again with the results stored.
+            if !s.ready_for_next_group() {
+                return Err(AppError::NotReady);
+            }
+            s.confirm_new(id, template, &area);
+        } else {
+            s.confirm_current(id, template, &area);
+        }
         Ok(())
     }
 
-    /// What the confirmed set area looks like, once there is one.
+    /// What the current group's watermark looks like, once there is a group.
     pub fn confirmed_template(&self) -> Option<Arc<WatermarkTemplate>> {
-        self.session().template.clone()
+        self.session().current().map(|g| g.template.clone())
     }
 
     /// Small JPEG of photo `id` (long side [`images::THUMB_LONG_SIDE`]), kept in memory. A

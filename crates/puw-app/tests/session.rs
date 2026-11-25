@@ -10,64 +10,21 @@ mod common;
 
 use std::path::{Path, PathBuf};
 use std::sync::mpsc;
-use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
+use common::{
+    Recorder, add_synth, confirm_truth, fixture, iou, matching, model_fixture, noop, rect_area,
+    state, synth, synth_truth,
+};
 use image::{GrayImage, Rgb, RgbImage};
 use puw_app::images::{GRID_LONG_SIDE, jpeg, thumbnail};
 use puw_app::photos::Problem;
 use puw_app::{
-    AppCore, AppError, AreaStatus, DataDirs, LoadPurpose, MatchSummary, PhotoState, ProgressEvent,
-    Settings, Suggestion, user_message,
+    AppCore, AppError, AreaStatus, DataDirs, LoadPurpose, MatchSummary, ProgressEvent, Settings,
+    Suggestion, user_message,
 };
 use puw_core::{Library, MatchStatus, ModelKind, SavedWatermark, build_template, find};
-
-/// Model tests run one at a time, so their timings and memory do not add up and only one of
-/// them writes to the shared compiled-model cache.
-static MODEL_TESTS: Mutex<()> = Mutex::new(());
-
-struct Fixture {
-    core: AppCore,
-    dirs: DataDirs,
-    _tmp: tempfile::TempDir,
-    _serial: Option<MutexGuard<'static, ()>>,
-}
-
-/// A core with its own data folder. `models` replaces the data folder's (empty) models folder.
-fn fixture(models: Option<PathBuf>) -> Fixture {
-    let serial = models
-        .as_ref()
-        .map(|_| MODEL_TESTS.lock().unwrap_or_else(PoisonError::into_inner));
-    let tmp = tempfile::tempdir().unwrap();
-    let mut dirs = DataDirs::at(tmp.path());
-    if let Some(m) = models {
-        dirs.models = m;
-        dirs.cache = common::model_cache_dir();
-    }
-    Settings {
-        prefer_gpu: cfg!(target_os = "macos"),
-        ..Settings::default()
-    }
-    .save(&dirs.settings)
-    .unwrap();
-    Fixture {
-        core: AppCore::new(dirs.clone()).unwrap(),
-        dirs,
-        _tmp: tmp,
-        _serial: serial,
-    }
-}
-
-/// A core that can load models, or `None` (with a message) when `PUW_MODELS_DIR` is not set.
-fn model_fixture() -> Option<Fixture> {
-    match common::models_dir() {
-        Some(m) => Some(fixture(Some(m))),
-        None => {
-            eprintln!("skipped: PUW_MODELS_DIR not set");
-            None
-        }
-    }
-}
 
 fn fixed() -> PathBuf {
     common::synth_dir().join("fixed")
@@ -105,21 +62,6 @@ fn covered(truth: &GrayImage, area: &[u8]) -> f64 {
     }
     assert!(all > 0);
     hit as f64 / all as f64
-}
-
-fn noop(_: ProgressEvent) {}
-
-#[derive(Default)]
-struct Recorder(Mutex<Vec<ProgressEvent>>);
-
-impl Recorder {
-    fn push(&self, e: ProgressEvent) {
-        self.0.lock().unwrap().push(e);
-    }
-
-    fn events(&self) -> Vec<ProgressEvent> {
-        self.0.lock().unwrap().clone()
-    }
 }
 
 fn load_fractions(events: &[ProgressEvent]) -> Vec<(f32, LoadPurpose)> {
@@ -175,7 +117,7 @@ fn detect_fixed_set() {
     assert_eq!(f.core.edit_size(rep).unwrap(), (1536, 1024));
     let share = covered(
         &ground_truth(&name_of(&f.core, rep)),
-        &f.core.area(rep).unwrap(),
+        &f.core.start_area(rep).unwrap(),
     );
     eprintln!("representative {rep} covers {share:.3} of its watermark");
     assert!(share >= 0.8, "covers {share:.3}");
@@ -281,6 +223,8 @@ fn second_job_is_busy() {
         assert!(matches!(core.remove_photo(0), Err(AppError::Busy)));
         assert!(matches!(core.clear_photos(), Err(AppError::Busy)));
         assert!(matches!(core.confirm_set_area(0), Err(AppError::Busy)));
+        assert!(matches!(core.confirm_new_group(0), Err(AppError::Busy)));
+        assert!(matches!(core.clear_groups(), Err(AppError::Busy)));
         assert!(matches!(core.match_all(&noop), Err(AppError::Busy)));
         first.join().unwrap().unwrap();
     });
@@ -356,7 +300,7 @@ fn use_saved_skips_models() {
     let rep = out.representative;
     let share = covered(
         &ground_truth(&name_of(&f.core, rep)),
-        &f.core.area(rep).unwrap(),
+        &f.core.start_area(rep).unwrap(),
     );
     assert!(share >= 0.8, "covers {share:.3}");
 
@@ -565,7 +509,7 @@ fn new_guesses_drop_stale_drafts() {
 
     let out = f.core.use_saved(&w.id, &noop).unwrap();
     assert!(out.sample.contains(&1));
-    let shown = f.core.area(1).unwrap();
+    let shown = f.core.start_area(1).unwrap();
     assert!(shown.iter().any(|&v| v != 0));
     assert!(shown[..100].iter().all(|&v| v == 0));
 
@@ -599,7 +543,7 @@ fn unreadable_sample_photo_is_left_out() {
         rec.events()
             .contains(&ProgressEvent::Looking { done: 3, total: 3 })
     );
-    assert!(f.core.area(4).unwrap().iter().all(|&v| v == 0));
+    assert!(f.core.start_area(4).unwrap().iter().all(|&v| v == 0));
 
     // With no readable photo in the sample the search fails with a plain sentence.
     for name in ["01.png", "06.png"] {
@@ -648,7 +592,8 @@ fn unreadable_photos_get_their_own_state() {
         assert!(f.core.set_included(id, true).is_err());
     }
     assert_eq!(sum.found + sum.unsure + sum.not_found, 6, "{sum:?}");
-    assert_eq!(sum.total, 8);
+    // Photos that cannot be read are in no group, so they are not counted at all.
+    assert_eq!(sum.total, 6);
     assert!(!f.core.removal_blockers().contains(&2));
     assert!(!f.core.removal_blockers().contains(&5));
     assert!(!f.core.to_remove().contains(&2));
@@ -667,21 +612,6 @@ fn detect_leaves_out_unreadable_photo() {
 
 // ---- Step 3: finding the set's watermark in every photo ----
 
-fn synth(set: &str) -> PathBuf {
-    common::synth_dir().join(set)
-}
-
-/// Adds the marked photos `names` of synthetic set `set`; returns their ids in the same order.
-fn add_synth(core: &AppCore, set: &str, names: &[&str]) -> Vec<u32> {
-    let paths: Vec<PathBuf> = names
-        .iter()
-        .map(|n| synth(set).join("marked").join(format!("{n}.png")))
-        .collect();
-    let added = core.add_paths(&paths).unwrap();
-    assert_eq!(added.added.len(), names.len(), "{:?}", added.skipped);
-    added.added.iter().map(|p| p.id).collect()
-}
-
 fn synth_names(set: &str) -> Vec<String> {
     let mut v: Vec<String> = std::fs::read_dir(synth(set).join("marked"))
         .unwrap()
@@ -691,21 +621,6 @@ fn synth_names(set: &str) -> Vec<String> {
         .collect();
     v.sort();
     v
-}
-
-fn synth_truth(set: &str, name: &str) -> GrayImage {
-    image::open(synth(set).join("mask").join(format!("{name}.png")))
-        .unwrap()
-        .to_luma8()
-}
-
-/// Confirms the ground truth of `name` (photo `id`) as the set area. Synthetic photos are
-/// below the edit size, so the edit size is the photo size.
-fn confirm_truth(core: &AppCore, set: &str, name: &str, id: u32) {
-    let gt = synth_truth(set, name);
-    core.put_draft(id, gt.width(), gt.height(), gt.into_raw())
-        .unwrap();
-    core.confirm_set_area(id).unwrap();
 }
 
 /// Marks that change the luma under their ground truth by less than this on average are
@@ -730,47 +645,6 @@ fn visibility(set: &str, name: &str) -> f32 {
     sum / n.max(1.0)
 }
 
-fn iou(truth: &GrayImage, area: &[u8]) -> f64 {
-    assert_eq!(truth.as_raw().len(), area.len());
-    let (mut inter, mut uni) = (0u64, 0u64);
-    for (t, a) in truth.as_raw().iter().zip(area) {
-        let (t, a) = (*t != 0, *a != 0);
-        inter += (t && a) as u64;
-        uni += (t || a) as u64;
-    }
-    if uni == 0 {
-        0.0
-    } else {
-        inter as f64 / uni as f64
-    }
-}
-
-fn state(core: &AppCore, id: u32) -> PhotoState {
-    core.photo_states()
-        .into_iter()
-        .find(|s| s.id == id)
-        .expect("photo in the states")
-}
-
-fn matching(events: &[ProgressEvent]) -> Vec<(u32, u32)> {
-    events
-        .iter()
-        .filter_map(|e| match e {
-            ProgressEvent::Matching { done, total } => Some((*done, *total)),
-            _ => None,
-        })
-        .collect()
-}
-
-/// An edit-size area (row-major, 0/255) with the rectangle `x0..x1` x `y0..y1` painted.
-fn rect_area(w: u32, h: u32, x0: u32, y0: u32, x1: u32, y1: u32) -> Vec<u8> {
-    let mut v = vec![0u8; (w * h) as usize];
-    for y in y0..y1 {
-        v[(y * w + x0) as usize..(y * w + x1) as usize].fill(255);
-    }
-    v
-}
-
 #[test]
 fn match_random_set() {
     let f = fixture(None);
@@ -778,10 +652,10 @@ fn match_random_set() {
     assert_eq!(names.len(), 12);
     let refs: Vec<&str> = names.iter().map(String::as_str).collect();
     let ids = add_synth(&f.core, "random", &refs);
-    confirm_truth(&f.core, "random", &names[0], ids[0]);
     let negatives = synth_names("negative");
     let refs: Vec<&str> = negatives.iter().map(String::as_str).collect();
     let neg_ids = add_synth(&f.core, "negative", &refs);
+    confirm_truth(&f.core, "random", &names[0], ids[0]);
     assert_eq!(state(&f.core, neg_ids[0]).status, AreaStatus::Pending);
 
     let rec = Recorder::default();
@@ -954,7 +828,7 @@ fn painting_not_found_ticks_it() {
 #[test]
 fn photo_edit_does_not_change_set() {
     let f = fixture(None);
-    let ids = add_synth(&f.core, "random", &["00", "01", "03", "04"]);
+    let ids = add_synth(&f.core, "random", &["00", "01", "03", "04", "11"]);
     confirm_truth(&f.core, "random", "00", ids[0]);
     f.core.match_all(&noop).unwrap();
     let template = f.core.confirmed_template().unwrap();
@@ -970,14 +844,20 @@ fn photo_edit_does_not_change_set() {
         &f.core.confirmed_template().unwrap()
     ));
 
-    // A photo added now waits for matching and holds up removal until then.
-    let new = add_synth(&f.core, "random", &["11"])[0];
+    // A changed set area makes the other photos wait for matching again, and they hold up
+    // removal until then; photo 3 keeps its own area.
+    let new = ids[4];
+    let (w, h) = f.core.edit_size(ids[0]).unwrap();
+    let mut changed = f.core.area(ids[0]).unwrap();
+    changed[0] = 255;
+    f.core.put_draft(ids[0], w, h, changed).unwrap();
+    f.core.confirm_set_area(ids[0]).unwrap();
     assert_eq!(state(&f.core, new).status, AreaStatus::Pending);
-    assert_eq!(f.core.removal_blockers(), vec![new]);
+    assert_eq!(f.core.removal_blockers(), vec![ids[1], ids[2], new]);
 
     let rec = Recorder::default();
     f.core.match_all(&|e| rec.push(e)).unwrap();
-    assert_eq!(matching(&rec.events()).last(), Some(&(1, 1)));
+    assert_eq!(matching(&rec.events()).last(), Some(&(3, 3)));
     // Found with the set's watermark, where random/11 has it, not where photo 3 was edited.
     assert_eq!(state(&f.core, new).status, AreaStatus::Found);
     let v = iou(&synth_truth("random", "11"), &f.core.area(new).unwrap());
@@ -1263,19 +1143,25 @@ fn layers_reread_only_for_template_size() {
             .iter()
             .any(|e| matches!(e, ProgressEvent::Reading { .. }))
     };
-    // random/00 and random/04 are 1536x1024, random/01 and random/02 are not.
+    // random/00 and random/04 are 1536x1024, random/01 and random/02 are not. Adding photos
+    // clears the groups, so the set area is confirmed again after each change.
     let ids = add_synth(&f.core, "random", &["00", "01"]);
-    confirm_truth(&f.core, "random", "00", ids[0]);
+    let confirm = || confirm_truth(&f.core, "random", "00", ids[0]);
+    confirm();
     assert!(reads(&f.core), "the set has no layers yet");
 
     add_synth(&f.core, "negative", &["00"]);
+    confirm();
     assert!(!reads(&f.core), "a photo of another size was added");
     add_synth(&f.core, "random", &["02"]);
+    confirm();
     assert!(!reads(&f.core), "a photo of another size was added");
 
     add_synth(&f.core, "random", &["04"]);
+    confirm();
     assert!(reads(&f.core), "a photo of the watermark's size was added");
     add_synth(&f.core, "negative", &["01"]);
+    confirm();
     assert!(
         !reads(&f.core),
         "the layers were read with photo 04 in the set"
