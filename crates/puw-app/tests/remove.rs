@@ -323,18 +323,23 @@ fn removes_into_output_folder() {
     }
     assert!(f.core.result_image(999).is_err());
 
-    // A second run never replaces the first results.
+    // A second run with nothing changed does nothing again: the results are listed as they are.
+    let again = f.core.remove(&|_| {}).unwrap();
+    assert_eq!(again.done, report.done);
+    assert_eq!(names_in(&out), ["00.png", "01.png"]);
+
+    // With a changed area the photo is done again, and never replaces the first result.
+    paint(&f.core, ids[0], (10, 10, 60, 40));
+    let first = fs::read(out.join("00.png")).unwrap();
     let start = Instant::now();
     let again = f.core.remove(&|_| {}).unwrap();
     eprintln!(
-        "second run (remover loaded): {:.2?} for 2 photos",
+        "second run (remover loaded): {:.2?} for 1 photo",
         start.elapsed()
     );
     assert_eq!(again.done.len(), 2);
-    assert_eq!(
-        names_in(&out),
-        ["00 (2).png", "00.png", "01 (2).png", "01.png"]
-    );
+    assert_eq!(names_in(&out), ["00 (2).png", "00.png", "01.png"]);
+    assert_eq!(fs::read(out.join("00.png")).unwrap(), first);
     assert_eq!(bytes_of(&paths), before);
 }
 
