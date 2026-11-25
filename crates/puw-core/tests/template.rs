@@ -3,7 +3,9 @@ mod common;
 use image::{GrayImage, Luma, RgbImage};
 use puw_core::mask::Mask;
 use puw_core::ncc::masked_ncc;
-use puw_core::template::{MatchResult, MatchStatus, WatermarkTemplate, build_template, find};
+use puw_core::template::{
+    MatchResult, MatchStatus, WatermarkTemplate, build_template, find, main_bbox, saved_score,
+};
 use std::path::Path;
 use std::time::Instant;
 
@@ -169,6 +171,85 @@ fn random_set() {
     }
     assert!(visible >= 10, "only {visible} visible marks");
     assert!(found * 100 >= visible * 95, "Found {found} of {visible}");
+}
+
+/// `m` plus a filled disc of radius 12 (the editor's default brush dot) at `(cx, cy)`.
+fn with_dot(m: &Mask, cx: i64, cy: i64) -> Mask {
+    let mut out = m.clone();
+    for y in cy - 12..=cy + 12 {
+        for x in cx - 12..=cx + 12 {
+            if (x - cx).pow(2) + (y - cy).pow(2) <= 144 {
+                out.put_pixel(x as u32, y as u32, Luma([255]));
+            }
+        }
+    }
+    out
+}
+
+/// A stray brush dot far from the mark: matching still finds the mark (the dot is carried along
+/// at its offset, not searched for), the template's main box stays the mark's, and the saved
+/// position scores as without the dot.
+#[test]
+fn stray_dot_is_carried_along() {
+    let set = common::synth_dir().join("random");
+    let names = names(&set);
+    let truth0 = gt(&set, &names[0]);
+    let b0 = puw_core::mask::bbox(&truth0).expect("mark");
+    let (w, h) = truth0.dimensions();
+    // 300 px beside the mark, on whichever side has room.
+    let dx: i64 = if b0.left() > 320 { -300 } else { 300 };
+    let (dot_x, dot_y) = (
+        i64::from(if dx < 0 { b0.left() } else { b0.right() }) + dx,
+        i64::from(b0.top()) + i64::from(b0.height()) / 2,
+    );
+    let area = with_dot(&truth0, dot_x, dot_y);
+    let ref_img = rgb(&set, "marked", &names[0]);
+    let t = build_template(&ref_img, &area);
+    assert_eq!(t.pieces.len(), 2, "the dot is a piece of its own");
+    let mb = main_bbox(&t).expect("main box");
+    let rel = |v: i32, n: u32| v as f32 / n as f32;
+    assert!((mb[0] - rel(b0.left(), w)).abs() < 0.01, "{mb:?}");
+    assert!(mb[2] < 1.2 * rel(b0.width() as i32, w), "{mb:?}");
+    let plain = build_template(&ref_img, &truth0);
+    assert_eq!(saved_score(&t, &ref_img), saved_score(&plain, &ref_img));
+
+    let mut found = 0;
+    for name in &names[1..] {
+        let img = rgb(&set, "marked", name);
+        let truth = gt(&set, name);
+        let (r, secs) = timed_find(&t, &img);
+        let (p, _) = timed_find(&plain, &img);
+        eprintln!(
+            "dot {name}: {:?} conf {:.3} (without dot {:?} {:.3}) {secs:.2}s",
+            r.status, r.confidence, p.status, p.confidence
+        );
+        assert_eq!(r.status, p.status, "{name}");
+        if r.status != MatchStatus::Found {
+            continue;
+        }
+        found += 1;
+        // The mark is where it is without the dot, and the dot sits at its offset from it.
+        let b = puw_core::mask::bbox(&p.mask).expect("found");
+        let (iw, ih) = img.dimensions();
+        let main_only: Mask = Mask::from_fn(iw, ih, |x, y| {
+            let near = (x as i32) >= b.left() - 2
+                && (x as i32) <= b.right() + 2
+                && (y as i32) >= b.top() - 2
+                && (y as i32) <= b.bottom() + 2;
+            Luma([if near { r.mask.get_pixel(x, y).0[0] } else { 0 }])
+        });
+        assert!(iou(&main_only, &p.mask) > 0.95, "{name}");
+        assert!(iou(&p.mask, &truth) >= 0.6, "{name}");
+        // Offsets scale with the photo's long side.
+        let k = iw.max(ih) as f32 / w.max(h) as f32;
+        let ex = b.left() as f32 + (dot_x - i64::from(b0.left())) as f32 * k;
+        let ey = b.top() as f32 + (dot_y - i64::from(b0.top())) as f32 * k;
+        let (ex, ey) = (ex.round() as i64, ey.round() as i64);
+        if (0..i64::from(iw)).contains(&ex) && (0..i64::from(ih)).contains(&ey) {
+            assert_eq!(r.mask.get_pixel(ex as u32, ey as u32).0[0], 255, "{name}");
+        }
+    }
+    assert!(found >= 9, "found {found}");
 }
 
 #[test]

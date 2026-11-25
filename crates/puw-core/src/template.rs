@@ -56,6 +56,14 @@ const MAX_SCALE_SPREAD: f32 = 0.1;
 const MIN_PIECE_FRAC: f64 = 0.001;
 /// Components whose bounding boxes are closer than this fraction of the long side merge.
 const MERGE_FRAC: f32 = 0.02;
+/// A piece with fewer pixels than this share of the largest piece is not searched for: it is
+/// carried along at its saved offset from the largest piece. Such a piece is a stray brush dot
+/// or a speck of scene the first guess caught, far from the mark (pieces are at least
+/// `MERGE_FRAC` apart). Searched on its own it would stretch the group template over most of
+/// the photo and pull every score down to its own. The smallest real part of a multi-piece
+/// mark in the tests (a ring logo beside the fixed set's text) holds about 18 % of the text's
+/// pixels; a dot of the editor's default brush beside that text holds about 2 %.
+const CARRY_FRAC: f32 = 0.1;
 
 type FImage = ImageBuffer<Luma<f32>, Vec<f32>>;
 
@@ -216,7 +224,7 @@ pub fn find(t: &WatermarkTemplate, img: &RgbImage) -> MatchResult {
     if w == 0 || h == 0 || t.ref_w == 0 || t.ref_h == 0 || t.pieces.is_empty() {
         return not_found(0.0);
     }
-    let Some(pieces) = t
+    let Some(all) = t
         .pieces
         .iter()
         .map(|p| Prepared::new(p, t.ref_w, t.ref_h))
@@ -224,6 +232,7 @@ pub fn find(t: &WatermarkTemplate, img: &RgbImage) -> MatchResult {
     else {
         return not_found(0.0);
     };
+    let (pieces, carried) = split_carried(all);
     let target = Target::new(img);
 
     let singles: Vec<Tmpl> = (0..pieces.len())
@@ -258,14 +267,25 @@ pub fn find(t: &WatermarkTemplate, img: &RgbImage) -> MatchResult {
         return not_found(confidence);
     };
     let mut out = GrayImage::new(w, h);
+    let size = ((target.nw, target.nh), (target.w, target.h));
     for (i, p) in &best.places {
-        paste(
-            &mut out,
-            &pieces[*i],
-            p,
-            (target.nw, target.nh),
-            (target.w, target.h),
-        );
+        paste(&mut out, &pieces[*i], p, size.0, size.1);
+    }
+    // Carried pieces keep their offset from the largest piece, wherever that was placed.
+    let anchor = best
+        .places
+        .iter()
+        .max_by_key(|(i, _)| pieces[*i].pixels)
+        .map(|(i, p)| (&pieces[*i], *p));
+    if let Some((a, ap)) = anchor {
+        for c in &carried {
+            let pl = Placement {
+                x: ap.x + c.ox - a.ox,
+                y: ap.y + c.oy - a.oy,
+                ..ap
+            };
+            paste(&mut out, c, &pl, size.0, size.1);
+        }
     }
     MatchResult {
         status,
@@ -275,18 +295,51 @@ pub fn find(t: &WatermarkTemplate, img: &RgbImage) -> MatchResult {
     }
 }
 
+/// Splits pieces into the ones searched for and the ones carried along (see `CARRY_FRAC`),
+/// keeping their order. The largest piece is always searched for.
+fn split_carried(all: Vec<Prepared>) -> (Vec<Prepared>, Vec<Prepared>) {
+    let largest = all.iter().map(|p| p.pixels).max().unwrap_or(0);
+    all.into_iter()
+        .partition(|p| p.pixels as f32 >= CARRY_FRAC * largest as f32)
+}
+
+/// Bounding box `[x, y, w, h]`, as fractions of the reference photo, of the pieces [`find`]
+/// searches for: the watermark without stray specks far from it (see `CARRY_FRAC`). `None`
+/// for a template without pieces or a damaged one.
+pub fn main_bbox(t: &WatermarkTemplate) -> Option<[f32; 4]> {
+    let all = t
+        .pieces
+        .iter()
+        .map(|p| Prepared::new(p, t.ref_w, t.ref_h).map(|q| (q.pixels, p.rel_bbox)))
+        .collect::<Option<Vec<_>>>()?;
+    let largest = all.iter().map(|(n, _)| *n).max()?;
+    let main = all
+        .iter()
+        .filter(|(n, _)| *n as f32 >= CARRY_FRAC * largest as f32)
+        .map(|(_, b)| *b);
+    let (mut x0, mut y0, mut x1, mut y1) = (f32::MAX, f32::MAX, f32::MIN, f32::MIN);
+    for [x, y, w, h] in main {
+        x0 = x0.min(x);
+        y0 = y0.min(y);
+        x1 = x1.max(x + w);
+        y1 = y1.max(y + h);
+    }
+    Some([x0, y0, x1 - x0, y1 - y0])
+}
+
 /// Score of the template at its saved position in `img` (same size as the reference): the
-/// fast path of [`find`] alone (+-2 px, scale 1, minimum over the pieces). `None` for a damaged
+/// fast path of [`find`] alone (+-2 px, scale 1, minimum over the pieces it searches for). `None` for a damaged
 /// template or a photo of another size.
 pub fn saved_score(t: &WatermarkTemplate, img: &RgbImage) -> Option<f32> {
     if img.dimensions() != (t.ref_w, t.ref_h) || t.pieces.is_empty() {
         return None;
     }
-    let pieces = t
+    let all = t
         .pieces
         .iter()
         .map(|p| Prepared::new(p, t.ref_w, t.ref_h))
         .collect::<Option<Vec<_>>>()?;
+    let (pieces, _) = split_carried(all);
     let singles: Vec<Tmpl> = (0..pieces.len())
         .map(|i| Tmpl::new(&pieces, &[i]))
         .collect();
@@ -419,6 +472,8 @@ struct Prepared {
     oy_f: f32,
     /// Reference-space pixels per native reference pixel.
     s_ref: f32,
+    /// Set pixels of `shape`.
+    pixels: u32,
 }
 
 impl Prepared {
@@ -441,6 +496,7 @@ impl Prepared {
             .iter()
             .map(|&v| (v != 0) as u8 as f32)
             .collect();
+        let pixels = unit.iter().filter(|&&v| v != 0.0).count() as u32;
         let weights = resize_f(&unit, shape.width() as usize, shape.height() as usize, w, h);
         let (ww, wh) = ref_dims(ref_w, ref_h);
         let (ox, oy, _, _) = edge_rect(p.rel_bbox, ref_w, ref_h);
@@ -455,6 +511,7 @@ impl Prepared {
             ox_f: p.rel_bbox[0] * ww as f32,
             oy_f: p.rel_bbox[1] * wh as f32,
             s_ref: REF_LONG / ref_w.max(ref_h) as f32,
+            pixels,
         })
     }
 }
