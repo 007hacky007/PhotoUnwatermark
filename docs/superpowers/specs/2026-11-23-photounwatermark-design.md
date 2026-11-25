@@ -125,8 +125,8 @@ anything we missed and the Eraser to clean up anything that is not watermark."
 - Tools: **Brush**, **Eraser**, **Rectangle**; **Size** slider; **Undo / Redo**; zoom **- / 100% / + / Fit**.
 - **Magnifier (owner's decision, 2026-11-24):** the user can magnify the image area they are working on. Besides
   zoom/pan, a toggleable magnifier (loupe) shows an enlarged view of the area around the cursor, including the red
-  layer and the brush outline, so fine edges can be painted without zooming the whole view *(builder's call, check:
-  loupe size, magnification steps, toggle button + shortcut)*.
+  layer and the brush outline, so fine edges can be painted without zooming the whole view (loupe confirmed by the
+  owner 2026-11-25; loupe size, magnification steps, toggle button + shortcut are the builder's call).
 - Shortcuts: B / E / R, `[` `]` size, Cmd/Ctrl+Z / Shift+Cmd/Ctrl+Z, wheel/pinch zoom, drag with Space or middle
   button to pan, hold Space (without dragging) to hide the red layer.
 - **Preview on this photo:** runs removal on this photo only, shows a before/after slider; the user can go back to
@@ -170,8 +170,8 @@ whether it was requested).
 **Model loading (owner's decision, 2026-11-24):** loading the models is slow on the CPU (about 30 s for all of
 them), so it never happens at app start and never blocks the screens where the user is working. Models are loaded
 only when the user starts something they already expect to wait for, and every load shows a progress or loading bar
-with a plain sentence ("Getting the watermark remover ready..."), never a frozen window. *Builder's call, check:* the
-detection models (segmenter, face detector) load when automatic detection starts after photos are added, as part of
+with a plain sentence ("Getting the watermark remover ready..."), never a frozen window. Confirmed by the owner
+2026-11-25: the detection models (segmenter, face detector) load when automatic detection starts after photos are added, as part of
 that step's progress; the removal model (LaMa) loads when the user first presses Preview or Remove, as part of that
 progress. Loaded models stay in memory for the rest of the session.
 
