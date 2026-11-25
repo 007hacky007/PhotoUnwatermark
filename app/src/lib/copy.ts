@@ -25,6 +25,8 @@ export const copy = {
       'The app needs to download its watermark remover once (about 690 MB). Your photos never leave this computer.',
     download: 'Download',
     pause: 'Pause',
+    resume: 'Resume',
+    pausedAt: (done: number) => `Paused at ${done} MB of ${DOWNLOAD_MEGABYTES} MB.`,
     tryAgain: 'Try again',
     downloading: 'Downloading the watermark remover...',
     progress: (done: number) => `${done} MB of ${DOWNLOAD_MEGABYTES} MB`,

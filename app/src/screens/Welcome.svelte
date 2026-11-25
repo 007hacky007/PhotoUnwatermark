@@ -21,6 +21,7 @@
   }
 
   async function start() {
+    if (downloading) return;
     error = null;
     pausing = false;
     downloading = true;
@@ -65,9 +66,11 @@
     <p>{copy.welcome.needsDownload}</p>
     {#if error !== null}
       <p class="error" role="alert">{error}</p>
+    {:else if doneBytes > 0}
+      <p>{copy.welcome.pausedAt(megabytes)}</p>
     {/if}
     <button type="button" class="primary" onclick={start}>
-      {error !== null ? copy.welcome.tryAgain : copy.welcome.download}
+      {error !== null ? copy.welcome.tryAgain : doneBytes > 0 ? copy.welcome.resume : copy.welcome.download}
     </button>
   {/if}
 </section>

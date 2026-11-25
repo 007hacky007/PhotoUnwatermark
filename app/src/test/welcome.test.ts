@@ -75,7 +75,7 @@ describe('Welcome', () => {
     assertPlainText(container);
   });
 
-  it('pauseStopsAndDownloadResumes', async () => {
+  it('pauseStopsAndResumeContinues', async () => {
     const first = openDownload();
     await start();
     await fireEvent.click(screen.getByRole('button', { name: copy.welcome.download }));
@@ -84,12 +84,38 @@ describe('Welcome', () => {
     cancelJob.mockImplementationOnce(async () => first.fail({ message: 'Stopped.', details: '' }));
     await fireEvent.click(screen.getByRole('button', { name: copy.welcome.pause }));
     expect(cancelJob).toHaveBeenCalledTimes(1);
-    const again = await screen.findByRole('button', { name: copy.welcome.download });
+    const again = await screen.findByRole('button', { name: copy.welcome.resume });
     expect(screen.queryByText('Stopped.')).toBeNull();
     expect(screen.queryByRole('button', { name: copy.welcome.tryAgain })).toBeNull();
     openDownload();
     await fireEvent.click(again);
     expect(downloadModels).toHaveBeenCalledTimes(2);
+  });
+
+  it('pausedShowsProgressAndResume', async () => {
+    const first = openDownload();
+    const { container } = await start();
+    await fireEvent.click(screen.getByRole('button', { name: copy.welcome.download }));
+    first.emit(progress(120_000_000));
+    await screen.findByText('120 MB of 690 MB');
+    cancelJob.mockImplementationOnce(async () => first.fail({ message: 'Stopped.', details: '' }));
+    await fireEvent.click(screen.getByRole('button', { name: copy.welcome.pause }));
+    expect(await screen.findByText('Paused at 120 MB of 690 MB.')).toBeTruthy();
+    expect(screen.queryByRole('button', { name: copy.welcome.download })).toBeNull();
+    assertPlainText(container);
+    openDownload();
+    await fireEvent.click(screen.getByRole('button', { name: copy.welcome.resume }));
+    expect(downloadModels).toHaveBeenCalledTimes(2);
+  });
+
+  it('doubleClickStartsOneDownload', async () => {
+    openDownload();
+    await start();
+    const button = screen.getByRole('button', { name: copy.welcome.download });
+    button.click();
+    button.click();
+    await screen.findByRole('button', { name: copy.welcome.pause });
+    expect(downloadModels).toHaveBeenCalledTimes(1);
   });
 
   it('errorOffersTryAgain', async () => {
