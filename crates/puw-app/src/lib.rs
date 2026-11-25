@@ -2,8 +2,10 @@
 
 pub mod download;
 pub mod estimate;
+pub mod images;
 pub mod messages;
 pub mod paths;
+pub mod photos;
 pub mod settings;
 
 pub use estimate::{Eta, load_fraction};
