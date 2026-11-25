@@ -6,6 +6,10 @@ vi.mock('../lib/api', () => ({
   appStatus: vi.fn(),
   downloadModels: vi.fn(),
   cancelJob: vi.fn(),
+  listPhotos: vi.fn(async () => []),
+  suggestSaved: vi.fn(async () => null),
+  onDragDrop: vi.fn(async () => () => {}),
+  imageUrl: vi.fn(),
 }));
 
 import App from '../App.svelte';
@@ -47,6 +51,8 @@ async function start() {
 describe('Welcome', () => {
   beforeEach(() => {
     vi.resetAllMocks();
+    vi.mocked(api.listPhotos).mockResolvedValue([]);
+    vi.mocked(api.onDragDrop).mockResolvedValue(() => {});
   });
 
   it('showsSizeAndPrivacy', async () => {

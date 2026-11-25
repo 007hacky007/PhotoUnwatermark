@@ -4,6 +4,7 @@
   import ProgressLine from './lib/components/ProgressLine.svelte';
   import { copy } from './lib/copy';
   import { wizard as appWizard, type Wizard } from './lib/wizard.svelte';
+  import AddPhotos from './screens/AddPhotos.svelte';
   import Welcome from './screens/Welcome.svelte';
 
   let { wizard = appWizard }: { wizard?: Wizard } = $props();
@@ -40,6 +41,15 @@
   <main>
     {#if wizard.screen === 'welcome' && checked}
       <Welcome {wizard} />
+    {/if}
+    {#if wizard.screen === 'add'}
+      <AddPhotos {wizard} />
+    {/if}
+    {#if wizard.screen === 'check'}
+      <!-- Placeholder until the watermark editor; it reads wizard.outcome. -->
+      <section class="page">
+        <h1>{copy.steps[1]}</h1>
+      </section>
     {/if}
     {#if wizard.screen === 'settings'}
       <section class="page">

@@ -3,6 +3,8 @@
 // `UserError`.
 
 import { Channel, convertFileSrc, invoke } from '@tauri-apps/api/core';
+import { getCurrentWebview } from '@tauri-apps/api/webview';
+import { open } from '@tauri-apps/plugin-dialog';
 import type {
   AddResult,
   AppStatus,
@@ -47,6 +49,39 @@ export const cancelJob = () => invoke<void>('cancel_job');
 export const removeDownloadedData = () => invoke<void>('remove_downloaded_data');
 
 // Step 1: photos
+
+/** What the window reports while files are dragged over it. `paths` is empty except on a drop. */
+export interface DragDrop {
+  kind: 'hover' | 'leave' | 'drop';
+  paths: string[];
+}
+
+/** Calls `onEvent` for files dragged over the window. Resolves with the function that stops it. */
+export async function onDragDrop(onEvent: (e: DragDrop) => void): Promise<() => void> {
+  return getCurrentWebview().onDragDropEvent(({ payload }) => {
+    if (payload.type === 'enter' || payload.type === 'over') onEvent({ kind: 'hover', paths: [] });
+    else if (payload.type === 'leave') onEvent({ kind: 'leave', paths: [] });
+    else onEvent({ kind: 'drop', paths: payload.paths });
+  });
+}
+
+/** The kinds of photo the app reads (HEIC dropped directly is reported as skipped). */
+const PHOTO_EXTENSIONS = ['jpg', 'jpeg', 'png', 'tif', 'tiff', 'webp'];
+
+/** Asks for photos; an empty list when the person cancels. */
+export async function choosePhotos(): Promise<string[]> {
+  const picked = await open({
+    multiple: true,
+    directory: false,
+    filters: [{ name: 'Photos', extensions: PHOTO_EXTENSIONS }],
+  });
+  return picked ?? [];
+}
+
+/** Asks for a folder; `null` when the person cancels. */
+export async function chooseFolder(): Promise<string | null> {
+  return open({ multiple: false, directory: true });
+}
 
 export const addPaths = (paths: string[]) => invoke<AddResult>('add_paths', { paths });
 

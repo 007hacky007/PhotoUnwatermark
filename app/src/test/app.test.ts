@@ -6,6 +6,10 @@ vi.mock('../lib/api', () => ({
   appStatus: vi.fn(() => new Promise(() => {})),
   downloadModels: vi.fn(),
   cancelJob: vi.fn(),
+  listPhotos: vi.fn(async () => []),
+  suggestSaved: vi.fn(async () => null),
+  onDragDrop: vi.fn(async () => () => {}),
+  imageUrl: vi.fn(),
 }));
 
 import App from '../App.svelte';
