@@ -637,11 +637,12 @@ fn cleaned_guess(guess: &[u8], ew: u32, eh: u32) -> Vec<u8> {
     out.into_raw()
 }
 
-/// Small sets of the real set-a (three photos each, one fixed watermark): the step-2 strip
-/// places the first guess, as it is and cleaned up by hand ([`cleaned_guess`]), at the same
-/// place on the two other photos, and step 3 finds all three photos there. Times each strip
-/// placement. Aggregates only. `cargo test -p puw-app --release --test timings real_small --
-/// --ignored --nocapture`; needs `PUW_MODELS_DIR` and `PUW_REAL_DIR`.
+/// Small sets of the real set-a (3 to 7 photos, one fixed watermark): the step-2 strip places
+/// the first guess, as it is and cleaned up by hand ([`cleaned_guess`]), at the same place on
+/// every other photo, and step 3 finds every photo there. Times each strip placement and
+/// counts Found and Unsure per set size. Aggregates only. `cargo test -p puw-app --release
+/// --test timings real_small -- --ignored --nocapture`; needs `PUW_MODELS_DIR` and
+/// `PUW_REAL_DIR`. `PUW_SET_SIZES=4,5` runs only the sets of those sizes.
 #[test]
 #[ignore = "acceptance run, needs models and local photos"]
 fn real_small_sets_keep_the_set_position() {
@@ -661,26 +662,42 @@ fn real_small_sets_keep_the_set_position() {
         .join("timing");
     let a = photos_in(&real.join("set-a"));
     assert_eq!(a.len(), 8, "set-a has 8 photos");
-    let triples: [[usize; 3]; 8] = [
-        [0, 1, 2],
-        [3, 4, 5],
-        [5, 6, 7],
-        [0, 3, 7],
-        [1, 4, 6],
-        [2, 5, 7],
-        [0, 2, 4],
-        [1, 3, 6],
+    let sets: Vec<Vec<usize>> = vec![
+        vec![0, 1, 2],
+        vec![3, 4, 5],
+        vec![5, 6, 7],
+        vec![0, 3, 7],
+        vec![1, 4, 6],
+        vec![2, 5, 7],
+        vec![0, 2, 4],
+        vec![1, 3, 6],
+        vec![0, 1, 2, 3],
+        vec![4, 5, 6, 7],
+        vec![0, 2, 4, 6, 7],
+        vec![1, 3, 5, 6, 7],
+        vec![0, 1, 2, 3, 4, 5],
+        vec![2, 3, 4, 5, 6, 7],
+        vec![0, 1, 2, 3, 4, 5, 6],
+        vec![1, 2, 3, 4, 5, 6, 7],
     ];
+    let sizes: Option<Vec<usize>> = std::env::var("PUW_SET_SIZES")
+        .ok()
+        .map(|v| v.split(',').map(|n| n.trim().parse().unwrap()).collect());
     let (mut strip_ok, mut strip_all, mut times) = (0, 0, Vec::new());
     let (mut match_ok, mut match_all, mut wrong_found) = (0, 0, 0);
     let mut statuses = [0usize; 3];
+    // Per set size 3..=7: strip Found, strip Unsure, step-3 Found, step-3 Unsure.
+    let mut by_size = [[0usize; 4]; 8];
     let mut removed = Vec::new();
-    for (k, triple) in triples.iter().enumerate() {
+    for (k, set) in sets.iter().enumerate() {
+        if sizes.as_ref().is_some_and(|z| !z.contains(&set.len())) {
+            continue;
+        }
         for cleaned in [false, true] {
             let data = work.join("data-small");
             let _ = fs::remove_dir_all(&data);
             let c = core(&models, &work.join("coreml-cache"), &data, Detail::Best);
-            let paths: Vec<PathBuf> = triple.iter().map(|&i| a[i].clone()).collect();
+            let paths: Vec<PathBuf> = set.iter().map(|&i| a[i].clone()).collect();
             let ids = add(&c, &paths);
             let out = c.detect(&|_| {}).unwrap();
             let rep = out.representative;
@@ -705,6 +722,7 @@ fn real_small_sets_keep_the_set_position() {
                 strip_all += 1;
                 if p.status != puw_app::Placed::NotFound && same {
                     strip_ok += 1;
+                    by_size[set.len()][(p.status == puw_app::Placed::Unsure) as usize] += 1;
                 }
                 line.push(format!("{:?} same place {same}", p.status));
             }
@@ -719,18 +737,21 @@ fn real_small_sets_keep_the_set_position() {
                     puw_app::AreaStatus::Found if q >= 0.99 => {
                         match_ok += 1;
                         statuses[0] += 1;
+                        by_size[set.len()][2] += 1;
                     }
                     puw_app::AreaStatus::Found => wrong_found += 1,
                     puw_app::AreaStatus::Unsure if q >= 0.99 => {
                         match_ok += 1;
                         statuses[1] += 1;
+                        by_size[set.len()][3] += 1;
                     }
                     _ => statuses[2] += 1,
                 }
             }
             eprintln!(
-                "triple {}{}: strip {}",
+                "set {} ({} photos){}: strip {}",
                 k + 1,
+                set.len(),
                 if cleaned { " cleaned" } else { "" },
                 line.join(", ")
             );
@@ -743,6 +764,13 @@ fn real_small_sets_keep_the_set_position() {
         times[times.len() / 2],
         times[times.len() - 1]
     );
+    for (n, [sf, su, mf, mu]) in by_size
+        .iter()
+        .enumerate()
+        .filter(|(_, c)| c.iter().any(|v| *v > 0))
+    {
+        eprintln!("{n} photos: strip Found {sf} Unsure {su}; step 3 Found {mf} Unsure {mu}");
+    }
     eprintln!(
         "cleaning removed {:.1}-{:.1} % of the guess",
         100.0 * removed.iter().cloned().fold(f64::MAX, f64::min),
