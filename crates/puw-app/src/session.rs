@@ -7,7 +7,7 @@ use std::sync::Arc;
 
 use puw_core::{Mask, MatchResult, MatchStatus, SetLayers, WatermarkTemplate};
 
-use crate::core::{AreaStatus, DetectOutcome, GroupInfo, GroupsState, PhotoState};
+use crate::core::{AreaStatus, DetectOutcome, GroupInfo, GroupsState, PhotoState, StripCache};
 use crate::photos::{PhotoId, PhotoList};
 use crate::{Detail, OutputRule};
 
@@ -250,11 +250,12 @@ pub(crate) struct Session {
     /// The folder the person chose for the results of this set, when the usual one cannot
     /// be written.
     pub output_override: Option<PathBuf>,
-    /// The template the strip placements use: learned from this photo and drawing (full
-    /// size), kept until either changes.
-    pub strip: Option<(PhotoId, Arc<Area>, Arc<WatermarkTemplate>)>,
+    /// What the strip placements use and found (see [`crate::AppCore::place_on`]).
+    pub strip: Option<StripCache>,
     /// How many times `strip` was built.
     pub strip_built: usize,
+    /// How many times a strip photo was read and matched.
+    pub strip_matched: usize,
 }
 
 impl Session {

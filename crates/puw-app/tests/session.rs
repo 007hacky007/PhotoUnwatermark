@@ -146,6 +146,93 @@ fn first_guess_matches_fixed_set_and_is_offered() {
     assert!(secs < 30.0, "{secs:.1} s");
 }
 
+/// The fixed set with its watermark blended at `alpha` (the stored photos have 0.25), written
+/// as PNGs into `dir`.
+fn faint_fixed(alpha: f32, dir: &Path) -> Vec<PathBuf> {
+    (0..8)
+        .map(|i| {
+            let clean = image::open(fixed().join("clean").join(format!("0{i}.png")))
+                .unwrap()
+                .to_rgb8();
+            let mut img = image::open(fixed().join("marked").join(format!("0{i}.png")))
+                .unwrap()
+                .to_rgb8();
+            for (m, c) in img.pixels_mut().zip(clean.pixels()) {
+                for ch in 0..3 {
+                    let d = m.0[ch] as f32 - c.0[ch] as f32;
+                    m.0[ch] = (c.0[ch] as f32 + d * alpha / 0.25).round() as u8;
+                }
+            }
+            let path = dir.join(format!("faint-0{i}.png"));
+            img.save(&path).unwrap();
+            path
+        })
+        .collect()
+}
+
+/// The finder's own first guess, grown much further (60 px around it: about five times the
+/// watermark's area, as a generous hand drawing or the grown guess on a real outline
+/// watermark), confirmed on a fainter copy of the fixed set. The search alone misses most
+/// photos with it, and most of the drawing lies off the set's batch layer (so the drawing
+/// does not follow the layer). Yet every photo is found at the same place through the set's
+/// position, with the whole drawing as its area.
+#[test]
+fn grown_first_guess_still_matches_fixed_set() {
+    let Some(f) = model_fixture() else { return };
+    let dir = tempfile::tempdir().unwrap();
+    let paths = faint_fixed(0.14, dir.path());
+    f.core.add_paths(&paths).unwrap();
+    let out = f.core.detect(&noop).unwrap();
+    let rep = out.representative;
+    let (w, h) = f.core.edit_size(rep).unwrap();
+    let guess = GrayImage::from_raw(w, h, f.core.start_area(rep).unwrap()).unwrap();
+    let drawing = puw_core::mask::dilate(&guess, 60);
+    let photos = f.core.photos();
+    let img = |id: u32| image::open(&paths[id as usize]).unwrap().to_rgb8();
+    let t = build_template(&img(rep), &drawing);
+    let missed = photos
+        .iter()
+        .filter(|p| p.id != rep && find(&t, &img(p.id)).status != MatchStatus::Found)
+        .count();
+    let layers = puw_core::build_set_layers(&paths, &puw_core::Progress::none()).unwrap();
+    let near = puw_core::mask::dilate(
+        layers.get(w, h).expect("the set has a layer"),
+        puw_core::mask::grow_for(w, h, 0.004),
+    );
+    let (all, on) = drawing
+        .as_raw()
+        .iter()
+        .zip(near.as_raw())
+        .filter(|(d, _)| **d != 0)
+        .fold((0u64, 0u64), |(a, o), (_, n)| (a + 1, o + (*n != 0) as u64));
+    let on_layer = on as f64 / all as f64;
+    eprintln!("search alone misses {missed} of 7; {on_layer:.2} of the drawing near the layer");
+    assert!(
+        missed >= 4,
+        "premise: the search alone misses most photos ({missed})"
+    );
+    assert!(
+        on_layer < 0.5,
+        "premise: the drawing does not follow the layer ({on_layer:.2})"
+    );
+
+    f.core
+        .put_draft(rep, w, h, drawing.as_raw().clone())
+        .unwrap();
+    f.core.confirm_set_area(rep).unwrap();
+    let sum = f.core.match_all(&noop).unwrap();
+    eprintln!("grown guess as the set area: {sum:?}");
+    assert_eq!(sum.found, 8, "{sum:?}");
+    for p in &photos {
+        assert_eq!(
+            f.core.area(p.id).unwrap(),
+            *drawing.as_raw(),
+            "photo {} is not at the set position",
+            p.id
+        );
+    }
+}
+
 /// Model files that are gone are missing app data (download again), not a photo problem.
 #[test]
 fn missing_models_are_missing_data() {

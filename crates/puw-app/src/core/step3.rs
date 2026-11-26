@@ -5,7 +5,7 @@
 
 use std::sync::{Arc, Mutex};
 
-use puw_core::{MatchStatus, SetLayers, WatermarkTemplate, load, match_photo};
+use puw_core::{MatchStatus, PositionPrior, SetLayers, WatermarkTemplate, load, match_with};
 use rayon::prelude::*;
 use serde::Serialize;
 
@@ -194,12 +194,20 @@ impl AppCore {
         // Held while the event is sent, so events go out one at a time with `done` growing.
         let done = Mutex::new(0u32);
         ev(ProgressEvent::Matching { done: 0, total });
+        // Worked out once for the whole pass (it reads the layer of the template's size).
+        let prior = if todo.is_empty() {
+            None
+        } else {
+            PositionPrior::new(template, layers)
+        };
         let one = |(id, path, (w, h)): &Unmatched| -> Result<()> {
             job.check()?;
             match load(path) {
                 Ok(photo) => {
-                    let matched = Matched::new(&match_photo(template, &photo.rgb, layers));
-                    self.session().set_match(*id, matched, Some(group));
+                    let m = match_with(template, prior.as_ref(), &photo.rgb, job.flag());
+                    // A search cut short says nothing about the photo.
+                    job.check()?;
+                    self.session().set_match(*id, Matched::new(&m), Some(group));
                 }
                 // Nothing can be removed from a photo that cannot be read.
                 Err(e) => {

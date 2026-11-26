@@ -696,6 +696,56 @@ fn template_is_kept_until_the_drawing_changes() {
     assert_eq!(f.core.strip_templates_built(), 4);
 }
 
+/// A placement found with one drawing is kept for the next drawing on the same reference while
+/// the drawing's main box stays where it was (a stroke inside it, or a stray dot far away), so
+/// the strip photo is not read again; a drawing somewhere else looks again, and so does a photo
+/// where the watermark was not found.
+#[test]
+fn placement_is_kept_while_the_main_box_stays() {
+    let f = fixture(None);
+    let dir = tempfile::tempdir().unwrap();
+    let m = mixed_set(&f.core, dir.path());
+    let (r, other) = (m.logos[0], m.logos[1]);
+    let truth = m.logo_truths[0].clone();
+    put_truth(&f.core, r, &truth);
+    let first = f.core.place_on(r, other).unwrap();
+    assert_eq!(first.status, Placed::Found, "{first:?}");
+    assert_eq!(f.core.place_on(r, m.plain[0]).unwrap(), not_found());
+    assert_eq!(f.core.strip_photos_matched(), 2);
+
+    // A stroke inside the box, and a dot far from the watermark: same main box.
+    let mut edited = truth.clone();
+    let b = edge_box(&truth);
+    let (cx, cy) = (((b[0] + b[2]) / 2.0) as u32, ((b[1] + b[3]) / 2.0) as u32);
+    edited.put_pixel(cx, cy, image::Luma([255]));
+    let (w, h) = edited.dimensions();
+    let far = (if b[0] > w as f32 / 2.0 { 10 } else { w - 20 }, h - 20);
+    for y in far.1..far.1 + 6 {
+        for x in far.0..far.0 + 6 {
+            edited.put_pixel(x, y, image::Luma([255]));
+        }
+    }
+    put_truth(&f.core, r, &edited);
+    assert_eq!(f.core.place_on(r, other).unwrap(), first);
+    assert_eq!(f.core.strip_templates_built(), 2);
+    assert_eq!(f.core.strip_photos_matched(), 2);
+    // Not found is looked for again.
+    assert_eq!(f.core.place_on(r, m.plain[0]).unwrap(), not_found());
+    assert_eq!(f.core.strip_photos_matched(), 3);
+
+    // A drawing somewhere else: looked for again.
+    f.core
+        .put_draft(r, w, h, rect_area(w, h, 10, 10, 91, 91))
+        .unwrap();
+    f.core.place_on(r, other).unwrap();
+    assert_eq!(f.core.strip_photos_matched(), 4);
+
+    // Another reference starts afresh.
+    put_truth(&f.core, other, &m.logo_truths[1]);
+    f.core.place_on(other, r).unwrap();
+    assert_eq!(f.core.strip_photos_matched(), 5);
+}
+
 // ---- Groups from saved watermarks, and the leftovers' first guess ----
 
 /// Saves the watermark learned from the photo file `photo` and its `truth` as `name`; returns

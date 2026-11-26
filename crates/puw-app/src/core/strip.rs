@@ -2,10 +2,15 @@
 //! can show the one shared drawing on every photo of the strip. The locking rules of
 //! [`AppCore`] (see `core.rs`) apply here too.
 
+use std::collections::HashMap;
 use std::sync::Arc;
 
-use puw_core::mask;
-use puw_core::{MatchStatus, SetLayers, Transform, build_template, load, match_photo};
+use puw_core::mask::{self, Mask};
+use puw_core::template::main_bbox;
+use puw_core::{
+    MatchStatus, PositionPrior, SetLayers, Transform, WatermarkTemplate, build_template, load,
+    match_with,
+};
 use serde::Serialize;
 
 use super::{AppCore, no_photo};
@@ -77,15 +82,61 @@ fn on_edit_images(
     }
 }
 
+/// How far, as a share of the reference photo's width or height, each side of the drawing's
+/// main box may move before a strip photo's placement is looked for again (see
+/// [`AppCore::place_on`]). 1 % is 40 px on a 4000 px side: a stroke along the edge of the
+/// drawing, not a drawing moved to another place.
+const KEEP_PLACEMENT: f32 = 0.01;
+
+/// What [`AppCore::place_on`] keeps between calls: the watermark learned from one drawing on
+/// one reference photo, and where it was found on the strip photos.
+#[derive(Debug, Clone)]
+pub(crate) struct StripCache {
+    pub reference: PhotoId,
+    /// The drawing at the reference's edit size, as the editor sends it.
+    pub drawing: Arc<Area>,
+    /// The batch layers the placements were looked for with.
+    pub layers: Option<Arc<SetLayers>>,
+    pub template: Arc<WatermarkTemplate>,
+    pub prior: Option<Arc<PositionPrior>>,
+    /// The template's main box ([`main_bbox`]), as fractions of the reference photo.
+    pub main: Option<[f32; 4]>,
+    /// Per strip photo: where it was placed, and the main box it was placed with. Kept across
+    /// drawings on the same reference and layers.
+    pub placed: HashMap<PhotoId, ([f32; 4], StripPlacement)>,
+}
+
+fn same_layers(a: &Option<Arc<SetLayers>>, b: &Option<Arc<SetLayers>>) -> bool {
+    match (a, b) {
+        (Some(a), Some(b)) => Arc::ptr_eq(a, b),
+        (None, None) => true,
+        _ => false,
+    }
+}
+
+fn near(a: &[f32; 4], b: &[f32; 4]) -> bool {
+    let sides = |r: &[f32; 4]| [r[0], r[1], r[0] + r[2], r[1] + r[3]];
+    sides(a)
+        .iter()
+        .zip(sides(b))
+        .all(|(x, y)| (x - y).abs() <= KEEP_PLACEMENT)
+}
+
 impl AppCore {
     /// Where the shared drawing (the draft of photo `reference`, else its step-2 area, see
     /// [`AppCore::start_area`]) lands on photo `id`, found as step 3 finds it: the watermark
     /// learned from the drawing on `reference`, then looked for on `id` with the set's batch
-    /// layers (if read). On `reference` itself it is [`Placed::Found`] where it is, with no
-    /// photo read. An empty drawing is [`Placed::NotFound`] everywhere, again with no photo
-    /// read. The learned watermark is kept until the reference or the drawing changes, or the
-    /// groups are cleared. A photo that cannot be read gets its [`crate::photos::Problem`] and
-    /// the error is returned.
+    /// layers (if read) and their position prior. On `reference` itself it is
+    /// [`Placed::Found`] where it is, with no photo read. An empty drawing is
+    /// [`Placed::NotFound`] everywhere, again with no photo read. A photo that cannot be read
+    /// gets its [`crate::photos::Problem`] and the error is returned.
+    ///
+    /// The learned watermark is kept until the reference or the drawing (compared at edit size)
+    /// changes, or the groups are cleared. A `Found` or `Unsure` placement on a photo is kept
+    /// too, across drawings on the same reference, while the main box of the drawing (the parts
+    /// matching looks for, see [`main_bbox`]) stays within 1 % of where it was: a stroke on the
+    /// drawing then costs one read of the reference, and no photo is looked at again. A
+    /// `NotFound` is always looked for again, as the new drawing may be what finds it.
     pub fn place_on(&self, reference: PhotoId, id: PhotoId) -> Result<StripPlacement> {
         let job = self.jobs.start()?;
         let (ref_path, (w, h), draft, start, path, cached, layers) = {
@@ -105,63 +156,108 @@ impl AppCore {
         if id == reference {
             return Ok(StripPlacement::IDENTITY);
         }
-        let drawing = match (draft, start) {
-            (Some(d), _) => Arc::new(Area::from_mask(&area_from_edit(&d.bytes, d.w, d.h, w, h)?)),
-            (None, Some(a)) => a,
+        let (ew, eh) = images::edit_size(w, h);
+        // The drawing at edit size: what the editor drew, compared without upsampling it.
+        let drawing = match (&draft, &start) {
+            (Some(d), _) => {
+                let m = Mask::from_raw(d.w, d.h, d.bytes.clone()).ok_or_else(|| {
+                    AppError::from(puw_core::Error::InvalidInput(
+                        "draft of the wrong size".into(),
+                    ))
+                })?;
+                Arc::new(Area::from_mask(&mask::binarize(&m)))
+            }
+            (None, Some(a)) => Arc::new(Area::from_mask(&a.resized(ew, eh))),
             (None, None) => return Ok(StripPlacement::NOT_FOUND),
         };
         if drawing.is_empty() {
             return Ok(StripPlacement::NOT_FOUND);
         }
 
-        let template = match cached {
-            Some((r, a, t)) if r == reference && *a == *drawing => t,
-            _ => {
+        let kept = cached.filter(|c| c.reference == reference && same_layers(&c.layers, &layers));
+        let strip = match kept {
+            Some(c) if *c.drawing == *drawing => c,
+            kept => {
                 job.check()?;
                 let photo =
                     self.noting_problem(reference, load(&ref_path).map_err(AppError::from))?;
                 let (pw, ph) = photo.rgb.dimensions();
-                let full = drawing.to_full();
-                let area = if full.dimensions() == (pw, ph) {
-                    full
-                } else {
-                    mask::binarize(&mask::resize_any(&full, pw, ph))
+                let area = match (draft, start) {
+                    (Some(d), _) => area_from_edit(&d.bytes, d.w, d.h, pw, ph)?,
+                    (None, Some(a)) => a.resized(pw, ph),
+                    (None, None) => unreachable!("an empty drawing returned above"),
                 };
-                let t = Arc::new(build_template(&photo.rgb, &area));
+                let template = Arc::new(build_template(&photo.rgb, &area));
+                drop(photo);
+                let no_layers = SetLayers::none();
+                let prior = PositionPrior::new(&template, layers.as_deref().unwrap_or(&no_layers))
+                    .map(Arc::new);
+                let c = StripCache {
+                    reference,
+                    drawing,
+                    layers: layers.clone(),
+                    main: main_bbox(&template),
+                    template,
+                    prior,
+                    placed: kept.map(|k| k.placed).unwrap_or_default(),
+                };
                 let mut s = self.session();
-                s.strip = Some((reference, drawing, t.clone()));
+                s.strip = Some(c.clone());
                 s.strip_built += 1;
-                t
+                c
             }
         };
-        if template.pieces.is_empty() {
+        if strip.template.pieces.is_empty() {
             return Ok(StripPlacement::NOT_FOUND);
+        }
+        let Some(main) = strip.main else {
+            return Ok(StripPlacement::NOT_FOUND);
+        };
+        if let Some((at, p)) = strip.placed.get(&id)
+            && p.status != Placed::NotFound
+            && near(at, &main)
+        {
+            return Ok(*p);
         }
 
         job.check()?;
         let photo = self.noting_problem(id, load(&path).map_err(AppError::from))?;
-        let layers = layers.unwrap_or_else(|| Arc::new(SetLayers::none()));
-        let r = match_photo(&template, &photo.rgb, &layers);
-        let status = match r.status {
-            MatchStatus::Found => Placed::Found,
-            MatchStatus::Unsure => Placed::Unsure,
-            MatchStatus::NotFound => return Ok(StripPlacement::NOT_FOUND),
+        let t = &strip.template;
+        let r = match_with(t, strip.prior.as_deref(), &photo.rgb, job.flag());
+        job.check()?;
+        let placed = match (r.status, r.transform) {
+            (MatchStatus::Found, Some(tr)) => on_edit_images(
+                Placed::Found,
+                tr,
+                (t.ref_w, t.ref_h),
+                photo.rgb.dimensions(),
+            ),
+            (MatchStatus::Unsure, Some(tr)) => on_edit_images(
+                Placed::Unsure,
+                tr,
+                (t.ref_w, t.ref_h),
+                photo.rgb.dimensions(),
+            ),
+            _ => StripPlacement::NOT_FOUND,
         };
-        let Some(t) = r.transform else {
-            return Ok(StripPlacement::NOT_FOUND);
-        };
-        Ok(on_edit_images(
-            status,
-            t,
-            (template.ref_w, template.ref_h),
-            photo.rgb.dimensions(),
-        ))
+        let mut s = self.session();
+        s.strip_matched += 1;
+        if let Some(c) = s.strip.as_mut().filter(|c| c.reference == reference) {
+            c.placed.insert(id, (main, placed));
+        }
+        Ok(placed)
     }
 
     /// How many times [`AppCore::place_on`] learned the watermark from a drawing.
     #[doc(hidden)]
     pub fn strip_templates_built(&self) -> usize {
         self.session().strip_built
+    }
+
+    /// How many times [`AppCore::place_on`] looked for the watermark on a strip photo.
+    #[doc(hidden)]
+    pub fn strip_photos_matched(&self) -> usize {
+        self.session().strip_matched
     }
 }
 

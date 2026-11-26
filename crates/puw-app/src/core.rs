@@ -57,6 +57,7 @@ mod strip;
 pub use remove::{Done, Failed, LeftOut, OutputCheck, PREVIEW_LONG_SIDE, RemoveReport};
 pub use saved::{SavedInfo, default_watermark_name};
 pub use step3::{AreaStatus, GroupInfo, GroupsState, MatchSummary, PhotoState};
+pub(crate) use strip::StripCache;
 pub use strip::{Placed, StripPlacement};
 
 /// Load speed assumed for a model that was never loaded on this computer.
