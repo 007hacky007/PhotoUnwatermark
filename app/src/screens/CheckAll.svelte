@@ -503,8 +503,8 @@
           </li>
         {/each}
       </ul>
-      {#if leftovers > 0 && groups !== null}
-        <p class="line">{g.line(groups.groups, leftovers)}</p>
+      {#if groups !== null && (leftovers > 0 || groups.unreadable > 0)}
+        <p class="line">{g.line(groups.groups, leftovers, groups.unreadable)}</p>
       {/if}
       <footer>
         <button type="button" disabled={backing} onclick={back}>{copy.common.back}</button>

@@ -8,6 +8,8 @@ const SAMPLES: Record<string, unknown[][]> = {
     [[], 1],
     [[{ number: 1, photos: 1 }], 0],
     [[{ number: 1, photos: 140 }, { number: 2, photos: 52 }], 38],
+    [[{ number: 1, photos: 5 }], 0, 1],
+    [[{ number: 1, photos: 140 }, { number: 2, photos: 52 }], 38, 2],
   ],
 };
 
@@ -81,6 +83,10 @@ describe('copy', () => {
     ).toBe('Group 1: 140 photos. Group 2: 52 photos. 38 photos have no group yet.');
     expect(g.line([{ number: 1, photos: 1 }], 1)).toBe('Group 1: 1 photo. 1 photo has no group yet.');
     expect(g.line([{ number: 1, photos: 140 }], 0)).toBe('Group 1: 140 photos.');
+    expect(g.line([{ number: 1, photos: 5 }], 0, 1)).toBe('Group 1: 5 photos. 1 photo could not be opened.');
+    expect(g.line([{ number: 1, photos: 5 }], 3, 2)).toBe(
+      'Group 1: 5 photos. 3 photos have no group yet. 2 photos could not be opened.',
+    );
     expect(g.findNext(38)).toBe('Find the next watermark in these 38');
     expect(g.findNext(1)).toBe('Find the next watermark in this photo');
     expect(g.useSaved).toBe('Use a saved watermark...');
@@ -112,6 +118,7 @@ describe('copy', () => {
     expect(copy.done.groupName(2)).toBe('Name for the saved watermark of group 2');
     expect(copy.done.groupDefault('Watermark from 2026-11-26', 2)).toBe('Watermark from 2026-11-26 (group 2)');
     expect(copy.done.editedName('Studio')).toBe('Studio (edited)');
+    expect(copy.done.savedGroup(2)).toBe('Group 2: saved');
   });
 
   it('countsReadNaturally', () => {

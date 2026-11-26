@@ -486,6 +486,20 @@ describe('Check all photos', () => {
     expect(button('Remove watermark from 192 photos')).toBeTruthy();
   });
 
+  it('groupsLineCountsUnreadablePhotos', async () => {
+    // Every photo is counted on screen: in a group, with no group yet, or could not be opened.
+    setup([st(1, 'found'), st(2, 'found'), st(3, 'notFound', { group: 1 }), st(4, 'unreadable', { included: false })]);
+    expect(
+      await screen.findByText('Group 1: 2 photos. 1 photo has no group yet. 1 photo could not be opened.'),
+    ).toBeTruthy();
+  });
+
+  it('groupsLineWithOnlyUnreadableLeft', async () => {
+    setup([st(1, 'found'), st(2, 'unreadable', { included: false }), st(3, 'unreadable', { included: false })]);
+    expect(await screen.findByText('Group 1: 1 photo. 2 photos could not be opened.')).toBeTruthy();
+    expect(screen.queryByRole('button', { name: /^Find the next watermark/ })).toBeNull();
+  });
+
   it('noLeftoversKeepsTheFooter', async () => {
     setup([st(1, 'found'), st(2, 'found')]);
     await primary();

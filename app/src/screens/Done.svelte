@@ -23,7 +23,7 @@
   const version = ++visits;
   const fieldId = $props.id();
 
-  /** One save row per group that can be saved. */
+  /** One save row per group that can be saved and has photos. */
   interface Row {
     group: number;
     name: string;
@@ -67,7 +67,7 @@
       const { groups } = await groupsState();
       several = groups.length > 1;
       rows = groups
-        .filter((g) => g.canSave)
+        .filter((g) => g.canSave && g.photos > 0)
         .map((g) => ({
           group: g.number,
           name:
@@ -209,7 +209,7 @@
     {/if}
     {#each rows as row (row.group)}
       {#if wizard.savedGroups.includes(row.group)}
-        <p class="saved" role="status">{c.savedWatermark}</p>
+        <p class="saved" role="status">{several ? c.savedGroup(row.group) : c.savedWatermark}</p>
       {:else}
         <form onsubmit={(e) => save(e, row)}>
           <label for="{fieldId}-name-{row.group}">{several ? c.groupName(row.group) : c.name}</label>

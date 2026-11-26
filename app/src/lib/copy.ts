@@ -181,10 +181,14 @@ export const copy = {
     label: (n: number) => `Group ${n}`,
     noGroup: 'No group yet',
     notInGroup: 'Not in a group yet',
-    /** "Group 1: 140 photos. Group 2: 52 photos. 38 photos have no group yet." */
-    line: (list: readonly { number: number; photos: number }[], leftovers: number) => {
+    /**
+     * "Group 1: 140 photos. Group 2: 52 photos. 38 photos have no group yet. 2 photos could not
+     * be opened." The last two sentences only when there are such photos.
+     */
+    line: (list: readonly { number: number; photos: number }[], leftovers: number, unreadable = 0) => {
       const parts = list.map((g) => `Group ${g.number}: ${photos(g.photos)}.`);
       if (leftovers > 0) parts.push(noGroupYet(leftovers));
+      if (unreadable > 0) parts.push(`${photos(unreadable)} could not be opened.`);
       return parts.join(' ');
     },
     findNext: (n: number) => (n === 1 ? 'Find the next watermark in this photo' : `Find the next watermark in these ${n}`),
@@ -333,6 +337,8 @@ export const copy = {
     groupDefault: (base: string, n: number) => `${base} (group ${n})`,
     editedName: (name: string) => `${name} (edited)`,
     savedWatermark: 'Saved',
+    /** "Saved" when several groups were made: which one. */
+    savedGroup: (n: number) => `Group ${n}: saved`,
     saveFailed: 'The watermark could not be saved.',
     groupsFailed: 'The watermarks to save could not be listed.',
     openFailed: 'The folder could not be opened.',

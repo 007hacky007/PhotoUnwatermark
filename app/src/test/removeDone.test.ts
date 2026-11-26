@@ -655,6 +655,14 @@ describe('Done', () => {
     expect(screen.getAllByRole('button', { name: copy.done.saveWatermark })).toHaveLength(2);
   });
 
+  it('groupWithoutPhotosHasNoRow', async () => {
+    m.groupsState.mockResolvedValue(state(info(1), info(2, { photos: 0 })));
+    stepFive(report({ done: [done(1)] }));
+    expect(await screen.findByLabelText(copy.done.groupName(1))).toBeTruthy();
+    expect(screen.queryByLabelText(copy.done.groupName(2))).toBeNull();
+    expect(screen.getAllByRole('button', { name: copy.done.saveWatermark })).toHaveLength(1);
+  });
+
   it('savedGroupWithoutEditsHasNoRow', async () => {
     m.groupsState.mockResolvedValue(state(info(1, { savedName: 'Studio', canSave: false }), info(2)));
     stepFive(report({ done: [done(1)] }));
@@ -678,15 +686,16 @@ describe('Done', () => {
     const first = render(Done, { wizard });
     await screen.findByLabelText(copy.done.groupName(2));
     await fireEvent.click(screen.getAllByRole('button', { name: copy.done.saveWatermark })[1]);
-    expect(await screen.findByText(copy.done.savedWatermark)).toBeTruthy();
+    // With several groups the line says which one was saved.
+    expect(await screen.findByText('Group 2: saved')).toBeTruthy();
     expect(m.saveWatermark).toHaveBeenCalledWith(2, 'Watermark from 2026-11-25 (group 2)');
-    expect(screen.getAllByText(copy.done.savedWatermark)).toHaveLength(1);
+    expect(screen.queryByText(copy.done.savedWatermark)).toBeNull();
     expect(screen.getAllByRole('button', { name: copy.done.saveWatermark })).toHaveLength(1);
     expect(wizard.savedGroups).toEqual([2]);
     first.unmount();
     render(Done, { wizard });
     await screen.findByLabelText(copy.done.groupName(1));
-    expect(screen.getAllByText(copy.done.savedWatermark)).toHaveLength(1);
+    expect(screen.getAllByText(copy.done.savedGroup(2))).toHaveLength(1);
     expect(screen.getAllByRole('button', { name: copy.done.saveWatermark })).toHaveLength(1);
     expect(m.saveWatermark).toHaveBeenCalledTimes(1);
   });
@@ -715,7 +724,7 @@ describe('Done', () => {
     expect(wizard.groups).toBe(2);
     await screen.findByLabelText(copy.done.groupName(2));
     await fireEvent.click(screen.getAllByRole('button', { name: copy.done.saveWatermark })[0]);
-    await screen.findByText(copy.done.savedWatermark);
+    await screen.findByText(copy.done.savedGroup(1));
     expect(wizard.savedGroups).toEqual([1]);
     await fireEvent.click(screen.getByRole('button', { name: copy.done.startNewSet }));
     await waitFor(() => expect(wizard.screen).toBe('add'));
@@ -755,6 +764,9 @@ describe('Done', () => {
       }),
     );
     await screen.findByDisplayValue('Studio (edited)');
+    assertPlainText(document.body);
+    await fireEvent.click(screen.getAllByRole('button', { name: copy.done.saveWatermark })[0]);
+    await screen.findByText(copy.done.savedGroup(1));
     assertPlainText(document.body);
   });
 });
