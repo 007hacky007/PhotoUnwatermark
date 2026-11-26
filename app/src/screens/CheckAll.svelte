@@ -512,7 +512,7 @@
       <footer>
         <button type="button" disabled={backing} onclick={back}>{copy.common.back}</button>
         <div class="actions">
-          <span class="hint" aria-live="polite">{blocked ? c.needLookHint : groups !== null && !groups.matched ? c.waitHint : ''}</span>
+          <span class="hint" aria-live="polite">{blocked ? c.needLookHint : ''}</span>
           {#if leftovers > 0}
             <button type="button" disabled={held || members === 0} onclick={() => (asking = true)}>
               {c.removeFrom(members)}

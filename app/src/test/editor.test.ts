@@ -770,6 +770,39 @@ describe('Check the watermark', () => {
     expect(parse()[2]).toBeLessThan(s3);
   });
 
+  it('safariPinchGesturesZoomOnceAndAreRemoved', async () => {
+    const add = vi.spyOn(HTMLElement.prototype, 'addEventListener');
+    const remove = vi.spyOn(HTMLElement.prototype, 'removeEventListener');
+    const set = await openSet({ 1: someArea() });
+    const types = ['gesturestart', 'gesturechange', 'gestureend'];
+    for (const t of types) expect(add.mock.calls.some((c) => c[0] === t)).toBe(true);
+    const stage = screen.getByRole('application');
+    const scaleOf = () => Number(/scale\(([-\d.]+)\)/.exec(sheet().style.transform)![1]);
+    const send = (type: string, scale: number) => {
+      const ev = Object.assign(new Event(type, { bubbles: true, cancelable: true }), { scale, clientX: 0, clientY: 0 });
+      stage.dispatchEvent(ev);
+      return ev;
+    };
+    const s0 = scaleOf();
+    send('gesturestart', 1);
+    const ev = send('gesturechange', 2);
+    expect(ev.defaultPrevented).toBe(true);
+    await waitFor(() => expect(scaleOf()).toBeCloseTo(s0 * 2));
+    send('gesturechange', 3);
+    await waitFor(() => expect(scaleOf()).toBeCloseTo(s0 * 3));
+    // A ctrl wheel event of the same pinch is not applied again.
+    await fireEvent.wheel(stage, { deltaY: -20, ctrlKey: true });
+    await settle();
+    expect(scaleOf()).toBeCloseTo(s0 * 3);
+    send('gestureend', 3);
+    await fireEvent.wheel(stage, { deltaY: -20, ctrlKey: true });
+    await waitFor(() => expect(scaleOf()).toBeGreaterThan(s0 * 3));
+    set.unmount();
+    for (const t of types) expect(remove.mock.calls.some((c) => c[0] === t)).toBe(true);
+    add.mockRestore();
+    remove.mockRestore();
+  });
+
   it('moveToolDragsThePhotoWithoutPainting', async () => {
     await openSet({ 1: someArea() });
     await fireEvent.keyDown(window, { key: 'h' });
@@ -800,6 +833,31 @@ describe('Check the watermark', () => {
     expect(screen.getByRole('progressbar').dataset.indeterminate).toBe('true');
     expect(document.querySelector('.pane.dim')).toBeTruthy();
     assertPlainText(set.container);
+  });
+
+  it('placingOverlayClearsWhenPlacementEnds', async () => {
+    const gate: { ok: (p: StripPlacement) => void; fail: (e: unknown) => void }[] = [];
+    placeOn.mockImplementation(() => new Promise<StripPlacement>((ok, fail) => gate.push({ ok, fail })));
+    await openSet({ 1: someArea() }, { sample: [1, 2, 3, 4], representative: 1 });
+    const placing = () => screen.queryByText(copy.checkWatermark.placing, { selector: '.sentence' });
+    // Success.
+    await fireEvent.click(button(copy.checkWatermark.stripPhoto(2, 4)));
+    await waitFor(() => expect(placing()).toBeTruthy());
+    gate[0].ok(placed('found'));
+    await waitFor(() => expect(placing()).toBeNull());
+    expect(document.querySelector('.pane.dim')).toBeNull();
+    // Error.
+    await fireEvent.click(button(copy.checkWatermark.stripPhoto(3, 4)));
+    await waitFor(() => expect(placing()).toBeTruthy());
+    gate[1].fail({ message: '', details: 'x' });
+    await waitFor(() => expect(placing()).toBeNull());
+    expect(document.querySelector('.pane.dim')).toBeNull();
+    // Stop: another photo is chosen while it runs.
+    await fireEvent.click(button(copy.checkWatermark.stripPhoto(4, 4)));
+    await waitFor(() => expect(placing()).toBeTruthy());
+    await fireEvent.click(button(copy.checkWatermark.stripPhoto(1, 4)));
+    await waitFor(() => expect(placing()).toBeNull());
+    expect(document.querySelector('.pane.dim')).toBeNull();
   });
 
   it('spaceStillHidesRedAfterClickingButtons', async () => {

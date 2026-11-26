@@ -17,7 +17,7 @@
   import type { OuterHistory } from './shared';
   import Toolbar from './Toolbar.svelte';
   import { DEFAULT_SIZE, stepSize, type Tool } from './tools';
-  import { fit, nextZoomStep, panBy, prevZoomStep, toImage, toScreen, wheelPan, wheelZoom, zoomAt, type View } from './view';
+  import { fit, nextZoomStep, gestureRatio, panBy, prevZoomStep, toImage, toScreen, wheelPan, wheelZoom, zoomAt, type View } from './view';
 
   type Props = {
     photoId: PhotoId;
@@ -139,9 +139,12 @@
     const observer = typeof ResizeObserver === 'undefined' ? null : new ResizeObserver(measure);
     observer?.observe(stage);
     stage.addEventListener('wheel', wheel, { passive: false });
+    // Safari (the Mac app's web view) may report a pinch as gestures instead of ctrl wheel events.
+    for (const t of GESTURES) stage.addEventListener(t, gesture as EventListener, { passive: false });
     return () => {
       observer?.disconnect();
       stage.removeEventListener('wheel', wheel);
+      for (const t of GESTURES) stage.removeEventListener(t, gesture as EventListener);
       red?.cancel();
     };
   });
@@ -188,12 +191,34 @@
     return [e.clientX - box.left, e.clientY - box.top];
   }
 
+  const GESTURES = ['gesturestart', 'gesturechange', 'gestureend'];
+  /** The scale of the pinch gesture last applied, or null when none runs. While one runs, ctrl wheel events are the same pinch and are ignored. */
+  let gestureScale: number | null = null;
+
+  function gesture(e: Event & { scale?: number; clientX?: number; clientY?: number }) {
+    e.preventDefault();
+    if (e.type === 'gestureend') {
+      gestureScale = null;
+      return;
+    }
+    if (e.type === 'gesturestart') {
+      gestureScale = e.scale ?? 1;
+      return;
+    }
+    if (!dims || stroke || gestureScale === null) return;
+    const scale = e.scale ?? 1;
+    const [px, py] = local({ clientX: e.clientX ?? 0, clientY: e.clientY ?? 0 });
+    zoomTo(view.scale * gestureRatio(gestureScale, scale), px, py);
+    gestureScale = scale;
+  }
+
   function wheel(e: WheelEvent) {
     e.preventDefault();
     if (!dims || stroke) return;
     const [px, py] = local(e);
     pointer = { x: px, y: py };
     if (e.ctrlKey || e.metaKey) {
+      if (gestureScale !== null) return;
       // A pinch on a trackpad arrives as a wheel with ctrlKey; Ctrl or Cmd with a wheel zooms too.
       zoomTo(view.scale * wheelZoom(e.deltaY, e.deltaMode, e.ctrlKey, boxH), px, py);
     } else {

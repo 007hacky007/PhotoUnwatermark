@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest';
-import { fit, nextZoomStep, panBy, prevZoomStep, toImage, toScreen, wheelPan, wheelZoom, zoomAt, ZOOM_STEPS } from './view';
+import { fit, nextZoomStep, gestureRatio, panBy, prevZoomStep, toImage, toScreen, wheelPan, wheelZoom, zoomAt, ZOOM_STEPS } from './view';
 
 describe('view', () => {
   it('fitCentres', () => {
@@ -70,6 +70,22 @@ describe('view', () => {
     expect(wheelZoom(3, 1, false, 800)).toBeCloseTo(wheelZoom(48, 0, false, 800));
     expect(wheelZoom(1, 2, false, 800)).toBeCloseTo(wheelZoom(800, 0, false, 800));
     // A pinch's small deltas still zoom noticeably.
+    expect(wheelZoom(-10, 0, true, 800)).toBeCloseTo(Math.exp(0.1));
+  });
+});
+
+describe('gestures and wheel notches', () => {
+  it('gestureRatioIsTheFactorSinceTheLastEvent', () => {
+    expect(gestureRatio(1, 1.5)).toBeCloseTo(1.5);
+    expect(gestureRatio(1.5, 3)).toBeCloseTo(2);
+    expect(gestureRatio(2, 1)).toBeCloseTo(0.5);
+    expect(gestureRatio(0, 2)).toBe(1);
+    expect(gestureRatio(1, 0)).toBe(1);
+  });
+
+  it('aWheelNotchWithCtrlOrCmdStepsLikeAPlainWheel', () => {
+    expect(wheelZoom(-100, 0, true, 800)).toBeCloseTo(wheelZoom(-100, 0, false, 800));
+    expect(wheelZoom(-3, 1, true, 800)).toBeCloseTo(wheelZoom(-3, 1, false, 800));
     expect(wheelZoom(-10, 0, true, 800)).toBeCloseTo(Math.exp(0.1));
   });
 });

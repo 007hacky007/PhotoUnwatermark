@@ -658,12 +658,17 @@
     padding: 0 var(--space-4);
     text-align: center;
   }
+  /* A pill behind the words, so they read on a bright photo. */
+  .placing .sentence,
+  .placing .wait {
+    padding: var(--space-1) var(--space-4);
+    border-radius: 999px;
+    background: var(--surface);
+    color: var(--text);
+  }
   .placing .sentence {
     font-size: var(--text-large);
     font-weight: 600;
-  }
-  .placing .wait {
-    color: var(--text-muted);
   }
   .spinner {
     width: 2.5rem;

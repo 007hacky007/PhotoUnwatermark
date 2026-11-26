@@ -261,8 +261,6 @@ export const copy = {
     finding: (done: number, total: number) => `Finding the watermark in all photos... ${done} of ${total}`,
     /** On a photo whose check has not run yet. */
     checking: 'Checking...',
-    /** Why the buttons below cannot be used yet. */
-    waitHint: 'Wait until all photos are checked',
     findingFailed: 'The watermark could not be looked for in all photos.',
     loadFailed: 'The photos could not be shown.',
     tickFailed: 'The change could not be kept.',

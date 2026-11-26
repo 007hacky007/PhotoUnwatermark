@@ -46,7 +46,9 @@ export function prevZoomStep(scale: number): number {
 export function wheelZoom(deltaY: number, deltaMode: number, ctrlKey: boolean, pageHeight: number): number {
   const unit = deltaMode === 1 ? 16 : deltaMode === 2 ? pageHeight : 1;
   // One event never zooms by more than about 1.6 times, so a mouse wheel notch with Ctrl is not a jump.
-  const exponent = Math.max(-0.5, Math.min(0.5, -deltaY * unit * (ctrlKey ? 0.01 : 0.002)));
+  // Small pixel deltas with Ctrl are a trackpad pinch (faster per unit); a wheel notch, with Ctrl or Cmd, steps like a plain wheel did.
+  const pinch = ctrlKey && deltaMode === 0 && Math.abs(deltaY) < 50;
+  const exponent = Math.max(-0.5, Math.min(0.5, -deltaY * unit * (pinch ? 0.01 : 0.002)));
   return Math.exp(exponent);
 }
 
@@ -72,4 +74,9 @@ export function wheelPan(
   let dy = deltaY * uy;
   if (shiftKey && dx === 0) [dx, dy] = [dy, 0];
   return [-dx, -dy];
+}
+
+/** Safari's gesturechange `scale` counts from the start of the pinch; this is the factor since the last event. */
+export function gestureRatio(previous: number, scale: number): number {
+  return previous > 0 && scale > 0 ? scale / previous : 1;
 }
