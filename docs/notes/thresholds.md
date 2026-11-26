@@ -313,6 +313,8 @@ A set-position result still pastes the whole template, so removal covers the who
 - else the search runs; below `PRIOR_UNSURE` 0.16 its result stands; a search `Found` whose area
   overlaps the saved placement by IoU >= 0.8 stands; anything else is `Unsure` at the saved
   position (a search `Found` elsewhere on a set that shows the mark here is not trusted).
+  (Since the small-set fix the search no longer runs between the two bars, see "Small sets of
+  one shoot" below.)
 
 Before, `find` ran first and its `Found` was kept wherever it was; that is how the real set got a
 `Found` at the wrong place.
@@ -364,6 +366,94 @@ size), group 1 from the finder's own guess as it is (`timings.rs`
 
 The two Unsure photos (0.233, 0.254) are opened by the person before removal, as for any unsure
 photo. No `Found` lands anywhere but the saved position.
+
+## Small sets of one shoot (owner test fix, 2026-11-26)
+
+The owner added 3 photos of one shoot (set-a: same size, one faint watermark at the same place).
+The reference's first guess looked right; the other two strip photos said "not sure" with the
+drawing moved a little or far to the side.
+
+Root cause, measured on the triples 0,1,2 / 3,4,5 / 5,6,7 / 0,3,7 of set-a before the fix:
+
+| | triples |
+|---|---|
+| batch layer of the size | none for 3 of 4: the median of 3 photos kept 1.53-1.58 % of the photo above `BATCH_HIGH` (8 photos: 0.36 %), and `batch_lines` gave up at more than 10 % coverage; for 5,6,7 a layer of 1.32 M px (8 photos: 0.43 M px), only 59 % of it within 0.4 % of the long side of the mark |
+| position prior | none for those 3; for 5,6,7 rule 1 held, but the drawing cut to that half-scene layer scored 0.09 and 0.12 at the saved position, under `PRIOR_UNSURE` |
+| the drawing (first guess) | 14.6 % of the photo in 2-9 pieces, 10-13 % of its pixels on the mark; at the saved position (minimum over the pieces) 0.00-0.11 |
+| the search | the scene where it moved between shots: Unsure 0.36-0.45 or Found 0.68 at 50-570 px off and scale 0.73-1.03, else NotFound 0.17-0.32; 5-10 s per 24 MP photo |
+
+Photos of one shoot share most of the scene: two shots nearly line up, so the median of three
+keeps every edge two of them share. The faint mark is a small part of a large drawing, the scene
+in it moved, and the search follows the scene. With all 8 photos the median needs 4 photos per
+edge, the layer is the mark, and the prior placed both strip photos.
+
+Fix (`batch::AGREE`, `batch::agreed`): with 3 or 4 photos the layer's gradient takes, per pixel
+and per axis, the value 3 photos reach on the same side of zero (all 3, or 3 of 4) instead of
+the median. From 5 photos on the median of an odd count is that value already, so larger sets
+keep their numbers (set-a's 8-photo layer, the synthetic fixed, styles and negative sets are
+unchanged).
+
+| set-a triple (6 measured) | median of 3 | 3 agree |
+|---|---|---|
+| photo above `BATCH_HIGH` | 0.95-1.64 % | 0.23-0.28 % |
+| layer | none for 4 of 6; 1.3-1.5 M px | 0.25-0.32 M px, 55-60 % of the 8-photo layer |
+| share of the layer within 10 px of the 8-photo layer | 0.43-0.47 | 0.79-0.99 |
+
+With that layer the first guess is smaller (7.8-9.1 % of the photo, layer share of it
+0.13-0.15), rule 1 of the prior holds for every triple, and the drawing cut to the layer scores
+0.24-0.44 at the saved position on the other photos.
+
+Second change (`pipeline::match_with`): between `PRIOR_UNSURE` and `PRIOR_FOUND` the result is
+`Unsure` at the saved position with no search. Before, the search ran there only to turn the
+result `Found` when it agreed with the saved place (IoU >= 0.8); it never did: 0 of the 4 faint
+synthetic fixed photos in that band, 0 of the 2 real 8-photo ones, 0 of the 1 in the triples. It cost
+2-9 s on a 24 MP photo (9.2 s for one strip photo of triple 1,3,6). A search `Found` elsewhere was
+already not trusted there, and the real triples show why: the drawing at the saved position
+scored 0.13 and the scene where it moved 0.52 (Found), so "prefer the search when it scores
+clearly better than the saved position" would bring the owner's bug back. Parked N1 (an
+`Unsure` from the prior discards a correct search placement elsewhere) therefore stays as a
+rule, not a bug; on the moving-mark checks below the prior never reaches the `Unsure` band.
+
+Moving marks (`prior_never_places_a_moving_mark`, tightened from "IoU > 0"):
+- random and styles: a set-position result must cover at least half of the photo's own mark.
+  With the new layers no drawing of either set gets a prior any more (before: 4 of 56, all on
+  the random set, whose size groups have 3 photos);
+- the fixed set's 8-photo layer (the prior holds) with photos whose mark moved 400 px up: the
+  saved position scores 0.00-0.10, no set-position result, and the 5 photos the search alone
+  finds at their moved mark (3 Found, 2 Unsure) come out the same.
+
+Random set first guesses (`puw-dev guess --all`, Core ML): recall unchanged (mean 0.975, min
+0.704); guess coverage mean 4.64 % -> 2.75 % (max 11.18 % -> 3.58 %), as the 3-photo layers no
+longer hold scene edges (layers of 0.30-2.82 % -> two sizes with 0.03 % and 0.13 %, two none).
+
+Synthetic test of the owner's case (`three_photos_of_one_shoot_keep_the_set_position`, models;
+`three_photos_of_one_shoot_give_the_mark`, no models): one scene moved by (0, 0), (1, 1) and
+(24, -16) px, the fixed set's mark at alpha 0.14 at one place. Median of 3: 3.36 % above
+`BATCH_HIGH`, no layer, the strip placed a photo `Found` 79 px off. Now: 0.36 %, the layer holds
+95 % of the mark and lies 91 % within 7 px of it; strip and step 3 place all
+photos at the saved position, `Found`, as guessed and with the guess cut down to the mark.
+
+Real acceptance (`timings.rs` `real_small_sets_keep_the_set_position`, Core ML): 8 triples of
+set-a (0,1,2 / 3,4,5 / 5,6,7 / 0,3,7 / 1,4,6 / 2,5,7 / 0,2,4 / 1,3,6), each with the first guess
+as it is and cleaned up (groups of less than a quarter of the largest group dropped, a band of
+1 % of the height erased at the top: 2.2-7.7 % of the guess removed, 0.4-7.7 % before the fix), a fresh session each:
+
+| | before | after |
+|---|---|---|
+| strip photos at the same place (scale and shift within 1 %) | 0 of 32 (19 Unsure elsewhere, 13 NotFound) | 32 of 32 (30 Found, 2 Unsure) |
+| strip placement, 24 MP | 6.62 s median, 16.92 s max | 0.94 s median, 2.06 s max (the first call also learns the drawing) |
+| step 3, photos at the saved place | 16 of 48 (the 16 references only); the other 32 Unsure elsewhere or NotFound, none Found elsewhere | 48 of 48 (46 Found, 2 Unsure), none Found elsewhere |
+
+The 8 + 1 acceptance (`real_group_from_the_first_guess`) still passes: 2 of 2 strip photos
+`Found` at the same place (1.14 s at most), group 1 6 Found and 2 Unsure, all at the saved place,
+none elsewhere, the photo of the other size not found. Its match_all takes 1.3 s (was 6.0-6.7 s:
+the 2 Unsure photos no longer run the search).
+
+Not covered: a person who erases a whole part of the mark from the drawing (in the first
+measurement the "cleanup" kept only the largest group of the guess, which on triple 1,3,6 cut
+away half of the mark): then less than 90 % of the layer lies in the drawing, rule 1
+fails, rule 2 scores the drawing itself (0.07-0.10), and the search decides (Unsure, moved 128 and 105 px, and
+NotFound). The drawing then does not cover the mark anyway.
 
 ## Detector specks in the first guess (Plan 2 fix wave, C1)
 
