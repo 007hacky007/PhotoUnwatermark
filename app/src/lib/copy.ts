@@ -334,6 +334,7 @@ export const copy = {
     editedName: (name: string) => `${name} (edited)`,
     savedWatermark: 'Saved',
     saveFailed: 'The watermark could not be saved.',
+    groupsFailed: 'The watermarks to save could not be listed.',
     openFailed: 'The folder could not be opened.',
     newSetFailed: 'A new set could not be started.',
   },

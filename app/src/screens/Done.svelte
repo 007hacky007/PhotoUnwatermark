@@ -33,6 +33,7 @@
   let rows: Row[] = $state([]);
   /** More than one group was made, so names and labels say which. */
   let several = $state(false);
+  let rowsError = $state(false);
   /** "Photo X of Y" for screen readers, said when the person browses. */
   let announced = $state('');
   let error: string | null = $state(null);
@@ -79,7 +80,7 @@
           error: null,
         }));
     } catch {
-      // No rows, so nothing to save.
+      rowsError = true;
     }
   }
 
@@ -203,6 +204,9 @@
   {/if}
 
   <div class="keep">
+    {#if rowsError}
+      <p class="error" role="alert">{c.groupsFailed}</p>
+    {/if}
     {#each rows as row (row.group)}
       {#if wizard.savedGroups.includes(row.group)}
         <p class="saved" role="status">{c.savedWatermark}</p>

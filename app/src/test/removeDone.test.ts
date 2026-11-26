@@ -659,6 +659,7 @@ describe('Done', () => {
     m.groupsState.mockResolvedValue(state(info(1, { savedName: 'Studio', canSave: false }), info(2)));
     stepFive(report({ done: [done(1)] }));
     expect(await screen.findByLabelText(copy.done.groupName(2))).toBeTruthy();
+    expect(await screen.findByDisplayValue('Watermark from 2026-11-25 (group 2)')).toBeTruthy();
     expect(screen.queryByLabelText(copy.done.groupName(1))).toBeNull();
     expect(screen.getAllByRole('button', { name: copy.done.saveWatermark })).toHaveLength(1);
   });
@@ -690,6 +691,14 @@ describe('Done', () => {
     expect(m.saveWatermark).toHaveBeenCalledTimes(1);
   });
 
+  it('groupsFailureSaysSo', async () => {
+    m.groupsState.mockRejectedValue({ message: '', details: '' });
+    stepFive(report({ done: [done(1)] }));
+    expect(await screen.findByText(copy.done.groupsFailed)).toBeTruthy();
+    expect(screen.queryByRole('button', { name: copy.done.saveWatermark })).toBeNull();
+    assertPlainText(document.body);
+  });
+
   it('singleGroupKeepsTheOldDefault', async () => {
     stepFive(report({ done: [done(1)] }));
     expect(await screen.findByLabelText(copy.done.name)).toBeTruthy();
@@ -697,10 +706,17 @@ describe('Done', () => {
   });
 
   it('newSetClearsGroups', async () => {
+    m.groupsState.mockResolvedValue(state(info(1), info(2)));
     const wizard = stepFive(report({ done: [done(1)] }));
-    await screen.findByDisplayValue('Watermark from 2026-11-25');
-    await fireEvent.click(screen.getByRole('button', { name: copy.done.saveWatermark }));
+    wizard.startDraft({ sample: [1], representative: 1 }, [1]);
+    wizard.confirmDraft();
+    wizard.startDraft({ sample: [2], representative: 2 }, [2]);
+    wizard.confirmDraft();
+    expect(wizard.groups).toBe(2);
+    await screen.findByLabelText(copy.done.groupName(2));
+    await fireEvent.click(screen.getAllByRole('button', { name: copy.done.saveWatermark })[0]);
     await screen.findByText(copy.done.savedWatermark);
+    expect(wizard.savedGroups).toEqual([1]);
     await fireEvent.click(screen.getByRole('button', { name: copy.done.startNewSet }));
     await waitFor(() => expect(wizard.screen).toBe('add'));
     expect(wizard.savedGroups).toEqual([]);
