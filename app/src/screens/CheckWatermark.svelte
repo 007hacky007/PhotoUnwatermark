@@ -501,7 +501,7 @@
     </div>
   {/if}
 
-  {#if note !== null && editing}
+  {#if note !== null && note !== 'placing' && editing}
     <div class="problem">
       <p class="note" role="status">{notes[note]}</p>
       {#if note === 'placeFailed' && failed !== null}
@@ -518,7 +518,7 @@
 
   <div class="work">
     {#if current !== null}
-      <div class="pane" hidden={!editing}>
+      <div class="pane" class:dim={note === 'placing'} hidden={!editing}>
         <Editor
           bind:this={editor}
           photoId={current}
@@ -528,6 +528,16 @@
           onCommit={single ? undefined : commit}
           paintable={single || kind === 'found'}
         />
+      </div>
+    {/if}
+    {#if note === 'placing' && editing}
+      <div class="placing" role="status">
+        <span class="spinner" aria-hidden="true"></span>
+        <p class="sentence">{c.placing}</p>
+        <p class="wait">{c.placingWait}</p>
+        <div class="bar" role="progressbar" aria-label={c.placing} data-indeterminate="true">
+          <div class="fill"></div>
+        </div>
       </div>
     {/if}
     {#if phase === 'previewing'}
@@ -626,6 +636,87 @@
   }
   .pane[hidden] {
     display: none;
+  }
+  /* The photo is being worked on: dimmed, and nothing reaches it. */
+  .pane.dim {
+    opacity: 0.45;
+    pointer-events: none;
+  }
+  .placing {
+    position: absolute;
+    inset: 0;
+    z-index: 2;
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+    justify-content: center;
+    gap: var(--space-3);
+    pointer-events: none;
+  }
+  .placing p {
+    margin: 0;
+    padding: 0 var(--space-4);
+    text-align: center;
+  }
+  /* A pill behind the words, so they read on a bright photo. */
+  .placing .sentence,
+  .placing .wait {
+    padding: var(--space-1) var(--space-4);
+    border-radius: 999px;
+    background: var(--surface);
+    color: var(--text);
+  }
+  .placing .sentence {
+    font-size: var(--text-large);
+    font-weight: 600;
+  }
+  .spinner {
+    width: 2.5rem;
+    height: 2.5rem;
+    border: 4px solid var(--track);
+    border-top-color: var(--accent);
+    border-radius: 50%;
+    animation: spin 0.9s linear infinite;
+  }
+  .bar {
+    position: relative;
+    width: min(20rem, 80%);
+    height: 8px;
+    overflow: hidden;
+    border-radius: 4px;
+    background: var(--track);
+  }
+  .bar .fill {
+    position: absolute;
+    width: 30%;
+    height: 100%;
+    border-radius: inherit;
+    background: var(--accent);
+    animation: slide 1.4s ease-in-out infinite;
+  }
+  @keyframes spin {
+    to {
+      transform: rotate(360deg);
+    }
+  }
+  @keyframes slide {
+    from {
+      left: -30%;
+    }
+    to {
+      left: 100%;
+    }
+  }
+  @media (prefers-reduced-motion: reduce) {
+    .spinner {
+      animation: none;
+    }
+    .bar .fill {
+      left: 0;
+      width: 100%;
+      opacity: 0.5;
+      animation: none;
+    }
   }
   .problem {
     display: flex;

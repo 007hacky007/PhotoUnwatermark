@@ -45,6 +45,7 @@
   const e = copy.editor;
   const k = copy.editor.keys;
   const tools: { id: Tool; name: string; key: string }[] = [
+    { id: 'move', name: copy.tools.move, key: k.move },
     { id: 'brush', name: copy.tools.brush, key: k.brush },
     { id: 'eraser', name: copy.tools.eraser, key: k.eraser },
     { id: 'rect', name: copy.tools.rectangle, key: k.rectangle },
@@ -136,7 +137,7 @@
     {/if}
   </div>
 
-  <span class="hint">{e.spaceHint}</span>
+  <span class="hint">{e.moveHint(isMac)}</span>
 </div>
 
 <style>

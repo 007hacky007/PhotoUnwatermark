@@ -49,7 +49,7 @@ describe('copy', () => {
     expect(copy.checkWatermark.help).toBe(
       'We found the watermark and painted it red. Use the Brush to paint over anything we missed and the Eraser to clean up anything that is not watermark.',
     );
-    expect(copy.tools).toEqual({ brush: 'Brush', eraser: 'Eraser', rectangle: 'Rectangle' });
+    expect(copy.tools).toEqual({ move: 'Move', brush: 'Brush', eraser: 'Eraser', rectangle: 'Rectangle' });
     expect(copy.checkWatermark.preview).toBe('Preview on this photo');
     expect(copy.checkWatermark.looksRight).toBe('Looks right →');
     expect(copy.checkAll.removeFrom(118)).toBe('Remove watermark from 118 photos');

@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest';
-import { fit, nextZoomStep, prevZoomStep, toImage, toScreen, wheelZoom, zoomAt, ZOOM_STEPS } from './view';
+import { fit, nextZoomStep, gestureRatio, panBy, prevZoomStep, toImage, toScreen, wheelPan, wheelZoom, zoomAt, ZOOM_STEPS } from './view';
 
 describe('view', () => {
   it('fitCentres', () => {
@@ -48,6 +48,21 @@ describe('view', () => {
     expect(prevZoomStep(40)).toBe(16);
   });
 
+  it('wheelPanFollowsTheFingersAndShiftGoesSideways', () => {
+    const page = { w: 1000, h: 800 };
+    expect(wheelPan(5, 12, 0, false, page)).toEqual([-5, -12]);
+    expect(wheelPan(0, 12, 0, true, page)).toEqual([-12, -0]);
+    expect(wheelPan(3, 12, 0, true, page)).toEqual([-3, -12]);
+    expect(wheelPan(0, 1, 1, false, page)).toEqual([-0, -16]);
+    expect(wheelPan(0, 1, 2, false, page)).toEqual([-0, -800]);
+    expect(panBy({ scale: 2, x: 1, y: 2 }, 3, 4)).toEqual({ scale: 2, x: 4, y: 6 });
+  });
+
+  it('oneWheelEventNeverZoomsByMoreThanAboutOnePointSix', () => {
+    expect(wheelZoom(-1000, 0, true, 800)).toBeCloseTo(Math.exp(0.5));
+    expect(wheelZoom(1000, 0, true, 800)).toBeCloseTo(Math.exp(-0.5));
+  });
+
   it('wheelZoomDirectionAndUnits', () => {
     expect(wheelZoom(-100, 0, false, 800)).toBeGreaterThan(1);
     expect(wheelZoom(100, 0, false, 800)).toBeLessThan(1);
@@ -55,6 +70,22 @@ describe('view', () => {
     expect(wheelZoom(3, 1, false, 800)).toBeCloseTo(wheelZoom(48, 0, false, 800));
     expect(wheelZoom(1, 2, false, 800)).toBeCloseTo(wheelZoom(800, 0, false, 800));
     // A pinch's small deltas still zoom noticeably.
+    expect(wheelZoom(-10, 0, true, 800)).toBeCloseTo(Math.exp(0.1));
+  });
+});
+
+describe('gestures and wheel notches', () => {
+  it('gestureRatioIsTheFactorSinceTheLastEvent', () => {
+    expect(gestureRatio(1, 1.5)).toBeCloseTo(1.5);
+    expect(gestureRatio(1.5, 3)).toBeCloseTo(2);
+    expect(gestureRatio(2, 1)).toBeCloseTo(0.5);
+    expect(gestureRatio(0, 2)).toBe(1);
+    expect(gestureRatio(1, 0)).toBe(1);
+  });
+
+  it('aWheelNotchWithCtrlOrCmdStepsLikeAPlainWheel', () => {
+    expect(wheelZoom(-100, 0, true, 800)).toBeCloseTo(wheelZoom(-100, 0, false, 800));
+    expect(wheelZoom(-3, 1, true, 800)).toBeCloseTo(wheelZoom(-3, 1, false, 800));
     expect(wheelZoom(-10, 0, true, 800)).toBeCloseTo(Math.exp(0.1));
   });
 });

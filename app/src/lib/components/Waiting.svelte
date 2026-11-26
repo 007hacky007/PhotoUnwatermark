@@ -60,9 +60,9 @@
   .bar {
     position: relative;
     width: 100%;
-    height: 8px;
+    height: 12px;
     overflow: hidden;
-    border-radius: 4px;
+    border-radius: 6px;
     background: var(--track);
   }
   .fill {

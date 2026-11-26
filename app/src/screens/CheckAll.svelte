@@ -476,6 +476,9 @@
                   <img src={imageUrl('grid', s.id, versions[s.id])} alt={name} loading="lazy" decoding="async" />
                 </button>
               {/if}
+              {#if s.status === 'pending'}
+                <span class="checking" role="status"><span class="spinner" aria-hidden="true"></span>{c.checking}</span>
+              {/if}
               {#if earlier && s.group !== null}
                 <span class="group">{g.label(s.group)}</span>
               {:else if !unreadable && !s.member}
@@ -649,6 +652,38 @@
     width: 20px;
     height: 20px;
     margin: 0;
+  }
+  .checking {
+    position: absolute;
+    left: 0;
+    right: 0;
+    bottom: 0;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    gap: var(--space-2);
+    padding: var(--space-1) var(--space-2);
+    background: var(--surface);
+    color: var(--text);
+    font-size: var(--text-small);
+  }
+  .spinner {
+    width: 0.9rem;
+    height: 0.9rem;
+    border: 2px solid var(--track);
+    border-top-color: var(--accent);
+    border-radius: 50%;
+    animation: spin 0.9s linear infinite;
+  }
+  @keyframes spin {
+    to {
+      transform: rotate(360deg);
+    }
+  }
+  @media (prefers-reduced-motion: reduce) {
+    .spinner {
+      animation: none;
+    }
   }
   .badge {
     position: absolute;

@@ -283,8 +283,10 @@ describe('Check all photos', () => {
     const wizard = wizardAt();
     render(CheckAll, { wizard });
     expect(await screen.findByText('Finding the watermark in all photos... 0 of 2')).toBeTruthy();
+    expect(screen.getByRole('progressbar').getAttribute('aria-valuenow')).toBe('0');
     emit({ phase: 'matching', done: 1, total: 2 });
     expect(await screen.findByText('Finding the watermark in all photos... 1 of 2')).toBeTruthy();
+    expect(screen.getByRole('progressbar').getAttribute('aria-valuenow')).toBe('50');
     expect(wizard.busy).toBe(true);
     await fireEvent.click(button(copy.common.back));
     expect(cancelJob).toHaveBeenCalledTimes(1);
