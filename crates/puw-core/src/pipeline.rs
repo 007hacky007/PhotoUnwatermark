@@ -58,10 +58,14 @@ pub const BATCH_LUMA_BUDGET: u64 = 1_200_000_000;
 pub const REPRESENTATIVE_CAP: usize = 3;
 
 /// The batch layers of a set: for each upright photo size whose group got one, the mask of
-/// the mark stamped at the same place on every photo.
+/// the mark stamped at the same place on every photo, and the set's own edges of that mark.
 #[derive(Debug, Clone, Default)]
 pub struct SetLayers {
     layers: BTreeMap<(u32, u32), Mask>,
+    /// Per size with a layer: the same median (see [`crate::batch::agree_count`]) of the photos'
+    /// Sobel gradients taken where the photos are matched, at long side 1536 (see
+    /// [`template::with_edges`]): the mark's edges without any one photo's scene.
+    edges: BTreeMap<(u32, u32), Vec<f32>>,
 }
 
 impl SetLayers {
@@ -73,6 +77,12 @@ impl SetLayers {
     /// The batch layer for photos of upright size `w` x `h`, if their group has one.
     pub fn get(&self, w: u32, h: u32) -> Option<&Mask> {
         self.layers.get(&(w, h))
+    }
+
+    /// The set's edges of the mark for photos of upright size `w` x `h` (see [`SetLayers`]), if
+    /// their group has a layer.
+    pub fn edges(&self, w: u32, h: u32) -> Option<&[f32]> {
+        self.edges.get(&(w, h)).map(Vec::as_slice)
     }
 
     /// Sizes that have a layer, with the layer, smallest size first.
@@ -150,8 +160,10 @@ const MEDIAN_UNITS: usize = 4;
 /// Photos are read one at a time: first every photo's header for its upright size, then, per
 /// group, an evenly spaced sample (see [`BATCH_SAMPLE_CAP`] and [`BATCH_LUMA_BUDGET`]) is
 /// decoded and kept as luma for [`crate::batch::median_gradient`]'s median, followed by
-/// [`batch_lines`] with [`BATCH_LOW`] / [`BATCH_HIGH`] and [`filter_layer`]. Peak memory is
-/// bounded by the sample (see [`BATCH_LUMA_BUDGET`]), whatever the size of the set.
+/// [`batch_lines`] with [`BATCH_LOW`] / [`BATCH_HIGH`] and [`filter_layer`]. Each sampled photo
+/// is also kept at long side 1536 (at most 3 MB), and a group that gets a layer gets the same
+/// median of those as its edges ([`SetLayers::edges`]). Peak memory is bounded by the sample
+/// (see [`BATCH_LUMA_BUDGET`]), whatever the size of the set.
 ///
 /// A group whose size is so large that [`MIN_BATCH_PHOTOS`] photos exceed [`BATCH_LUMA_BUDGET`]
 /// (sizes come from file headers, which may lie) has no layer either (logged). Memory is
@@ -196,11 +208,17 @@ pub fn build_set_layers(paths: &[PathBuf], progress: &Progress) -> Result<SetLay
         .sum::<usize>();
     units.add(paths.len() * HEADER_UNITS);
 
-    let mut layers = BTreeMap::new();
+    let (mut layers, mut edges) = (BTreeMap::new(), BTreeMap::new());
     for ((w, h), sample) in samples {
         let mut lumas = PackedLumas::new(w, h);
-        // The sample was cut to fit BATCH_LUMA_BUDGET, so this is bounded by it.
-        if let Err(e) = lumas.reserve_photos(sample.len()) {
+        let (rw, rh) = template::ref_dims(w, h);
+        let mut small = PackedLumas::new(rw as u32, rh as u32);
+        // The sample was cut to fit BATCH_LUMA_BUDGET, so this is bounded by it (the copies at
+        // long side 1536 add at most 3 MB per photo).
+        if let Err(e) = lumas
+            .reserve_photos(sample.len())
+            .and_then(|()| small.reserve_photos(sample.len()))
+        {
             tracing::warn!("batch layer skipped for the {w}x{h} photos: {e}");
             units.add(sample.len() * (DECODE_UNITS + MEDIAN_UNITS));
             continue;
@@ -211,6 +229,9 @@ pub fn build_set_layers(paths: &[PathBuf], progress: &Progress) -> Result<SetLay
                 Ok(photo) => {
                     if lumas.push(&photo.rgb).is_err() {
                         tracing::warn!("batch layer: photo {} changed size, skipped", i + 1);
+                    } else {
+                        // Never fails: the size is the group's.
+                        let _ = small.push(&template::working_rgb(&photo.rgb, rw, rh));
                     }
                 }
                 Err(e) => tracing::warn!("batch layer: photo {} skipped: {e}", i + 1),
@@ -228,6 +249,9 @@ pub fn build_set_layers(paths: &[PathBuf], progress: &Progress) -> Result<SetLay
                         .filter(|l| !is_empty(l));
                     if let Some(layer) = layer {
                         layers.insert((w, h), layer);
+                        if let Ok(e) = median_gradient_packed(&small) {
+                            edges.insert((w, h), e.into_raw());
+                        }
                     }
                 }
                 Err(e) => tracing::warn!("batch layer skipped for the {w}x{h} photos: {e}"),
@@ -236,7 +260,7 @@ pub fn build_set_layers(paths: &[PathBuf], progress: &Progress) -> Result<SetLay
         units.add(sample.len() * MEDIAN_UNITS);
     }
     (progress.on_fraction)(1.0);
-    Ok(SetLayers { layers })
+    Ok(SetLayers { layers, edges })
 }
 
 /// Share of the saved placement's pixels that must lie in the grown batch layer.
@@ -251,16 +275,23 @@ const PRIOR_GROW: f32 = 0.004;
 /// is tiny or whose area covers most of the photo.
 const PRIOR_LAYER_INSIDE: f64 = 0.9;
 /// With that rule, the layer inside the drawing must also make up at least this share of the
-/// drawing's pixels (a drawing up to about ten times the mark's own lines). Synthetic fixed
-/// set 0.36-1.00; the real set's grown first guess 0.19; random and styles photos that pass
-/// [`PRIOR_LAYER_INSIDE`] 0.01-0.15. Keeps a few static scene pixels under a large drawing
-/// from becoming the template the position is scored with.
-const PRIOR_LAYER_SHARE: f64 = 0.1;
+/// drawing's pixels (a drawing up to about twenty times the mark's own lines). Keeps a few
+/// static scene pixels under a large drawing from becoming the template the position is scored
+/// with. Calibrated at 0.1 on median layers: synthetic fixed set 0.36-1.00, the real set's
+/// grown first guess 0.19, random and styles photos that passed [`PRIOR_LAYER_INSIDE`]
+/// 0.01-0.15. Layers that 6 photos must agree on (see [`crate::batch::agree_count`]) hold the
+/// mark's lines only, about half as many pixels: the real first guess then holds 0.12-0.14 of
+/// its layer, and a drawing 1.6 times as large fell under 0.1 (the set position was lost, and
+/// the search found the scene). No drawing of the random and styles sets passes
+/// [`PRIOR_LAYER_INSIDE`] on such layers.
+const PRIOR_LAYER_SHARE: f64 = 0.05;
 /// Score at the saved position (masked NCC, +-2 px, scale 1) for `Found` on set support.
 /// Calibrated on the synthetic fixed set with its own layer and the template of photo 0:
 /// photos without the mark (the clean/ originals other than the reference's scene, and the
-/// negative set resized to 1536x1024) score 0.00-0.155, the 7 other faint (alpha 0.12) marked
-/// photos 0.175-0.331. See `docs/notes/thresholds.md`.
+/// negative set resized to 1536x1024) scored 0.00-0.155, the 7 other faint (alpha 0.12) marked
+/// photos 0.175-0.331. Since rule 1 scores on the set's own edges of the mark
+/// ([`SetLayers::edges`]) the same photos score 0.00-0.07 and 0.51-0.95, a clean photo inside
+/// the set 0.01-0.07, and the real set's photos 0.45-0.57. See `docs/notes/thresholds.md`.
 pub const PRIOR_FOUND: f32 = 0.28;
 /// Score at the saved position for `Unsure` on set support (the user opens the photo).
 pub const PRIOR_UNSURE: f32 = 0.16;
@@ -274,9 +305,11 @@ pub const PRIOR_UNSURE: f32 = 0.16;
 /// 1. at least 90 % of the layer lies in the placement grown by `g`, and the layer inside the
 ///    placement is at least 10 % of it (see [`PRIOR_LAYER_INSIDE`], [`PRIOR_LAYER_SHARE`]): the
 ///    layer is the mark, and the position is scored with the template cut down to the raw layer
-///    ([`template::within`]). A drawing grown well beyond the mark (the first guess is grown,
-///    and people draw generously) is then judged on the mark's own edges, not on the scene
-///    around it;
+///    ([`template::within`]), its edges taken from the set's own edges of the mark
+///    ([`SetLayers::edges`], [`template::with_edges`]) rather than from the reference photo,
+///    whose scene the other photos do not share. A drawing grown well beyond the mark (the
+///    first guess is grown, and people draw generously) is then judged on the mark's own
+///    edges, not on the scene around it;
 /// 2. else, at least half of the placement lies in the layer grown by `g` (the drawing follows
 ///    the layer): the position is scored with the template itself.
 ///
@@ -315,7 +348,12 @@ impl PositionPrior {
         let layer_is_mark = layer_px > 0
             && layer_in as f64 >= PRIOR_LAYER_INSIDE * layer_px as f64
             && on_layer as f64 >= PRIOR_LAYER_SHARE * placed_px as f64;
-        if layer_is_mark && let Some(scored) = template::within(t, layer) {
+        if layer_is_mark && let Some(cut) = template::within(t, layer) {
+            // Scored on the set's own edges of the mark where the set has them.
+            let scored = layers
+                .edges(w, h)
+                .and_then(|e| template::with_edges(&cut, e))
+                .unwrap_or(cut);
             return Some(PositionPrior { placed, scored });
         }
         let (total, inside) = count_in(&placed, &mask::dilate(layer, g));
@@ -400,7 +438,11 @@ const LAYER_NEAR_FRAC: f32 = 0.02;
 /// Share of the batch layer the detector must see for the layer to be taken as the mark
 /// itself, so that only detector components near it are kept. Synthetic sets: 1.0 on every
 /// photo of the fixed set (its layer is the mark); 0.0-1.0, mostly below 0.6, where the layer
-/// holds static scene edges and the marks move (random, styles).
+/// holds static scene edges and the marks move (random, styles). The layer must also hold at
+/// least [`SPECK_FRAC`] of the pixels of the detector's largest group: on layers from
+/// [`crate::batch::agree_count`] the styles set keeps a 210 px scene layer that the detector
+/// covers, 0.004-0.011 of its marks; the fixed set's layer is about as large as its mark's
+/// group, the real set's 3-10 times (the detector sees only part of a faint mark).
 const LAYER_SEEN: f64 = 0.9;
 /// Otherwise detector components are grouped like the pieces of a template (boxes closer than
 /// [`LAYER_NEAR_FRAC`] of the long side) and a group with less than this share of the largest
@@ -410,8 +452,9 @@ const SPECK_FRAC: f64 = 0.1;
 
 /// The parts of the detector's `guess` that are the mark, without the specks it also finds on
 /// fur, foliage and stars. See [`LAYER_NEAR_FRAC`], [`LAYER_SEEN`] and [`SPECK_FRAC`]:
-/// - with a non-empty batch `layer` (same size) that the detector sees almost all of, only the
-///   components near the layer are kept;
+/// - with a non-empty batch `layer` (same size) that the detector sees almost all of, and that
+///   is no speck beside the detector's largest group, only the components near the layer are
+///   kept;
 /// - otherwise the components near the layer (if any) and every group of at least
 ///   [`SPECK_FRAC`] of the largest group are kept.
 pub fn keep_mark_parts(guess: &Mask, layer: Option<&Mask>) -> Mask {
@@ -424,6 +467,12 @@ pub fn keep_mark_parts(guess: &Mask, layer: Option<&Mask>) -> Mask {
     let near = (LAYER_NEAR_FRAC * long).round() as u32;
     let layer = layer.filter(|l| l.dimensions() == (w, h) && !is_empty(l));
     let mut keep = vec![false; comps.len()];
+    let groups = mask::group_near(&comps, LAYER_NEAR_FRAC * long);
+    let sizes: Vec<u64> = groups
+        .iter()
+        .map(|g| g.iter().map(|&i| u64::from(comps[i].pixels)).sum())
+        .collect();
+    let most = sizes.iter().copied().max().unwrap_or(0);
     let mut seen = false;
     if let Some(l) = layer {
         let around = mask::dilate(l, near);
@@ -443,15 +492,11 @@ pub fn keep_mark_parts(guess: &Mask, layer: Option<&Mask>) -> Mask {
                 hit += (*r != 0) as u64;
             }
         }
-        seen = hit as f64 >= LAYER_SEEN * all as f64;
+        // A layer no bigger than a speck beside the detector's largest group is not the mark,
+        // however much of it the detector covers.
+        seen = hit as f64 >= LAYER_SEEN * all as f64 && all as f64 >= SPECK_FRAC * most as f64;
     }
     if !seen {
-        let groups = mask::group_near(&comps, LAYER_NEAR_FRAC * long);
-        let sizes: Vec<u64> = groups
-            .iter()
-            .map(|g| g.iter().map(|&i| u64::from(comps[i].pixels)).sum())
-            .collect();
-        let most = sizes.iter().copied().max().unwrap_or(0);
         for (g, &size) in groups.iter().zip(&sizes) {
             if size as f64 >= SPECK_FRAC * most as f64 {
                 g.iter().for_each(|&i| keep[i] = true);
@@ -642,8 +687,9 @@ mod tests {
         }
         let mut layer = Mask::new(1000, 600);
         for k in 0..6 {
-            // The layer holds the letters' edges, a little off the detector's fill.
-            rect(&mut layer, 302 + 40 * k, 398, 328 + 40 * k, 400);
+            // The layer holds the letters' edges, a little off the detector's fill, grown by
+            // 3 px as `batch_lines` grows them.
+            rect(&mut layer, 302 + 40 * k, 394, 328 + 40 * k, 400);
         }
         (guess, layer)
     }
@@ -664,6 +710,20 @@ mod tests {
         for (x, y) in [(51, 51), (901, 81), (650, 40), (951, 551)] {
             assert!(!set_at(&kept, x, y), "speck at {x},{y} kept");
         }
+    }
+
+    #[test]
+    fn a_speck_of_layer_does_not_decide() {
+        // A tiny layer of scene the detector happens to cover, under one speck: it is no mark,
+        // so the mark far from it stays (as without a layer).
+        let (guess, _) = mark_and_specks();
+        let mut layer = Mask::new(1000, 600);
+        rect(&mut layer, 901, 81, 903, 83);
+        let kept = keep_mark_parts(&guess, Some(&layer));
+        assert!(
+            set_at(&kept, 310, 410) && set_at(&kept, 510, 410),
+            "mark lost"
+        );
     }
 
     #[test]
@@ -806,7 +866,10 @@ mod tests {
             .collect();
         build_set_layers(&real, &progress).expect("ok");
         let reserved = crate::batch::MAX_RESERVED.with(|m| m.get());
-        assert_eq!(reserved, 3 * 16 * 8);
+        // The larger of the two reservations: the photos as they are, and as matching sees
+        // them (long side 1536, here larger than the photos).
+        let (rw, rh) = template::ref_dims(16, 8);
+        assert_eq!(reserved, 3 * (16 * 8).max(rw * rh));
         assert!(2 * reserved as u64 <= BATCH_LUMA_BUDGET);
     }
 

@@ -466,8 +466,31 @@ pub fn within(t: &WatermarkTemplate, keep: &Mask) -> Option<WatermarkTemplate> {
     })
 }
 
+/// `t` with each piece's edges taken from `edges`, an edge magnitude of the whole reference
+/// photo in the reference space (row-major, [`ref_dims`] of the reference size), at the piece's
+/// own crop: the same shapes and boxes, scored against other edges. The set's position prior
+/// uses it with the set's median edges, which hold the mark without the reference's scene.
+/// `None` when `edges` has another size or the template is damaged.
+pub fn with_edges(t: &WatermarkTemplate, edges: &[f32]) -> Option<WatermarkTemplate> {
+    let (ww, wh) = ref_dims(t.ref_w, t.ref_h);
+    if t.ref_w == 0 || t.ref_h == 0 || edges.len() != ww * wh {
+        return None;
+    }
+    let mut out = t.clone();
+    for p in &mut out.pieces {
+        let (x, y, w, h) = edge_rect(p.rel_bbox, t.ref_w, t.ref_h);
+        if (w, h) != (p.edges_w as usize, p.edges_h as usize) {
+            return None;
+        }
+        p.edges = (y..y + h)
+            .flat_map(|r| edges[r * ww + x..r * ww + x + w].iter().copied())
+            .collect();
+    }
+    Some(out)
+}
+
 /// Size of an image of native size `w` x `h` in the reference space (long side 1536).
-fn ref_dims(w: u32, h: u32) -> (usize, usize) {
+pub(crate) fn ref_dims(w: u32, h: u32) -> (usize, usize) {
     let s = REF_LONG / w.max(h) as f32;
     (
         ((w as f32 * s).round() as usize).max(1),
@@ -486,13 +509,18 @@ fn edge_rect(rel: [f32; 4], ref_w: u32, ref_h: u32) -> (usize, usize, usize, usi
     (x, y, w, h)
 }
 
+/// `img` resized (antialiased) to `ww` x `wh`, as matching sees it before taking its luma.
+pub(crate) fn working_rgb(img: &RgbImage, ww: usize, wh: usize) -> RgbImage {
+    imageops::resize(img, ww as u32, wh as u32, FilterType::Triangle)
+}
+
 /// ITU-R 601 luma of `img` resized (antialiased) to `ww` x `wh`.
 fn working_luma(img: &RgbImage, ww: usize, wh: usize) -> Vec<f32> {
     let resized;
     let src = if img.dimensions() == (ww as u32, wh as u32) {
         img
     } else {
-        resized = imageops::resize(img, ww as u32, wh as u32, FilterType::Triangle);
+        resized = working_rgb(img, ww, wh);
         &resized
     };
     let mut luma = vec![0f32; ww * wh];

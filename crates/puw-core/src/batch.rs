@@ -2,8 +2,8 @@
 //!
 //! The per-pixel median of image gradients over the set keeps a fixed watermark and averages
 //! the varying content out (Dekel et al., CVPR 2017). The method and thresholds follow the
-//! research prototype (numpy/scipy/skimage), so the numbers keep their meaning. One change: with
-//! only 3 or 4 photos an edge must show on 3 of them, not on half (see [`AGREE`]).
+//! research prototype (numpy/scipy/skimage), so the numbers keep their meaning. One change: up
+//! to 11 photos an edge must show on more than half of them (see [`agree_count`]).
 
 use crate::mask::{self, Mask};
 use crate::{Error, Result};
@@ -14,14 +14,13 @@ pub const BATCH_LOW: f32 = 40.0;
 /// High hysteresis threshold on the median gradient magnitude.
 pub const BATCH_HIGH: f32 = 80.0;
 
-/// How many photos must show an edge (the same sign of the derivative) for it to stay in the
-/// batch layer when the set has 3 or 4 photos (see `agreed`); from 5 photos on, the median
-/// already asks for 3. The median of 3 photos keeps every edge that 2 of them share, and photos
-/// of one shoot share most of the scene: on the real set's triples it kept 1.0-1.6 % of the
-/// photo above [`BATCH_HIGH`], so the layer covered more than [`MAX_COVERAGE`] (no layer) or was
-/// half scene. Asking all 3 keeps 0.2-0.3 %: 55-60 % of the 8-photo layer, and 80-99 % of what
-/// it keeps lies within 10 px of that layer. See `docs/notes/thresholds.md`.
-pub const AGREE: usize = 3;
+/// Most photos [`agree_count`] asks to show an edge. Photos of one shoot share most of the
+/// scene: two or three shots of a burst nearly line up, so the median keeps every edge that half
+/// of the photos share, and on subsets of 4-7 photos of the real set it kept 2-5 % of the photo
+/// as layer, 10-47 % of it scene. A scene edge that 6 photos share is no longer a burst,
+/// and asking more would lose a faint mark wherever one photo in four hides it. See
+/// `docs/notes/thresholds.md` ("Small sets of one shoot").
+pub const AGREE_MAX: usize = 6;
 /// Border (in pixels) added around the strong pixels to form the region of interest.
 const ROI_PAD: u32 = 60;
 /// Result is discarded when it covers more than this fraction of the image.
@@ -48,8 +47,8 @@ type MagImage = ImageBuffer<Luma<f32>, Vec<f32>>;
 ///
 /// Each image gets its own 2-D Sobel (as `scipy.ndimage.sobel`, 'reflect' boundary) on its
 /// ITU-R 601 luma; gx and gy are then medianed separately across images and combined with
-/// `hypot`. For 3 or 4 images the median is replaced by the value [`AGREE`] of them reach on
-/// the same side of zero (`agreed`). Works row by row, so beyond the images it needs only the
+/// `hypot`. From 3 to 11 images the median is replaced by the value [`agree_count`] of them
+/// reach on the same side of zero. Works row by row, so beyond the images it needs only the
 /// output and a few rows per image. Errors with [`Error::SizeMismatch`] when sizes differ and
 /// [`Error::Image`] for an empty slice.
 pub fn median_gradient(images: &[&RgbImage]) -> Result<MagImage> {
@@ -236,17 +235,28 @@ pub(crate) fn sobel_magnitude(luma: &[f32], w: usize, h: usize) -> Vec<f32> {
     out
 }
 
-/// The value at least [`AGREE`] of `v` reach on the same side of zero (the [`AGREE`]-th largest
-/// when it is positive, else the [`AGREE`]-th smallest when that is negative, else 0) for 3 or
-/// 4 values; the [`median`] for any other count (from 5 values on, the median of an odd count
-/// is that value already). Reorders `v`.
+/// How many of `n` photos must show an edge with the same sign for it to stay in the batch
+/// layer, or `None` for the plain median: all but one in four photos (`n - (n - 1) / 4`), at
+/// most [`AGREE_MAX`], for 3 photos and more; the median for 1 or 2 photos, and once at most
+/// half of the photos would have to agree (from 12 photos on).
+pub fn agree_count(n: usize) -> Option<usize> {
+    if n < 3 {
+        return None;
+    }
+    let k = (n - (n - 1) / 4).min(AGREE_MAX);
+    (2 * k > n).then_some(k)
+}
+
+/// The value at least `k` of `v` reach on the same side of zero (the `k`-th largest when it is
+/// positive, else the `k`-th smallest when that is negative, else 0), with `k` from
+/// [`agree_count`]; the [`median`] where that gives none. Reorders `v`.
 fn agreed(v: &mut [f32]) -> f32 {
     let n = v.len();
-    if !(AGREE..2 * AGREE - 1).contains(&n) {
+    let Some(k) = agree_count(n) else {
         return median(v);
-    }
+    };
     v.sort_unstable_by(f32::total_cmp);
-    let (hi, lo) = (v[n - AGREE], v[AGREE - 1]);
+    let (hi, lo) = (v[n - k], v[k - 1]);
     if hi > 0.0 {
         hi
     } else if lo < 0.0 {

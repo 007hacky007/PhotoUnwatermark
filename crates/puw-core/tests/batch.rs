@@ -1,7 +1,9 @@
 mod common;
 
 use image::{Luma, RgbImage, imageops};
-use puw_core::batch::{AGREE, BATCH_HIGH, BATCH_LOW, batch_lines, filter_layer, median_gradient};
+use puw_core::batch::{
+    BATCH_HIGH, BATCH_LOW, agree_count, batch_lines, filter_layer, median_gradient,
+};
 use puw_core::mask::{self, Mask};
 use puw_core::{Error, Progress, build_set_layers};
 use std::path::{Path, PathBuf};
@@ -33,8 +35,8 @@ fn random_image(w: u32, h: u32, seed: u64) -> RgbImage {
     })
 }
 
-/// Reference: per-image Sobel (reflect boundary) on 601 luma, then median (for 3 or 4 images
-/// the value 3 of them agree on), then hypot.
+/// Reference: per-image Sobel (reflect boundary) on 601 luma, then median (or the value
+/// `agree_count` of them agree on), then hypot.
 fn naive(images: &[&RgbImage]) -> Vec<f32> {
     let (w, h) = images[0].dimensions();
     let (w, h) = (w as i64, h as i64);
@@ -67,9 +69,9 @@ fn naive(images: &[&RgbImage]) -> Vec<f32> {
     let med = |mut v: Vec<f64>| {
         v.sort_by(f64::total_cmp);
         let n = v.len();
-        if (AGREE..2 * AGREE - 1).contains(&n) {
-            // 3 or 4 photos: the value AGREE of them reach on one side of zero.
-            let (hi, lo) = (v[n - AGREE], v[AGREE - 1]);
+        if let Some(k) = agree_count(n) {
+            // The value k of them reach on one side of zero.
+            let (hi, lo) = (v[n - k], v[k - 1]);
             if hi > 0.0 {
                 hi
             } else if lo < 0.0 {
@@ -105,8 +107,8 @@ fn median_gradient_rejects_mixed_sizes() {
 
 #[test]
 fn median_is_per_image() {
-    // 3 and 4 images take the value 3 of them agree on, 5 and 6 the median.
-    for n in 3..=6 {
+    // 2 images take the median, 3 to 11 the value `agree_count` of them agree on, 12 the median.
+    for n in [2, 3, 4, 5, 6, 7, 8, 12] {
         let imgs: Vec<RgbImage> = (1..=n).map(|s| random_image(64, 48, s)).collect();
         let refs: Vec<&RgbImage> = imgs.iter().collect();
         let got = median_gradient(&refs).expect("median");
@@ -119,6 +121,29 @@ fn median_is_per_image() {
             .fold(0f32, f32::max);
         assert!(max < 1e-3, "{n} images: max abs diff {max}");
     }
+}
+
+/// All but one photo in four must agree, at most 6, and the median once that is half or less.
+#[test]
+fn agree_count_by_set_size() {
+    let got: Vec<Option<usize>> = (1..=13).chain([24]).map(agree_count).collect();
+    let want = [
+        None,
+        None,
+        Some(3),
+        Some(4),
+        Some(4),
+        Some(5),
+        Some(6),
+        Some(6),
+        Some(6),
+        Some(6),
+        Some(6),
+        None,
+        None,
+        None,
+    ];
+    assert_eq!(got, want);
 }
 
 /// With 3 photos an edge that only 2 of them show is not in the layer's gradient; one all 3
