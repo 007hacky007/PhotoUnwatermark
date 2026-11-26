@@ -1,4 +1,5 @@
 export type Action =
+  | 'move'
   | 'brush'
   | 'eraser'
   | 'rect'
@@ -29,6 +30,7 @@ export function actionFor(e: KeyEvent, isMac: boolean): Action | null {
     return null;
   }
   switch (key) {
+    case 'h': return 'move';
     case 'b': return 'brush';
     case 'e': return 'eraser';
     case 'r': return 'rect';

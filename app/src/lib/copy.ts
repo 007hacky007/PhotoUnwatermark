@@ -172,6 +172,8 @@ export const copy = {
     notFoundHere: 'The watermark was not found on this photo.',
     unsureHere: 'Not sure the watermark is here on this photo.',
     placing: 'Finding the watermark on this photo...',
+    /** Over the photo while it is being worked out. */
+    placingWait: 'This can take a few seconds.',
     placeFailed: 'The watermark area could not be shown on this photo.',
   },
   /** Watermark groups: each group is one watermark and the photos it was found on. */
@@ -201,6 +203,7 @@ export const copy = {
     nextFailed: 'The next watermark could not be looked for.',
   },
   tools: {
+    move: 'Move',
     brush: 'Brush',
     eraser: 'Eraser',
     rectangle: 'Rectangle',
@@ -214,6 +217,7 @@ export const copy = {
     withKey: (name: string, key: string) => `${name} (${key})`,
     /** The keys shown in those hints; the undo keys depend on the system. */
     keys: {
+      move: 'H',
       brush: 'B',
       eraser: 'E',
       rectangle: 'R',
@@ -242,7 +246,9 @@ export const copy = {
     magnifier: 'Magnifier',
     magnification: 'How much the magnifier enlarges',
     times: (n: number) => `${n}x`,
-    spaceHint: 'Hold Space to hide red',
+    /** Next to the toolbar: how to move around the photo, and the Space key. */
+    moveHint: (mac: boolean) =>
+      `Scroll to move around. Pinch or ${mac ? 'Cmd' : 'Ctrl'}+scroll to zoom. Hold Space to hide red.`,
   },
   beforeAfter: {
     before: 'Before',
@@ -253,6 +259,10 @@ export const copy = {
   checkAll: {
     /** While the watermark is looked for in every photo. */
     finding: (done: number, total: number) => `Finding the watermark in all photos... ${done} of ${total}`,
+    /** On a photo whose check has not run yet. */
+    checking: 'Checking...',
+    /** Why the buttons below cannot be used yet. */
+    waitHint: 'Wait until all photos are checked',
     findingFailed: 'The watermark could not be looked for in all photos.',
     loadFailed: 'The photos could not be shown.',
     tickFailed: 'The change could not be kept.',

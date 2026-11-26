@@ -1,4 +1,4 @@
-export type Tool = 'brush' | 'eraser' | 'rect';
+export type Tool = 'move' | 'brush' | 'eraser' | 'rect';
 
 /** Brush and eraser size: the diameter in photo pixels (at edit size). */
 export const MIN_SIZE = 2;

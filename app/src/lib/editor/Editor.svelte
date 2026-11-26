@@ -17,7 +17,7 @@
   import type { OuterHistory } from './shared';
   import Toolbar from './Toolbar.svelte';
   import { DEFAULT_SIZE, stepSize, type Tool } from './tools';
-  import { fit, nextZoomStep, prevZoomStep, toImage, toScreen, wheelZoom, zoomAt, type View } from './view';
+  import { fit, nextZoomStep, panBy, prevZoomStep, toImage, toScreen, wheelPan, wheelZoom, zoomAt, type View } from './view';
 
   type Props = {
     photoId: PhotoId;
@@ -193,7 +193,15 @@
     if (!dims || stroke) return;
     const [px, py] = local(e);
     pointer = { x: px, y: py };
-    zoomTo(view.scale * wheelZoom(e.deltaY, e.deltaMode, e.ctrlKey, boxH), px, py);
+    if (e.ctrlKey || e.metaKey) {
+      // A pinch on a trackpad arrives as a wheel with ctrlKey; Ctrl or Cmd with a wheel zooms too.
+      zoomTo(view.scale * wheelZoom(e.deltaY, e.deltaMode, e.ctrlKey, boxH), px, py);
+    } else {
+      // Two fingers on a trackpad, or a wheel: the photo moves.
+      const [dx, dy] = wheelPan(e.deltaX, e.deltaY, e.deltaMode, e.shiftKey, { w: boxW, h: boxH });
+      view = panBy(view, dx, dy);
+      fitted = false;
+    }
   }
 
   /** One undo step was added or taken back. */
@@ -215,7 +223,7 @@
     if (stroke || !red?.area || !active || stale) return;
     const [px, py] = local(e);
     pointer = { x: px, y: py };
-    if (e.button === 1 || (e.button === 0 && space)) {
+    if (e.button === 1 || (e.button === 0 && (space || tool === 'move'))) {
       stroke = { kind: 'pan', sx: px, sy: py, from: { ...view } };
       panning = true;
     } else if (e.button === 0) {
@@ -321,13 +329,13 @@
     if (!ctx) return;
     if (drawn) ctx.clearRect(drawn.x, drawn.y, drawn.w, drawn.h);
     drawn = null;
-    if (!pointer || !red?.area || stale || panning || !paintable || (space && !stroke)) return;
+    if (!pointer || !red?.area || stale || panning || !paintable || tool === 'move' || (space && !stroke)) return;
     if (stroke?.kind === 'rect') {
       const [ax, ay] = toScreen(view, ...stroke.start);
       const [bx, by] = toScreen(view, ...stroke.end);
       outlineBox(ctx, ax, ay, bx, by);
       drawn = { x: Math.min(ax, bx) - 3, y: Math.min(ay, by) - 3, w: Math.abs(bx - ax) + 6, h: Math.abs(by - ay) + 6 };
-    } else if (tool !== 'rect') {
+    } else if (tool === 'brush' || tool === 'eraser') {
       const r = Math.max(1, (size / 2) * view.scale);
       outlineCircle(ctx, pointer.x, pointer.y, r);
       drawn = { x: pointer.x - r - 3, y: pointer.y - r - 3, w: 2 * r + 6, h: 2 * r + 6 };
@@ -355,7 +363,7 @@
       boxH,
       viewScale: view.scale,
       mag: loupeMag,
-      brush: tool === 'rect' ? null : size / 2,
+      brush: tool === 'rect' || tool === 'move' ? null : size / 2,
       rect: rect && { x: rect.start[0], y: rect.start[1], w: rect.end[0] - rect.start[0], h: rect.end[1] - rect.start[1] },
     });
   }
@@ -384,6 +392,7 @@
 
   function run(action: Action) {
     switch (action) {
+      case 'move':
       case 'brush':
       case 'eraser':
       case 'rect':
@@ -447,7 +456,7 @@
     bind:this={stage}
     class="stage"
     class:rect={tool === 'rect'}
-    class:grab={space}
+    class:grab={space || tool === 'move'}
     class:panning
     role="application"
     aria-label={copy.editor.photo}

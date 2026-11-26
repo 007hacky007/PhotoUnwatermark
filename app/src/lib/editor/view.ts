@@ -45,5 +45,31 @@ export function prevZoomStep(scale: number): number {
  */
 export function wheelZoom(deltaY: number, deltaMode: number, ctrlKey: boolean, pageHeight: number): number {
   const unit = deltaMode === 1 ? 16 : deltaMode === 2 ? pageHeight : 1;
-  return Math.exp(-deltaY * unit * (ctrlKey ? 0.01 : 0.002));
+  // One event never zooms by more than about 1.6 times, so a mouse wheel notch with Ctrl is not a jump.
+  const exponent = Math.max(-0.5, Math.min(0.5, -deltaY * unit * (ctrlKey ? 0.01 : 0.002)));
+  return Math.exp(exponent);
+}
+
+/** Moves the view by (dx, dy) screen pixels. */
+export function panBy(v: View, dx: number, dy: number): View {
+  return { scale: v.scale, x: v.x + dx, y: v.y + dy };
+}
+
+/**
+ * How far one wheel event moves the photo, in screen pixels: the photo follows the fingers on a
+ * trackpad. Shift turns a mouse wheel's up and down into sideways.
+ */
+export function wheelPan(
+  deltaX: number,
+  deltaY: number,
+  deltaMode: number,
+  shiftKey: boolean,
+  pageSize: { w: number; h: number },
+): [number, number] {
+  const ux = deltaMode === 1 ? 16 : deltaMode === 2 ? pageSize.w : 1;
+  const uy = deltaMode === 1 ? 16 : deltaMode === 2 ? pageSize.h : 1;
+  let dx = deltaX * ux;
+  let dy = deltaY * uy;
+  if (shiftKey && dx === 0) [dx, dy] = [dy, 0];
+  return [-dx, -dy];
 }

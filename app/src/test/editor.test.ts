@@ -668,7 +668,7 @@ describe('Check the watermark', () => {
     const set = await openSet({ 1: someArea() });
     await fireEvent.keyDown(window, { key: 'm' });
     expect(screen.getByText(copy.checkWatermark.help)).toBeTruthy();
-    expect(screen.getByText(copy.editor.spaceHint)).toBeTruthy();
+    expect(screen.getByText(copy.editor.moveHint(false))).toBeTruthy();
     assertPlainText(set.container);
     preview.mockResolvedValue();
     await fireEvent.click(screen.getByRole('button', { name: copy.checkWatermark.preview }));
@@ -745,6 +745,61 @@ describe('Check the watermark', () => {
     await fireEvent.click(screen.getByRole('button', { name: copy.checkWatermark.looksRight }));
     await waitFor(() => expect(confirmNewGroup).toHaveBeenCalled());
     expect(putDraft).toHaveBeenCalledWith(1, W, H, someArea());
+  });
+
+  it('plainWheelMovesThePhotoAndCtrlWheelZooms', async () => {
+    await openSet({ 1: someArea() });
+    const stage = screen.getByRole('application');
+    const parse = () => /translate\((-?[\d.]+)px, (-?[\d.]+)px\) scale\((-?[\d.]+)\)/.exec(sheet().style.transform)!.slice(1).map(Number);
+    const [x0, y0, s0] = parse();
+    await fireEvent.wheel(stage, { deltaX: 10, deltaY: 30 });
+    const [x1, y1, s1] = parse();
+    expect(s1).toBeCloseTo(s0);
+    expect(x1).toBeCloseTo(x0 - 10);
+    expect(y1).toBeCloseTo(y0 - 30);
+    // Shift turns up and down into sideways.
+    await fireEvent.wheel(stage, { deltaX: 0, deltaY: 20, shiftKey: true });
+    const [x2, y2] = parse();
+    expect(x2).toBeCloseTo(x1 - 20);
+    expect(y2).toBeCloseTo(y1);
+    // Pinch (ctrlKey) and Cmd or Ctrl with the wheel zoom.
+    await fireEvent.wheel(stage, { deltaY: -20, ctrlKey: true });
+    const [, , s3] = parse();
+    expect(s3).toBeGreaterThan(s0);
+    await fireEvent.wheel(stage, { deltaY: 20, metaKey: true });
+    expect(parse()[2]).toBeLessThan(s3);
+  });
+
+  it('moveToolDragsThePhotoWithoutPainting', async () => {
+    await openSet({ 1: someArea() });
+    await fireEvent.keyDown(window, { key: 'h' });
+    expect(pressed(copy.tools.move)).toBe('true');
+    expect(pressed(copy.tools.brush)).toBe('false');
+    const before = sheet().style.transform;
+    const stage = screen.getByRole('application');
+    await fireEvent.pointerDown(stage, { pointerId: 1, button: 0, clientX: 0, clientY: 0, pointerType: 'mouse' });
+    await fireEvent.pointerMove(stage, { pointerId: 1, button: 0, clientX: 30, clientY: 20, pointerType: 'mouse' });
+    await fireEvent.pointerUp(stage, { pointerId: 1, button: 0, clientX: 30, clientY: 20, pointerType: 'mouse' });
+    expect(sheet().style.transform).not.toBe(before);
+    expect(button(copy.editor.undo).disabled).toBe(true);
+    expect(redPixels()).toEqual(someArea());
+    // The tool button works too.
+    await fireEvent.click(button(copy.tools.brush));
+    expect(pressed(copy.tools.move)).toBe('false');
+    await fireEvent.click(button(copy.tools.move));
+    expect(pressed(copy.tools.move)).toBe('true');
+  });
+
+  it('placingShowsAnOverlayOverTheDimmedPhoto', async () => {
+    placeOn.mockImplementation(() => new Promise<StripPlacement>(() => {}));
+    const set = await openSet({ 1: someArea() });
+    await fireEvent.click(button(copy.checkWatermark.stripPhoto(2, 2)));
+    const overlay = await screen.findByText(copy.checkWatermark.placing);
+    expect(overlay.closest('[role="status"]')).toBeTruthy();
+    expect(screen.getByText(copy.checkWatermark.placingWait)).toBeTruthy();
+    expect(screen.getByRole('progressbar').dataset.indeterminate).toBe('true');
+    expect(document.querySelector('.pane.dim')).toBeTruthy();
+    assertPlainText(set.container);
   });
 
   it('spaceStillHidesRedAfterClickingButtons', async () => {

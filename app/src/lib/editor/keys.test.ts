@@ -26,7 +26,7 @@ describe('keys', () => {
 
   it('maps the tool, size, loupe and zoom keys', () => {
     const plain: [string, string][] = [
-      ['b', 'brush'], ['B', 'brush'], ['e', 'eraser'], ['r', 'rect'], ['m', 'toggleLoupe'],
+      ['h', 'move'], ['b', 'brush'], ['B', 'brush'], ['e', 'eraser'], ['r', 'rect'], ['m', 'toggleLoupe'],
       ['[', 'sizeDown'], [']', 'sizeUp'], ['0', 'fit'], ['1', 'actualSize'],
       ['+', 'zoomIn'], ['=', 'zoomIn'], ['-', 'zoomOut'],
     ];
@@ -49,7 +49,7 @@ describe('keys', () => {
 describe('key helpers', () => {
   it('onlyStepActionsRepeat', () => {
     for (const a of ['sizeDown', 'sizeUp', 'zoomIn', 'zoomOut', 'undo', 'redo'] as const) expect(repeats(a), a).toBe(true);
-    for (const a of ['brush', 'eraser', 'rect', 'toggleLoupe', 'fit', 'actualSize'] as const) expect(repeats(a), a).toBe(false);
+    for (const a of ['move', 'brush', 'eraser', 'rect', 'toggleLoupe', 'fit', 'actualSize'] as const) expect(repeats(a), a).toBe(false);
   });
 
   it('textFieldsKeepTheirKeys', () => {
