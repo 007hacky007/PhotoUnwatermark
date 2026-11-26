@@ -249,8 +249,9 @@ pub fn find(t: &WatermarkTemplate, img: &RgbImage) -> MatchResult {
 }
 
 /// [`find`] that gives up as soon as `stop` is set: the search looks at the flag before each
-/// scale and each refinement, and returns `NotFound` (confidence 0) once it is set. Such a
-/// result says nothing about the photo, so a caller that set the flag drops it.
+/// scale, each candidate and each refinement step, and returns `NotFound` (confidence 0) once
+/// it is set. Such a result says nothing about the photo, so a caller that set the flag drops
+/// it.
 pub fn find_until(t: &WatermarkTemplate, img: &RgbImage, stop: &AtomicBool) -> MatchResult {
     let (w, h) = img.dimensions();
     let not_found = |confidence: f32| MatchResult {
@@ -993,6 +994,7 @@ fn search(target: &Target, tm: &Tmpl, claimed: &[[f32; 4]]) -> Option<Placement>
     // by fine score are refined.
     let mut checked: Vec<Placement> = cands
         .into_iter()
+        .take_while(|_| !target.stopped())
         .filter_map(|(_, k, cx, cy)| {
             let x = (cx - tm.w as f32 / 2.0).round() as i32;
             let y = (cy - tm.h as f32 / 2.0).round() as i32;
@@ -1017,6 +1019,9 @@ fn refine(target: &Target, tm: &Tmpl, start: Placement, claimed: &[[f32; 4]]) ->
     for (step, span) in REFINE_STEPS.into_iter().zip(REFINE_SPAN) {
         let (k0, cx0, cy0) = (best.k, best.x as f32 + half_w, best.y as f32 + half_h);
         for j in -span..=span {
+            if target.stopped() {
+                return best;
+            }
             let k2 = k0 * (1.0 + step * j as f32);
             let x = (cx0 * k0 / k2 - half_w).round() as i32;
             let y = (cy0 * k0 / k2 - half_h).round() as i32;

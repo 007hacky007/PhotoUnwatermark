@@ -507,8 +507,7 @@ fn real_group_from_the_first_guess() {
     );
     c.put_draft(rep, ew, eh, guess.clone()).unwrap();
 
-    // A full search (the photo of another size: the set position cannot help), stopped
-    // after half a second: how long the call still runs.
+    // The photo of another size: the set position cannot help there.
     if let Some(&o) = other.first() {
         let t = Instant::now();
         let p = c.place_on(rep, o).unwrap();
@@ -517,22 +516,47 @@ fn real_group_from_the_first_guess() {
             p.status,
             secs(t)
         );
-        std::thread::scope(|s| {
-            let job = s.spawn(|| {
-                let t = Instant::now();
-                let r = c.place_on(rep, o);
-                (r.is_err(), secs(t))
-            });
-            std::thread::sleep(std::time::Duration::from_millis(500));
-            let stopped_at = Instant::now();
-            c.cancel();
-            let (stopped, total) = job.join().unwrap();
-            eprintln!(
-                "stop during a full search: call ended {:.2} s after the stop (stopped {stopped}, {total:.2} s in all)",
-                secs(stopped_at)
-            );
-        });
     }
+
+    // A full search: a drawing of two boxes in empty corners (no set position, two pieces, so
+    // the pieces are also searched one by one), on a photo of the same size. Once as it is,
+    // then stopped after half a second: how long the call still runs.
+    let corners = {
+        let mut a = vec![0u8; (ew * eh) as usize];
+        let (bw, bh) = (ew as usize / 8, eh as usize / 8);
+        for y in 0..eh as usize {
+            for x in 0..ew as usize {
+                let tl = (bw..2 * bw).contains(&x) && (bh..2 * bh).contains(&y);
+                let br = (w - 2 * bw..w - bw).contains(&x)
+                    && (eh as usize - 2 * bh..eh as usize - bh).contains(&y);
+                if tl || br {
+                    a[y * w + x] = 255;
+                }
+            }
+        }
+        a
+    };
+    let same_size: Vec<u32> = set_a.iter().copied().filter(|&id| id != rep).collect();
+    c.put_draft(rep, ew, eh, corners).unwrap();
+    let t = Instant::now();
+    let p = c.place_on(rep, same_size[0]).unwrap();
+    let full = secs(t);
+    eprintln!(
+        "full search on a 24 MP photo: {:?} in {full:.2} s",
+        p.status
+    );
+    // Another photo, so the placement is not one kept from before.
+    std::thread::scope(|s| {
+        let job = s.spawn(|| c.place_on(rep, same_size[1]).is_err());
+        std::thread::sleep(std::time::Duration::from_millis(500));
+        let stopped_at = Instant::now();
+        c.cancel();
+        let stopped = job.join().unwrap();
+        eprintln!(
+            "stop half a second into a {full:.2} s search: the call ended {:.2} s after the stop (stopped {stopped})",
+            secs(stopped_at)
+        );
+    });
 
     // Step 3: group 1 from the unedited guess.
     c.drop_draft(rep);
