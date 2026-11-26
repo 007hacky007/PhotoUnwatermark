@@ -297,15 +297,11 @@ pub async fn detect(
     self::job(job, move || core.detect(&sender(&on_event))).await
 }
 
+/// Starts the next group from saved watermark `id`; returns its number.
 #[tauri::command]
-pub async fn use_saved(
-    shell: State<'_, Shell>,
-    id: String,
-    on_event: Channel<ProgressEvent>,
-    job: Option<u64>,
-) -> Res<DetectOutcome> {
+pub async fn use_saved(shell: State<'_, Shell>, id: String, job: Option<u64>) -> Res<u32> {
     let core = shell.core.clone();
-    self::job(job, move || core.use_saved(&id, &sender(&on_event))).await
+    self::job(job, move || core.use_saved(&id)).await
 }
 
 /// Size of the image the area is drawn on.

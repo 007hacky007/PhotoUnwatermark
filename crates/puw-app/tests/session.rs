@@ -213,7 +213,12 @@ fn second_job_is_busy() {
         rx.recv_timeout(Duration::from_secs(60))
             .expect("the first job reports progress");
         assert!(matches!(core.detect(&noop), Err(AppError::Busy)));
-        assert!(matches!(core.use_saved("x", &noop), Err(AppError::Busy)));
+        assert!(matches!(core.use_saved("x"), Err(AppError::Busy)));
+        // Not a job: it answers at once.
+        assert!(matches!(
+            core.group_sample(),
+            Err(AppError::NothingToRemove)
+        ));
         assert!(matches!(core.suggest_saved(), Err(AppError::Busy)));
         assert!(matches!(
             core.ensure_models(&[ModelKind::Lama], LoadPurpose::Remover, &noop),
@@ -273,6 +278,8 @@ fn copy_fixed() -> tempfile::TempDir {
     dir
 }
 
+/// A saved watermark starts a group at once; its matching loads no model and the photos step 2
+/// shows for it are where it was found.
 #[test]
 fn use_saved_skips_models() {
     // Without PUW_MODELS_DIR the models folder is empty, so loading any model would fail.
@@ -289,14 +296,21 @@ fn use_saved_skips_models() {
             name: "Studio".into()
         })
     );
+    assert_eq!(f.core.use_saved(&w.id).unwrap(), 1);
     let rec = Recorder::default();
-    let out = f.core.use_saved(&w.id, &|e| rec.push(e)).unwrap();
-    assert_eq!(out.sample.len(), 3);
-    assert!(out.sample.contains(&out.representative));
+    let sum = f.core.match_all(&|e| rec.push(e)).unwrap();
+    assert_eq!(sum.found, 8, "{sum:?}");
     let events = rec.events();
     assert!(load_fractions(&events).is_empty());
-    assert!(events.contains(&ProgressEvent::Looking { done: 3, total: 3 }));
+    assert!(
+        !events
+            .iter()
+            .any(|e| matches!(e, ProgressEvent::Looking { .. }))
+    );
 
+    let out = f.core.group_sample().unwrap();
+    assert_eq!(out.sample.len(), 3);
+    assert_eq!(out.sample[0], out.representative);
     let rep = out.representative;
     let share = covered(
         &ground_truth(&name_of(&f.core, rep)),
@@ -496,66 +510,51 @@ fn images_served_during_job() {
 }
 
 #[test]
-fn new_guesses_drop_stale_drafts() {
+fn saved_group_drops_stale_drafts() {
     let f = fixture(None);
     add_fixed(&f.core);
     let w = save_fixed_watermark(&f.dirs);
-    // A draft on photo 1 (in the sample), far from the watermark.
+    // A draft on photo 1, far from the watermark.
     let mut draft = vec![0u8; 1536 * 1024];
     for y in 0..100 {
         draft[y * 1536..y * 1536 + 100].fill(255);
     }
     f.core.put_draft(1, 1536, 1024, draft).unwrap();
 
-    let out = f.core.use_saved(&w.id, &noop).unwrap();
-    assert!(out.sample.contains(&1));
+    assert_eq!(f.core.use_saved(&w.id).unwrap(), 1);
+    assert!(f.core.start_area(1).unwrap().iter().all(|&v| v == 0));
+    f.core.match_all(&noop).unwrap();
     let shown = f.core.start_area(1).unwrap();
     assert!(shown.iter().any(|&v| v != 0));
     assert!(shown[..100].iter().all(|&v| v == 0));
 
-    // Accepting what is shown, without a new draft, confirms the new guess.
+    // Accepting what is shown, without a new draft, changes nothing: the old draft is gone.
     f.core.confirm_set_area(1).unwrap();
     assert!(
         f.core.area(1).unwrap() == shown,
         "the confirmed area is not the one shown"
     );
-    let t = f.core.confirmed_template().unwrap();
-    let other = image::open(fixed().join("marked/05.png"))
-        .unwrap()
-        .to_rgb8();
-    assert_eq!(find(&t, &other).status, MatchStatus::Found);
+    let g = f.core.groups();
+    assert!(!g.groups[0].edited && g.matched, "{g:?}");
 }
 
 #[test]
-fn unreadable_sample_photo_is_left_out() {
+fn unreadable_photo_stays_out_of_a_saved_group() {
     let f = fixture(None);
     let photos = copy_fixed();
     f.core.add_paths(&[photos.path().to_path_buf()]).unwrap();
     let w = save_fixed_watermark(&f.dirs);
-    // The sample of 8 photos is 1, 4 and 6; photo 4 can no longer be read.
     std::fs::write(photos.path().join("04.png"), b"not a photo").unwrap();
 
-    let rec = Recorder::default();
-    let out = f.core.use_saved(&w.id, &|e| rec.push(e)).unwrap();
-    assert_eq!(out.sample, vec![1, 6]);
+    assert_eq!(f.core.use_saved(&w.id).unwrap(), 1);
+    let sum = f.core.match_all(&noop).unwrap();
+    assert_eq!(sum.total, 7, "{sum:?}");
+    let st = state(&f.core, 4);
+    assert_eq!(st.status, AreaStatus::Unreadable);
+    assert!(st.group.is_none() && !st.member, "{st:?}");
+    let out = f.core.group_sample().unwrap();
+    assert!(!out.sample.contains(&4), "{out:?}");
     assert!(out.sample.contains(&out.representative));
-    assert!(
-        rec.events()
-            .contains(&ProgressEvent::Looking { done: 3, total: 3 })
-    );
-    assert!(f.core.start_area(4).unwrap().iter().all(|&v| v == 0));
-
-    // With no readable photo in the sample the search fails with a plain sentence.
-    for name in ["01.png", "06.png"] {
-        std::fs::remove_file(photos.path().join(name)).unwrap();
-    }
-    let err = f.core.use_saved(&w.id, &noop).unwrap_err();
-    let m = user_message(&err);
-    assert!(
-        m == "The photo could not be opened. The file may be damaged."
-            || m == "The photo could not be found. It may have been moved or deleted.",
-        "{m}"
-    );
 }
 
 /// A photo cut short after it was added, and one deleted: both are "cannot be read" (with

@@ -13,17 +13,18 @@
 //! session, and no `AppCore` lock is ever held when it is taken, so a callback that calls back
 //! into `AppCore` (to cancel, say) cannot deadlock either.
 //!
-//! A long call (detection, model loading, the saved-watermark search, matching, adding, removing or
-//! clearing photos, confirming a group's area, clearing the groups, placing the drawing on a
-//! strip photo, the preview, the removal run, saving the watermark, removing the downloaded data) holds the job slot from start to end, so
-//! only one runs at a time and another one gets [`AppError::Busy`]. It locks the session to copy
-//! its inputs, works without it, and locks it again to store the results (matching stores each
-//! photo's result as soon as it is ready, and so does the removal run). Because the photo list
-//! changes only inside the job slot, the photos a job read are still there when it stores the
-//! results. Everything else (the photo list, areas, drafts, photo states and edits, images,
-//! settings, the saved-watermark list) answers while a job runs; a match result never replaces an
-//! area the person saved for that photo in the meantime, and the removal run works with the photos
-//! and areas it copied when it started.
+//! A long call (detection, model loading, the saved-watermark offer, starting a group from a saved
+//! watermark, matching, adding, removing or clearing photos, confirming a group's area, clearing
+//! the groups, placing the drawing on a strip photo, the preview, the removal run, saving the
+//! watermark, removing the downloaded data) holds the job slot from start to end, so only one runs
+//! at a time and another one gets [`AppError::Busy`]. It locks the session to copy its inputs,
+//! works without it, and locks it again to store the results (matching stores each photo's result
+//! as soon as it is ready, and so does the removal run). Because the photo list changes only inside
+//! the job slot, the photos a job read are still there when it stores the results. Everything else
+//! (the photo list, areas, drafts, photo states and edits, images, settings, the saved-watermark
+//! list) answers while a job runs; a match result never replaces an area the person saved for that
+//! photo in the meantime, and the removal run works with the photos and areas it copied when it
+//! started.
 
 use std::collections::HashSet;
 use std::path::PathBuf;
@@ -33,9 +34,9 @@ use std::time::Instant;
 use image::RgbImage;
 use puw_core::mask::{self, Mask};
 use puw_core::{
-    Engine, EngineOptions, Error, Guess, GuessOptions, Library, MatchStatus, ModelKind, ModelPaths,
-    Progress, SetLayers, WatermarkTemplate, build_set_layers, build_template, find, guess_photo,
-    load, pick_representative, representative_sample,
+    Engine, EngineOptions, Error, Guess, GuessOptions, Library, ModelKind, ModelPaths, Progress,
+    SetLayers, WatermarkTemplate, build_set_layers, build_template, guess_photo, load,
+    pick_representative, representative_sample,
 };
 use serde::Serialize;
 
@@ -45,7 +46,7 @@ use crate::image_cache::ImageCache;
 use crate::images::{self, area_from_edit};
 use crate::jobs::{Events, Job, JobSlot, LoadPurpose, ProgressEvent, with_ticker};
 use crate::photos::{AddResult, PhotoId, PhotoInfo, Problem};
-use crate::session::{Area, Draft, Session};
+use crate::session::{Area, Draft, SavedOrigin, Session};
 use crate::{AppError, DataDirs, OutputRule, Result, Settings, load_fraction};
 
 mod remove;
@@ -294,13 +295,6 @@ impl AppCore {
         self.session().photos.infos()
     }
 
-    /// Ids and files of all photos, in list order.
-    fn photo_files(&self) -> (Vec<PhotoId>, Vec<PathBuf>) {
-        let s = self.session();
-        let ids = s.photos.infos().iter().map(|i| i.id).collect();
-        (ids, s.photos.paths())
-    }
-
     fn photo_path(&self, id: PhotoId) -> Result<PathBuf> {
         let s = self.session();
         Ok(s.photos.get(id).ok_or_else(|| no_photo(id))?.path.clone())
@@ -398,7 +392,8 @@ impl AppCore {
         let _ = s.save(&self.dirs.settings);
     }
 
-    /// A saved watermark found on most of the first few photos (no model needed).
+    /// A saved watermark found on most of up to [`SUGGEST_PHOTOS`] photos spread over the
+    /// photos with no group (no model needed). `None` when there is no such photo.
     pub fn suggest_saved(&self) -> Result<Option<Suggestion>> {
         let job = self.jobs.start()?;
         let library = Library::open(&self.dirs.watermarks)?;
@@ -406,7 +401,12 @@ impl AppCore {
         if saved.is_empty() {
             return Ok(None);
         }
-        let (_, paths) = self.photo_files();
+        let paths: Vec<PathBuf> = self
+            .session()
+            .ungrouped()
+            .into_iter()
+            .map(|u| u.1)
+            .collect();
         let mut imgs: Vec<RgbImage> = Vec::new();
         for i in spread(paths.len(), SUGGEST_PHOTOS) {
             job.check()?;
@@ -425,13 +425,26 @@ impl AppCore {
         }))
     }
 
-    /// Finds the watermark on a few photos ([`representative_sample`], leaving out any that
-    /// cannot be read) after loading the detection models and reading the set (its batch layers
-    /// are kept). The guesses become those photos' step-2 areas ([`AppCore::start_area`]);
-    /// every step-2 guess and draft from before is dropped.
+    /// The first guess for the next group: finds the watermark on a few of the photos with no
+    /// group (all photos while there is no group; [`representative_sample`], leaving out any
+    /// that cannot be read) after loading the detection models and reading those photos (their
+    /// batch layers are kept, built from them only). The guesses become those photos' step-2
+    /// areas ([`AppCore::start_area`]); every step-2 guess and draft from before is dropped,
+    /// and the outcome is kept as the last first guess. Groups, ticks and results stay as they
+    /// are. Fails with [`AppError::NotReady`] until the next group can start.
+    ///
+    /// Stopped part way, it leaves the guesses and the last first guess as they were, but
+    /// keeps the batch layers once they are read. Matching reads them again whenever they miss
+    /// a photo it matches, so they never stand in for photos they were not built from.
     pub fn detect(&self, ev: Events) -> Result<DetectOutcome> {
         let job = self.jobs.start()?;
-        let (ids, paths) = self.photo_files();
+        self.ready_for_next_group()?;
+        let (ids, paths): (Vec<PhotoId>, Vec<PathBuf>) = self
+            .session()
+            .ungrouped()
+            .into_iter()
+            .map(|(id, path, _)| (id, path))
+            .unzip();
         if ids.is_empty() {
             return Err(not_found("no photos to look at"));
         }
@@ -467,38 +480,47 @@ impl AppCore {
         Ok(outcome)
     }
 
-    /// Looks for saved watermark `id` on the same photos [`AppCore::detect`] would use, without
-    /// any model. The best `Found` photo comes first, else the first photo. Like `detect`, it
-    /// replaces every step-2 guess and drops every draft.
-    pub fn use_saved(&self, id: &str, ev: Events) -> Result<DetectOutcome> {
-        let job = self.jobs.start()?;
+    /// The photos the last first guess looked at ([`AppCore::detect`]), for tests.
+    #[doc(hidden)]
+    pub fn last_detect(&self) -> Option<DetectOutcome> {
+        self.session().last_detect.clone()
+    }
+
+    /// Makes the next group (group 1 when there is none) from saved watermark `id`, as it is,
+    /// and returns its number. Every photo in no group is reset first and every step-2 guess
+    /// and draft is dropped, as for any new group. Reads no photo
+    /// and loads no model: [`AppCore::match_all`] then finds the watermark on the photos with
+    /// no group. Fails with [`AppError::NotReady`] until the next group can start.
+    pub fn use_saved(&self, id: &str) -> Result<u32> {
+        let _job = self.jobs.start()?;
+        self.ready_for_next_group()?;
         let saved = Library::open(&self.dirs.watermarks)?
             .list()?
             .into_iter()
             .find(|w| w.id == id)
             .ok_or_else(|| not_found("no such saved watermark"))?;
-        let (ids, paths) = self.photo_files();
-        if ids.is_empty() {
+        let mut s = self.session();
+        // Ticks and opens do not need the job slot; check again before the group is made.
+        if !s.ready_for_next_group() {
+            return Err(AppError::NotReady);
+        }
+        if s.ungrouped().is_empty() {
             return Err(not_found("no photos to look at"));
         }
-        let results = self.look_at_sample(&job, &ids, &paths, ev, |p| {
-            Ok(find(&saved.template, &p.rgb))
-        })?;
-        let sample: Vec<PhotoId> = results.iter().map(|(id, _)| *id).collect();
-        let representative = results
-            .iter()
-            .filter(|(_, r)| r.status == MatchStatus::Found)
-            .max_by(|a, b| a.1.confidence.total_cmp(&b.1.confidence))
-            .map_or(sample[0], |(id, _)| *id);
+        let origin = SavedOrigin { name: saved.name };
+        Ok(s.begin_group(Arc::new(saved.template), None, Some(origin), None))
+    }
 
-        let outcome = DetectOutcome {
-            sample,
-            representative,
-        };
-        let mut s = self.session();
-        s.set_guesses(results.into_iter().map(|(id, r)| (id, r.mask)).collect());
-        s.last_detect = Some(outcome.clone());
-        Ok(outcome)
+    /// The photos step 2 shows for the current group, and the one it opens first. A group
+    /// made from a saved watermark gets them once its matching has finished (kept from then
+    /// on): up to 3 of its members where it was found, the best match first; else the first 3
+    /// photos it was looked for on. Before that they are worked out on every call, from the
+    /// same photos, else from the first 3 photos with no group. Fails with
+    /// [`AppError::NothingToRemove`] when there is no group (or no photo to show).
+    pub fn group_sample(&self) -> Result<DetectOutcome> {
+        self.session()
+            .group_sample()
+            .ok_or(AppError::NothingToRemove)
     }
 
     /// Reads photos `ids` (files `paths`) for their batch layers ([`ProgressEvent::Reading`])
@@ -518,6 +540,18 @@ impl AppCore {
         let layers = Arc::new(build_set_layers(paths, &progress)?);
         self.session().set_layers(layers.clone(), ids);
         Ok(layers)
+    }
+
+    /// The photos the batch layers were read from, in list order, for tests.
+    #[doc(hidden)]
+    pub fn layer_photos(&self) -> Vec<PhotoId> {
+        let s = self.session();
+        s.photos
+            .infos()
+            .iter()
+            .map(|i| i.id)
+            .filter(|id| s.layers_from.contains(id))
+            .collect()
     }
 
     /// Runs `look` on each photo of the [`representative_sample`], one at a time, reporting

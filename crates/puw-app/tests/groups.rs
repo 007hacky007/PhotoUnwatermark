@@ -1,31 +1,61 @@
 //! Watermark groups: a set with two watermarks is handled one group at a time, and every photo
 //! is always counted once (in a group, with no group yet, or as one that cannot be read).
 //!
-//! No test here needs models.
+//! The tests of the leftovers' first guess need models: they read them from `PUW_MODELS_DIR`
+//! and return early with a message when it is not set. No other test here needs models.
 
 mod common;
 
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
+use std::time::Instant;
 
 use common::{
-    Mixed, Recorder, add_synth, confirm_truth, fixture, logo_photos, matching, mixed_set, noop,
-    put_truth, rect_area, settle, state, synth_truth,
+    Fixture, Mixed, Recorder, add_synth, confirm_truth, fixture, logo_photos, matching, mixed_set,
+    model_fixture, noop, put_truth, rect_area, settle, state, synth, synth_truth,
 };
-use image::GrayImage;
+use image::{GrayImage, RgbImage};
 use puw_app::images::jpeg;
-use puw_app::{AppCore, AppError, AreaStatus, GroupInfo, PhotoState, Placed, StripPlacement};
+use puw_app::{
+    AppCore, AppError, AreaStatus, DeviceState, GroupInfo, PhotoState, Placed, ProgressEvent,
+    StripPlacement, with_ticket,
+};
+use puw_core::{Library, SavedWatermark, build_template};
 
 /// The members of every group, plus the photos with no group yet, plus the ones that cannot be
-/// read, are all the photos.
+/// read, are all the photos. Each count is checked against other calls too: the photo states,
+/// the photo problems and, when nothing holds up removal, the photos to remove.
 fn assert_counts(core: &AppCore) {
     let g = core.groups();
+    let photos = core.photos();
     let members: u32 = g.groups.iter().map(|i| i.photos).sum();
     assert_eq!(
         members + g.leftovers + g.unreadable,
-        core.photos().len() as u32,
+        photos.len() as u32,
         "{g:?}"
     );
+    let states = core.photo_states();
+    let count = |keep: &dyn Fn(&PhotoState) -> bool| states.iter().filter(|s| keep(s)).count();
+    assert_eq!(
+        g.leftovers as usize,
+        count(&|s| s.status != AreaStatus::Unreadable && !s.member),
+        "{g:?}"
+    );
+    assert_eq!(
+        g.unreadable as usize,
+        photos.iter().filter(|p| p.problem.is_some()).count(),
+        "{g:?}"
+    );
+    for info in &g.groups {
+        assert_eq!(
+            info.photos as usize,
+            count(&|s| s.member && s.group == Some(info.number)),
+            "{g:?}"
+        );
+    }
+    if core.removal_blockers().is_empty() {
+        assert_eq!(core.to_remove().len(), members as usize, "{g:?}");
+    }
 }
 
 fn states_of(core: &AppCore, ids: &[u32]) -> Vec<PhotoState> {
@@ -63,7 +93,7 @@ fn two_groups(core: &AppCore, dir: &Path) -> Mixed {
 }
 
 /// A JPEG cut short: it is added (its header is fine) but cannot be read.
-fn broken_jpeg(dir: &Path) -> std::path::PathBuf {
+fn broken_jpeg(dir: &Path) -> PathBuf {
     let img = image::RgbImage::from_fn(300, 200, |x, y| image::Rgb([x as u8, y as u8, 90]));
     let bytes = jpeg(&img, 85);
     let p = dir.join("broken.jpg");
@@ -664,4 +694,384 @@ fn template_is_kept_until_the_drawing_changes() {
     f.core.clear_groups().unwrap();
     f.core.place_on(m.logos[1], m.logos[0]).unwrap();
     assert_eq!(f.core.strip_templates_built(), 4);
+}
+
+// ---- Groups from saved watermarks, and the leftovers' first guess ----
+
+/// Saves the watermark learned from the photo file `photo` and its `truth` as `name`; returns
+/// its id.
+fn save_from(f: &Fixture, name: &str, photo: &Path, truth: &GrayImage) -> String {
+    let img = image::open(photo).unwrap().to_rgb8();
+    let w = SavedWatermark::new(
+        name,
+        build_template(&img, truth),
+        jpeg(&RgbImage::new(4, 4), 80),
+    );
+    Library::open(&f.dirs.watermarks).unwrap().save(&w).unwrap();
+    w.id
+}
+
+/// Saves "Studio", learned from the truth of `fixed/00`.
+fn save_fixed(f: &Fixture) -> String {
+    let photo = synth("fixed").join("marked").join("00.png");
+    save_from(f, "Studio", &photo, &synth_truth("fixed", "00"))
+}
+
+/// Saves "Ring", learned from the truth of the first logo photo of [`mixed_set`] in `dir`.
+fn save_logo(f: &Fixture, dir: &Path, m: &Mixed) -> String {
+    let photo = dir.join("marked").join("logo-00.png");
+    save_from(f, "Ring", &photo, &m.logo_truths[0])
+}
+
+fn ids_of(core: &AppCore) -> Vec<u32> {
+    core.photos().iter().map(|p| p.id).collect()
+}
+
+fn has_looking(events: &[ProgressEvent]) -> bool {
+    events
+        .iter()
+        .any(|e| matches!(e, ProgressEvent::Looking { .. }))
+}
+
+fn has_loading(events: &[ProgressEvent]) -> bool {
+    events
+        .iter()
+        .any(|e| matches!(e, ProgressEvent::LoadingModels { .. }))
+}
+
+fn has_reading(events: &[ProgressEvent]) -> bool {
+    events
+        .iter()
+        .any(|e| matches!(e, ProgressEvent::Reading { .. }))
+}
+
+#[test]
+fn use_saved_starts_group_one() {
+    let f = fixture(None);
+    let dir = tempfile::tempdir().unwrap();
+    let m = mixed_set(&f.core, dir.path());
+    let id = save_fixed(&f);
+    assert_eq!(f.core.use_saved(&id).unwrap(), 1);
+    assert_eq!(f.core.device_status().state, DeviceState::NotStarted);
+    let g = f.core.groups();
+    assert_eq!(
+        g.groups,
+        [GroupInfo {
+            number: 1,
+            photos: 0,
+            saved_name: Some("Studio".into()),
+            edited: false,
+            can_save: false,
+        }]
+    );
+    assert!(g.current == Some(1) && !g.matched, "{g:?}");
+    assert_counts(&f.core);
+
+    f.core.match_all(&noop).unwrap();
+    assert_counts(&f.core);
+    for &id in &m.fixed {
+        assert!(state(&f.core, id).member, "{:?}", state(&f.core, id));
+    }
+}
+
+#[test]
+fn use_saved_makes_the_next_group() {
+    let f = fixture(None);
+    let dir = tempfile::tempdir().unwrap();
+    let m = mixed_set(&f.core, dir.path());
+    let id = save_logo(&f, dir.path(), &m);
+    group_one(&f.core, &m);
+    let fixed_before = states_of(&f.core, &m.fixed);
+
+    assert_eq!(f.core.use_saved(&id).unwrap(), 2);
+    assert_counts(&f.core);
+    let g = f.core.groups();
+    assert_eq!(g.current, Some(2));
+    let two = &g.groups[1];
+    assert_eq!(two.saved_name.as_deref(), Some("Ring"));
+    assert!(!two.can_save && !two.edited && !g.matched, "{g:?}");
+
+    let rec = Recorder::default();
+    f.core.match_all(&|e| rec.push(e)).unwrap();
+    assert_counts(&f.core);
+    let events = rec.events();
+    let m_events = matching(&events);
+    assert_eq!(m_events.first(), Some(&(0, 6)), "{m_events:?}");
+    assert_eq!(m_events.last(), Some(&(6, 6)), "{m_events:?}");
+    assert!(!has_looking(&events) && !has_loading(&events), "{events:?}");
+    for &id in &m.logos {
+        let st = state(&f.core, id);
+        assert!(st.member && st.group == Some(2), "{st:?}");
+    }
+    assert_eq!(states_of(&f.core, &m.fixed), fixed_before);
+    assert!(f.core.groups().matched);
+}
+
+#[test]
+fn use_saved_waits() {
+    let f = fixture(None);
+    let dir = tempfile::tempdir().unwrap();
+    let m = mixed_set(&f.core, dir.path());
+    let id = save_logo(&f, dir.path(), &m);
+    confirm_truth(&f.core, "fixed", "00", m.fixed[0]);
+    let before = f.core.photo_states();
+    assert!(matches!(f.core.use_saved(&id), Err(AppError::NotReady)));
+    assert_eq!(f.core.groups().groups.len(), 1);
+    assert_eq!(f.core.photo_states(), before);
+
+    // Once matching is done it can start the next group.
+    f.core.match_all(&noop).unwrap();
+    settle(&f.core);
+    assert_eq!(f.core.use_saved(&id).unwrap(), 2);
+}
+
+#[test]
+fn saved_group_sample_is_its_best_photos() {
+    let f = fixture(None);
+    let dir = tempfile::tempdir().unwrap();
+    let m = mixed_set(&f.core, dir.path());
+    assert!(matches!(
+        f.core.group_sample(),
+        Err(AppError::NothingToRemove)
+    ));
+    let id = save_logo(&f, dir.path(), &m);
+    group_one(&f.core, &m);
+    f.core.use_saved(&id).unwrap();
+    f.core.match_all(&noop).unwrap();
+
+    let out = f.core.group_sample().unwrap();
+    assert!(!out.sample.is_empty() && out.sample.len() <= 3, "{out:?}");
+    assert!(out.sample.contains(&out.representative), "{out:?}");
+    for &id in &out.sample {
+        let st = state(&f.core, id);
+        assert!(
+            st.member && st.group == Some(2) && st.status == AreaStatus::Found,
+            "{st:?}"
+        );
+    }
+    assert_eq!(f.core.group_sample().unwrap(), out);
+
+    // It is kept: unticking a sample photo does not change it.
+    f.core.set_included(out.sample[0], false).unwrap();
+    assert_eq!(f.core.group_sample().unwrap(), out);
+}
+
+#[test]
+fn unchanged_saved_group_stays_saved() {
+    let f = fixture(None);
+    let dir = tempfile::tempdir().unwrap();
+    let m = mixed_set(&f.core, dir.path());
+    let id = save_logo(&f, dir.path(), &m);
+    group_one(&f.core, &m);
+    f.core.use_saved(&id).unwrap();
+    f.core.match_all(&noop).unwrap();
+    settle(&f.core);
+    let rep = f.core.group_sample().unwrap().representative;
+    let before = f.core.photo_states();
+
+    let (w, h) = f.core.edit_size(rep).unwrap();
+    let same = f.core.area(rep).unwrap();
+    f.core.put_draft(rep, w, h, same.clone()).unwrap();
+    f.core.confirm_set_area(rep).unwrap();
+    let g = f.core.groups();
+    assert!(!g.groups[1].edited && !g.groups[1].can_save, "{g:?}");
+    assert!(g.matched, "{g:?}");
+    assert_eq!(f.core.photo_states(), before);
+
+    let mut changed = same;
+    changed[0] = 255;
+    f.core.put_draft(rep, w, h, changed).unwrap();
+    f.core.confirm_set_area(rep).unwrap();
+    assert_counts(&f.core);
+    let g = f.core.groups();
+    let two = &g.groups[1];
+    assert!(two.edited && two.can_save, "{g:?}");
+    assert_eq!(two.saved_name.as_deref(), Some("Ring"));
+    assert!(!g.matched && g.current == Some(2), "{g:?}");
+}
+
+#[test]
+fn suggest_looks_only_at_photos_without_a_group() {
+    let f = fixture(None);
+    let dir = tempfile::tempdir().unwrap();
+    let m = mixed_set(&f.core, dir.path());
+    save_fixed(&f);
+    group_one(&f.core, &m);
+    // Only the fixed watermark is saved, and no photo left has it.
+    assert_eq!(f.core.suggest_saved().unwrap(), None);
+
+    let logo_id = save_logo(&f, dir.path(), &m);
+    let offer = f.core.suggest_saved().unwrap().expect("an offer");
+    assert_eq!(offer.id, logo_id);
+    assert_eq!(offer.name, "Ring");
+}
+
+/// R18c: the batch layers are read over the photos being matched, and only when one of them
+/// of the template's size was not read for them.
+#[test]
+fn layers_are_read_over_the_photos_being_matched() {
+    let f = fixture(None);
+    let core = &f.core;
+    let dir = tempfile::tempdir().unwrap();
+    let m = mixed_set(core, dir.path());
+    let all = ids_of(core);
+
+    confirm_truth(core, "fixed", "00", m.fixed[0]);
+    let rec = Recorder::default();
+    core.match_all(&|e| rec.push(e)).unwrap();
+    assert!(has_reading(&rec.events()));
+    let matched: Vec<u32> = all.iter().copied().filter(|&id| id != m.fixed[0]).collect();
+    assert_eq!(core.layer_photos(), matched);
+    settle(core);
+
+    // Unticked, the photo group 1 was learned from has no group; it was never read for the
+    // layers and has the size of the saved fixed watermark, so they are read again, over the
+    // photos with no group only.
+    core.set_included(m.fixed[0], false).unwrap();
+    let fixed_id = save_fixed(&f);
+    assert_eq!(core.use_saved(&fixed_id).unwrap(), 2);
+    let rec = Recorder::default();
+    core.match_all(&|e| rec.push(e)).unwrap();
+    let events = rec.events();
+    assert!(has_reading(&events));
+    assert_eq!(matching(&events).last(), Some(&(7, 7)));
+    let leftovers: Vec<u32> = all
+        .iter()
+        .copied()
+        .filter(|id| *id == m.fixed[0] || m.logos.contains(id) || m.plain.contains(id))
+        .collect();
+    assert_eq!(core.layer_photos(), leftovers);
+    let st = state(core, m.fixed[0]);
+    assert!(st.member && st.group == Some(2), "{st:?}");
+    settle(core);
+
+    // Group 3 matches photos that were all read: nothing is read again.
+    put_truth(core, m.logos[0], &m.logo_truths[0]);
+    core.confirm_new_group(m.logos[0]).unwrap();
+    let rec = Recorder::default();
+    core.match_all(&|e| rec.push(e)).unwrap();
+    assert!(!has_reading(&rec.events()));
+    assert_eq!(core.layer_photos(), leftovers);
+    assert_counts(core);
+}
+
+/// The ids of the logo and plain photos, the leftovers after group 1.
+fn leftovers_of(m: &Mixed) -> Vec<u32> {
+    m.logos.iter().chain(&m.plain).copied().collect()
+}
+
+#[test]
+fn next_group_first_guess_costs_one_sample() {
+    let Some(f) = model_fixture() else { return };
+    let core = &f.core;
+    let dir = tempfile::tempdir().unwrap();
+    let m = mixed_set(core, dir.path());
+    group_one(core, &m);
+    let (groups, states) = (core.groups(), core.photo_states());
+
+    let rec = Recorder::default();
+    let start = Instant::now();
+    let out = core.detect(&|e| rec.push(e)).unwrap();
+    let guess_took = start.elapsed();
+    let events = rec.events();
+    let looking: Vec<(u32, u32)> = events
+        .iter()
+        .filter_map(|e| match e {
+            ProgressEvent::Looking { done, total } => Some((*done, *total)),
+            _ => None,
+        })
+        .collect();
+    assert!(looking.iter().all(|&(_, t)| t == 3), "{looking:?}");
+    assert_eq!(looking.last(), Some(&(3, 3)), "{looking:?}");
+    assert!(has_reading(&events));
+    let leftovers = leftovers_of(&m);
+    assert_eq!(out.sample.len(), 3, "{out:?}");
+    assert!(
+        out.sample.iter().all(|id| leftovers.contains(id)),
+        "{out:?}"
+    );
+    assert!(out.sample.contains(&out.representative));
+    // The batch layers come from the leftovers only.
+    assert_eq!(core.layer_photos(), leftovers);
+    assert_eq!(core.groups(), groups);
+    assert_eq!(core.photo_states(), states);
+    for &id in &out.sample {
+        assert!(core.area(id).unwrap().iter().all(|&v| v == 0), "{id}");
+    }
+    assert!(
+        out.sample
+            .iter()
+            .any(|&id| core.start_area(id).unwrap().iter().any(|&v| v != 0)),
+        "no first guess at all"
+    );
+    assert_eq!(core.last_detect(), Some(out.clone()));
+
+    let pick = out
+        .sample
+        .iter()
+        .copied()
+        .find(|id| m.logos.contains(id))
+        .unwrap_or(m.logos[0]);
+    let k = m.logos.iter().position(|&id| id == pick).unwrap();
+    put_truth(core, pick, &m.logo_truths[k]);
+    core.confirm_new_group(pick).unwrap();
+    let rec = Recorder::default();
+    let start = Instant::now();
+    core.match_all(&|e| rec.push(e)).unwrap();
+    let match_took = start.elapsed();
+    let events = rec.events();
+    assert_eq!(matching(&events).last(), Some(&(5, 5)), "{events:?}");
+    assert!(!has_reading(&events), "the layers were read again");
+    eprintln!("leftovers' first guess {guess_took:?}, matching the leftovers {match_took:?}");
+    assert_counts(core);
+}
+
+/// Review Focus 5. `detect` keeps the batch layers it read before it was stopped (built from
+/// the leftovers); that is not undone, as matching reads them again whenever they miss a photo
+/// it matches.
+#[test]
+fn stopped_leftover_guess_changes_nothing() {
+    let Some(f) = model_fixture() else { return };
+    let core = &f.core;
+    let dir = tempfile::tempdir().unwrap();
+    let m = mixed_set(core, dir.path());
+    group_one(core, &m);
+    let first = core.detect(&noop).unwrap();
+    let (groups, states, last) = (core.groups(), core.photo_states(), core.last_detect());
+    assert_eq!(last, Some(first.clone()));
+    let ids = ids_of(core);
+    let starts: Vec<Vec<u8>> = ids.iter().map(|&id| core.start_area(id).unwrap()).collect();
+
+    const TICKET: u64 = 41;
+    let err = with_ticket(Some(TICKET), || {
+        core.detect(&|e| {
+            if matches!(e, ProgressEvent::Looking { .. }) {
+                core.cancel_ticket(TICKET);
+            }
+        })
+    })
+    .unwrap_err();
+    assert!(
+        matches!(err, AppError::Core(puw_core::Error::Cancelled)),
+        "{err:?}"
+    );
+    assert_eq!(core.photo_states(), states);
+    assert_eq!(core.groups(), groups);
+    assert_eq!(core.last_detect(), last);
+    for (&id, start) in ids.iter().zip(&starts) {
+        assert!(core.start_area(id).unwrap() == *start, "photo {id}");
+    }
+
+    // Clearing the groups keeps the first guesses and the photos they looked at.
+    core.clear_groups().unwrap();
+    assert_eq!(core.last_detect(), last);
+    for (&id, start) in ids.iter().zip(&starts) {
+        if first.sample.contains(&id) {
+            assert!(core.start_area(id).unwrap() == *start, "photo {id}");
+        }
+    }
+
+    // Removing a photo it looked at forgets it.
+    core.remove_photo(first.sample[0]).unwrap();
+    assert_eq!(core.last_detect(), None);
 }

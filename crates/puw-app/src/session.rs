@@ -144,10 +144,6 @@ pub(crate) struct Matched {
     pub status: MatchStatus,
     pub area: Arc<Area>,
     /// The match score.
-    #[allow(
-        dead_code,
-        reason = "picks a saved group's step-2 photos (group_sample)"
-    )]
     pub confidence: f32,
 }
 
@@ -211,8 +207,6 @@ pub(crate) struct Confirmed {
 /// The saved watermark a group was started from.
 #[derive(Debug, Clone)]
 pub(crate) struct SavedOrigin {
-    #[allow(dead_code, reason = "set when a group starts from a saved watermark")]
-    pub id: String,
     pub name: String,
 }
 
@@ -234,6 +228,9 @@ pub(crate) struct Group {
     /// This group's matching over the photos with no group has finished.
     pub matched: bool,
 }
+
+/// Photos step 2 shows for a group made from a saved watermark, at most.
+const SAMPLE: usize = 3;
 
 /// A photo waiting for matching: id, file and upright size.
 pub(crate) type Unmatched = (PhotoId, PathBuf, (u32, u32));
@@ -497,6 +494,62 @@ impl Session {
         number
     }
 
+    /// The photos step 2 shows for the current group ([`crate::AppCore::group_sample`]): its
+    /// outcome, else, for a saved watermark, [`Session::saved_sample`], kept as its outcome
+    /// once its matching has finished. `None` when there is no group or no photo to show.
+    pub fn group_sample(&mut self) -> Option<DetectOutcome> {
+        let g = self.current()?;
+        if let Some(o) = &g.outcome {
+            return Some(o.clone());
+        }
+        let matched = g.matched;
+        let o = self.saved_sample()?;
+        if matched && let Some(g) = self.current_mut() {
+            g.outcome = Some(o.clone());
+        }
+        Some(o)
+    }
+
+    /// Up to [`SAMPLE`] members of the current group where its watermark was found by matching,
+    /// highest score first; else the first photos whose result came from the group; else,
+    /// while its matching is not done, the first photos with no group. The first photo is the
+    /// representative.
+    fn saved_sample(&self) -> Option<DetectOutcome> {
+        let n = self.current_number()?;
+        let ids: Vec<PhotoId> = self.photos.infos().iter().map(|i| i.id).collect();
+        let from_group = |id: PhotoId| self.data.get(&id).is_some_and(|d| d.group == Some(n));
+        let mut found: Vec<(PhotoId, f32)> = ids
+            .iter()
+            .copied()
+            .filter(|&id| {
+                from_group(id) && self.is_member(id) && self.status(id) == AreaStatus::Found
+            })
+            .filter_map(|id| self.data[&id].matched.as_ref().map(|m| (id, m.confidence)))
+            .collect();
+        found.sort_by(|a, b| b.1.total_cmp(&a.1));
+        let mut sample: Vec<PhotoId> = found.into_iter().map(|f| f.0).take(SAMPLE).collect();
+        if sample.is_empty() {
+            sample = ids
+                .into_iter()
+                .filter(|&id| from_group(id))
+                .take(SAMPLE)
+                .collect();
+        }
+        if sample.is_empty() && self.matching_open() {
+            sample = self
+                .ungrouped()
+                .into_iter()
+                .map(|u| u.0)
+                .take(SAMPLE)
+                .collect();
+        }
+        let representative = *sample.first()?;
+        Some(DetectOutcome {
+            sample,
+            representative,
+        })
+    }
+
     /// The photos step 2 showed for a group confirmed on photo `id`: the last first guess when
     /// it looked at `id`, else `id` alone.
     fn outcome_for(&self, id: PhotoId) -> DetectOutcome {
@@ -691,9 +744,18 @@ impl Session {
         }
     }
 
+    /// Removes photo `id` from the list, with everything known about it. The last first guess
+    /// is forgotten when it looked at that photo, so no outcome ever shows a photo that is gone.
     pub fn remove(&mut self, id: PhotoId) {
         self.photos.remove(id);
         self.data.remove(&id);
+        if self
+            .last_detect
+            .as_ref()
+            .is_some_and(|o| o.sample.contains(&id))
+        {
+            self.last_detect = None;
+        }
     }
 
     /// Forgets the photos and everything learned from them. Ids are not reused.
@@ -727,6 +789,154 @@ mod tests {
                 0
             }])
         })
+    }
+
+    fn no_template() -> Arc<WatermarkTemplate> {
+        Arc::new(puw_core::build_template(
+            &image::RgbImage::new(8, 8),
+            &Mask::new(8, 8),
+        ))
+    }
+
+    fn result(status: MatchStatus, confidence: f32) -> Matched {
+        let mut mask = Mask::new(40, 30);
+        if status != MatchStatus::NotFound {
+            mask.put_pixel(5, 5, image::Luma([255]));
+        }
+        Matched {
+            status,
+            area: Arc::new(Area::from_mask(&mask)),
+            confidence,
+        }
+    }
+
+    /// A session listing `n` small photos (ids `0..n`) written into `dir`.
+    fn with_photos(dir: &std::path::Path, n: u32) -> Session {
+        let paths: Vec<PathBuf> = (0..n)
+            .map(|k| {
+                let p = dir.join(format!("{k:02}.png"));
+                image::RgbImage::from_pixel(40, 30, image::Rgb([k as u8 * 20, 90, 120]))
+                    .save(&p)
+                    .unwrap();
+                p
+            })
+            .collect();
+        let mut s = Session::default();
+        let added = s.photos.add_paths(&paths, &OutputRule::default());
+        assert_eq!(added.added.len(), n as usize, "{:?}", added.skipped);
+        s
+    }
+
+    #[test]
+    fn saved_sample_is_the_best_matches() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut s = with_photos(dir.path(), 6);
+        let origin = SavedOrigin {
+            name: "Studio".into(),
+        };
+        assert_eq!(s.group_sample(), None);
+        assert_eq!(s.begin_group(no_template(), None, Some(origin), None), 1);
+        // Matching not done, nothing found yet: the first photos with no group.
+        let first = s.group_sample().unwrap();
+        assert_eq!(
+            (first.sample.clone(), first.representative),
+            (vec![0, 1, 2], 0)
+        );
+
+        for (id, status, conf) in [
+            (0, MatchStatus::Found, 0.7),
+            (1, MatchStatus::NotFound, 0.99),
+            (2, MatchStatus::Found, 0.9),
+            (3, MatchStatus::Unsure, 0.95),
+            (4, MatchStatus::Found, 0.8),
+            (5, MatchStatus::Found, 0.6),
+        ] {
+            s.set_match(id, result(status, conf), Some(1));
+        }
+        let best = DetectOutcome {
+            sample: vec![2, 4, 0],
+            representative: 2,
+        };
+        assert_eq!(s.group_sample(), Some(best.clone()));
+        // Not kept until matching is done.
+        assert!(s.current().unwrap().outcome.is_none());
+        s.groups[0].matched = true;
+        assert_eq!(s.group_sample(), Some(best.clone()));
+        assert_eq!(s.current().unwrap().outcome, Some(best.clone()));
+        s.set_match(5, result(MatchStatus::Found, 0.99), Some(1));
+        assert_eq!(s.group_sample(), Some(best));
+    }
+
+    #[test]
+    fn saved_sample_without_a_find() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut s = with_photos(dir.path(), 5);
+        let origin = SavedOrigin {
+            name: "Studio".into(),
+        };
+        s.begin_group(no_template(), None, Some(origin), None);
+        for id in 0..5 {
+            s.set_match(id, result(MatchStatus::NotFound, 0.1), Some(1));
+        }
+        s.groups[0].matched = true;
+        let out = s.group_sample().unwrap();
+        assert_eq!((out.sample, out.representative), (vec![0, 1, 2], 0));
+    }
+
+    #[test]
+    fn removing_a_photo_forgets_the_first_guess_that_saw_it() {
+        let mut s = Session::default();
+        let seen = DetectOutcome {
+            sample: vec![1, 2, 3],
+            representative: 2,
+        };
+        s.last_detect = Some(seen.clone());
+        s.remove(7);
+        assert_eq!(s.last_detect, Some(seen));
+        s.remove(3);
+        assert_eq!(s.last_detect, None);
+    }
+
+    #[test]
+    fn clearing_groups_keeps_guesses_previews_and_results() {
+        let mut s = Session::default();
+        let seen = DetectOutcome {
+            sample: vec![1],
+            representative: 1,
+        };
+        s.last_detect = Some(seen.clone());
+        s.begin_group(no_template(), None, None, Some(seen.clone()));
+        let guess = Arc::new(Area::from_mask(&speckles(40, 30, 1)));
+        let made = Made {
+            area: guess.clone(),
+            output: OutputRule::default(),
+            detail: Detail::default(),
+        };
+        s.set_match(1, result(MatchStatus::Found, 0.9), Some(1));
+        let d = s.data.get_mut(&1).unwrap();
+        d.guess = Some(guess.clone());
+        d.preview = Some(Arc::new(vec![1, 2, 3]));
+        d.result = Some(PathBuf::from("out/01.png"));
+        d.result_made = Some(made);
+        s.set_match(2, result(MatchStatus::Found, 0.9), Some(1));
+        s.save_own(2, guess.clone());
+
+        s.clear_groups();
+        assert!(s.groups.is_empty());
+        assert_eq!(s.last_detect, Some(seen));
+        let d = &s.data[&1];
+        assert!(d.guess.as_ref().is_some_and(|g| Arc::ptr_eq(g, &guess)));
+        assert_eq!(d.preview.as_deref(), Some(&vec![1, 2, 3]));
+        assert_eq!(
+            d.result.as_deref(),
+            Some(std::path::Path::new("out/01.png"))
+        );
+        assert!(d.result_made.is_some());
+        for id in [1, 2] {
+            let d = &s.data[&id];
+            assert!(d.matched.is_none() && d.own.is_none() && d.group.is_none());
+            assert!(!d.included && !d.reviewed);
+        }
     }
 
     #[test]
