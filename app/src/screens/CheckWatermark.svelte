@@ -116,6 +116,11 @@
   let running: Promise<void> | null = null;
   /** The running placement's call: it holds the app's one job, so it is stopped when no longer wanted. */
   let placing: Promise<StripPlacement> | null = null;
+  /**
+   * The last stop of a placement, once the app has taken it. The app refuses a new job while
+   * an earlier one runs that it has not been asked to stop, so the next job waits for this.
+   */
+  let stopped: Promise<void> = Promise.resolve();
   /** The placement of the photo on screen, or null (placing, failed, or an empty drawing). */
   let placement: StripPlacement | null = null;
   let busy = false;
@@ -191,11 +196,11 @@
     return loadingStrip;
   }
 
-  /** Stops the placement that runs, if any; its answer is dropped. */
+  /** Stops the placement that runs, if any; its answer is dropped. The next job awaits `stopped`. */
   function stopPlacing() {
     const call = placing;
     placing = null;
-    if (call !== null) void stopJob(call);
+    if (call !== null) stopped = stopJob(call);
   }
 
   function show(id: PhotoId): Promise<void> {
@@ -246,6 +251,8 @@
         note = 'placing';
         const revision = s.shared.revision;
         const a = s.shared.area;
+        await stopped;
+        if (mine !== shown) return;
         await putDraft(reference, a.w, a.h, a.data);
         if (mine !== shown) return;
         const call = placeOn(reference, id);
@@ -339,6 +346,8 @@
       }
     };
     try {
+      // A placement stopped just before (on another strip photo) still has to let go of the job.
+      await stopped;
       await putDraft(id, area.w, area.h, area.data);
       // Stopped while the area was on its way: the preview never starts.
       if (mine !== job) return;
@@ -381,6 +390,7 @@
     saving = true;
     setBusy(true);
     try {
+      await stopped;
       const a = s.shared.area;
       await putDraft(reference, a.w, a.h, a.data);
       if (draft) await confirmNewGroup(reference);
@@ -445,6 +455,7 @@
       saving = true;
       setBusy(true);
       try {
+        await stopped;
         await clearGroups();
       } catch (e) {
         // Staying: the photo whose placement was stopped is placed again.

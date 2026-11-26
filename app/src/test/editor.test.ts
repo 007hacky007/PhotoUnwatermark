@@ -136,6 +136,9 @@ async function stripTo(n: number, total = 2) {
 
 const looksRight = () => fireEvent.click(button(copy.checkWatermark.looksRight));
 
+/** Lets every answer that is already on its way arrive. */
+const settle = () => new Promise((r) => setTimeout(r, 20));
+
 /** Paints a short stroke at the top-left of the editor; with the default brush it covers the tiny test photo. */
 async function paint() {
   const stage = screen.getByRole('application');
@@ -422,24 +425,59 @@ describe('Check the watermark', () => {
   });
 
   it('switchingPhotosStopsThePlacement', async () => {
-    const { wizard } = await openSet({ 1: someArea() }, { sample: [1, 2, 3], representative: 1 });
+    const { wizard } = await openSet({ 1: someArea() }, { sample: [1, 2, 3], representative: 1 }, 'reopened');
     placeOn.mockImplementation((_r, id) =>
       id === 2 ? tag(new Promise<StripPlacement>(() => {}), 77) : Promise.resolve(placed('found')),
     );
+    // The app takes a stop only when the test says so.
+    let take: () => void = () => {};
+    cancelJob.mockImplementation(() => new Promise<void>((r) => (take = r)));
     await fireEvent.click(button(copy.checkWatermark.stripPhoto(2, 3)));
     expect(await screen.findByText(copy.checkWatermark.placing)).toBeTruthy();
     await waitFor(() => expect(placeOn).toHaveBeenCalledWith(1, 2));
-    await stripTo(3, 3);
+    const sent = putDraft.mock.calls.length;
+    await fireEvent.click(button(copy.checkWatermark.stripPhoto(3, 3)));
     expect(cancelJob).toHaveBeenCalledWith(77);
+    // Nothing more reaches the app until it has taken the stop.
+    await settle();
+    expect(placeOn).toHaveBeenCalledTimes(1);
+    expect(putDraft).toHaveBeenCalledTimes(sent);
+    take();
+    await ready();
     expect(placeOn).toHaveBeenLastCalledWith(1, 3);
     expect(screen.queryByText(copy.checkWatermark.placing)).toBeNull();
-    // Leaving step 2 while a photo is placed stops it too.
+    // Leaving step 2 while a photo is placed stops it too, and the groups are cleared only after.
     cancelJob.mockClear();
     await fireEvent.click(button(copy.checkWatermark.stripPhoto(2, 3)));
     await waitFor(() => expect(placeOn).toHaveBeenCalledTimes(3));
     await fireEvent.click(button(copy.common.back));
     expect(cancelJob).toHaveBeenCalledWith(77);
+    await settle();
+    expect(clearGroups).not.toHaveBeenCalled();
+    take();
     await waitFor(() => expect(wizard.screen).toBe('add'));
+    expect(clearGroups).toHaveBeenCalledTimes(1);
+    expect(cancelJob.mock.invocationCallOrder[0]).toBeLessThan(clearGroups.mock.invocationCallOrder[0]);
+  });
+
+  it('confirmWaitsForAStoppedPlacement', async () => {
+    const { wizard } = await openSet({ 1: someArea() });
+    placeOn.mockImplementation(() => tag(new Promise<StripPlacement>(() => {}), 78));
+    let take: () => void = () => {};
+    cancelJob.mockImplementation(() => new Promise<void>((r) => (take = r)));
+    await fireEvent.click(button(copy.checkWatermark.stripPhoto(2, 2)));
+    await waitFor(() => expect(placeOn).toHaveBeenCalledWith(1, 2));
+    // Back on the reference photo, which shows at once, and "Looks right" right away.
+    await stripTo(1);
+    expect(cancelJob).toHaveBeenCalledWith(78);
+    putDraft.mockClear();
+    await looksRight();
+    await settle();
+    expect(putDraft).not.toHaveBeenCalled();
+    expect(confirmNewGroup).not.toHaveBeenCalled();
+    take();
+    await waitFor(() => expect(wizard.screen).toBe('checkAll'));
+    expect(confirmNewGroup).toHaveBeenCalledWith(1);
   });
 
   it('draftLooksRightMakesTheNextGroup', async () => {
