@@ -265,10 +265,6 @@ pub const PRIOR_FOUND: f32 = 0.28;
 /// Score at the saved position for `Unsure` on set support (the user opens the photo).
 pub const PRIOR_UNSURE: f32 = 0.16;
 
-/// Overlap (intersection over union) at which a search result and the saved placement are the
-/// same place: a search `Found` that agrees with the set position is kept as it is.
-const PRIOR_AGREE: f64 = 0.8;
-
 /// The position prior of one template over one set, worked out once and used for every photo of
 /// the template's size ([`match_with`]).
 ///
@@ -348,17 +344,6 @@ impl PositionPrior {
     }
 }
 
-/// Share of the pixels set in both masks among those set in either.
-fn overlap(a: &Mask, b: &Mask) -> f64 {
-    let (mut inter, mut uni) = (0u64, 0u64);
-    for (p, q) in a.as_raw().iter().zip(b.as_raw()) {
-        let (x, y) = (*p != 0, *q != 0);
-        inter += (x && y) as u64;
-        uni += (x || y) as u64;
-    }
-    inter as f64 / uni.max(1) as f64
-}
-
 /// [`find`] with a position prior for marks stamped at the same place on every photo:
 /// [`match_with`] with the [`PositionPrior`] of `t` over `layers`, worked out for this call.
 /// Matching many photos, work the prior out once and call [`match_with`].
@@ -371,12 +356,16 @@ pub fn match_photo(t: &WatermarkTemplate, img: &RgbImage, layers: &SetLayers) ->
 ///
 /// Without a prior, or for a photo of another size than the template's reference, this is
 /// [`find_until`]. Otherwise the photo itself must show the mark at the saved position: the
-/// score there ([`saved_score`] of the cut template, +-2 px, scale 1) decides first.
-/// - At least [`PRIOR_FOUND`]: `Found` at the saved position, with no search.
-/// - Else the search runs. Below [`PRIOR_UNSURE`] its result is returned as it is. Else a search
-///   `Found` whose area overlaps the saved placement by at least 0.8 is returned as it is, and
-///   anything else gives `Unsure` at the saved position (a search `Found` somewhere else on a
-///   set that shows the mark here is not trusted; the person opens the photo).
+/// score there ([`saved_score`] of the cut template, +-2 px, scale 1) decides first, with no
+/// search.
+/// - At least [`PRIOR_FOUND`]: `Found` at the saved position.
+/// - At least [`PRIOR_UNSURE`]: `Unsure` at the saved position; the person opens the photo. A
+///   search `Found` somewhere else is not trusted on a set that shows the mark here: on the real
+///   set the drawing is mostly scene, and the search finds the scene where it moved between
+///   shots (0.52-0.68, against 0.13 for the drawing at the saved position). Nor is the search
+///   needed for a `Found` at the same place: it never turned one of these photos `Found` (see
+///   `docs/notes/thresholds.md`), and it costs 2-9 s on a 24 MP photo.
+/// - Below: the search's result, as it is.
 ///
 /// A set-position result has basis [`MatchBasis::SetPosition`], the score as its confidence,
 /// the saved placement of the whole template as its mask and [`Transform::IDENTITY`].
@@ -395,13 +384,10 @@ pub fn match_with(
     if score >= PRIOR_FOUND {
         return p.result(MatchStatus::Found, score);
     }
-    let found = find_until(t, img, stop);
-    if score < PRIOR_UNSURE
-        || (found.status == MatchStatus::Found && overlap(&found.mask, &p.placed) >= PRIOR_AGREE)
-    {
-        return found;
+    if score >= PRIOR_UNSURE {
+        return p.result(MatchStatus::Unsure, score);
     }
-    p.result(MatchStatus::Unsure, score)
+    find_until(t, img, stop)
 }
 
 /// How near, as a share of the photo's long side, the detector must come to a pixel of the
