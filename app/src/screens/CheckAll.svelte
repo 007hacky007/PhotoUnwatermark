@@ -7,31 +7,60 @@
 </script>
 
 <script lang="ts">
-  // Step 3, "Check all photos": the watermark is looked for in every photo, then a grid shows
-  // each photo with a tick, a badge for the ones that need a look, and a summary line. A tile
-  // opens the single-photo editor. "Remove" waits until no ticked photo is still marked "?".
+  // Step 3, "Check all photos": the current group's watermark is looked for in every photo with
+  // no group yet, then a grid shows each photo with a tick, a badge for the ones that need a
+  // look, and a summary line. A tile opens the single-photo editor. "Remove" waits until no
+  // ticked photo is still marked "?". While photos have no group, the next watermark can be
+  // found for them, a saved one used for them, or they can be left out.
   import { onMount } from 'svelte';
-  import { imageUrl, listPhotos, matchAll, photoStates, removalBlockers, setIncluded } from '../lib/api';
+  import {
+    detect,
+    groupSample,
+    groupsState,
+    imageUrl,
+    listPhotos,
+    matchAll,
+    photoStates,
+    removalBlockers,
+    setIncluded,
+    suggestSaved,
+  } from '../lib/api';
+  import Dialog from '../lib/components/Dialog.svelte';
   import Waiting from '../lib/components/Waiting.svelte';
   import { copy } from '../lib/copy';
+  import { startFromSaved } from '../lib/groups';
   import { stopJob } from '../lib/jobs.svelte';
-  import type { PhotoId, PhotoInfo, PhotoProblem, PhotoState, UserError } from '../lib/types';
+  import type {
+    DetectOutcome,
+    GroupsState,
+    PhotoId,
+    PhotoInfo,
+    PhotoProblem,
+    PhotoState,
+    Suggestion,
+    UserError,
+  } from '../lib/types';
   import type { Wizard } from '../lib/wizard.svelte';
   import CheckWatermark from './CheckWatermark.svelte';
+  import Finding from './Finding.svelte';
 
   let { wizard }: { wizard: Wizard } = $props();
 
   const c = copy.checkAll;
+  const g = copy.groups;
 
   let names: Map<PhotoId, string> = $state(new Map());
   /** Why a photo that cannot be read cannot be used. */
   let problems: Map<PhotoId, PhotoProblem> = $state(new Map());
   let states: PhotoState[] = $state([]);
   let blockers: PhotoId[] = $state([]);
+  let groups = $state<GroupsState | null>(null);
   let versions: Record<PhotoId, number> = $state({});
   let loaded = $state(false);
-  /** Ticks waiting for the app; Remove waits for them. */
+  /** Ticks waiting for the app; the next steps wait for them. */
   let ticking = $state(0);
+  /** Counts reads after a tick, so only the newest one is shown. */
+  let reads = 0;
   let matching = $state(false);
   let done = $state(0);
   let total = $state(0);
@@ -40,15 +69,45 @@
   let open: PhotoId | null = $state(null);
   let root: HTMLElement | undefined = $state();
   let scrollTop = 0;
+  /** The screen is gone. */
   let leaving = false;
+  /** Back was pressed: on the way to step 2. */
+  let backing = $state(false);
   /** The running search, so a stop names exactly its ticket. */
   let search: Promise<unknown> | null = null;
 
-  const included = $derived(states.filter((s) => s.included).length);
+  /** On the way to the next group: checking the saved watermarks, the offer, or the first guess. */
+  type Next = { kind: 'checking' } | { kind: 'offer'; suggestion: Suggestion } | { kind: 'finding' };
+  let next: Next | null = $state(null);
+  /** The running saved-watermark check, so Back stops exactly its ticket. */
+  let checkCall: Promise<unknown> | null = null;
+  /** Counts checks asked for, so an answer that arrives after Back is dropped. */
+  let asked = 0;
+  /** The offered saved watermark is being used. */
+  let using = $state(false);
+  /** The question before a removal that leaves the photos with no group out. */
+  let asking = $state(false);
+
+  const current = $derived(groups?.current ?? null);
+  /** The current group's photos: what its matching found, and the photos opened for it. */
+  const mine = $derived(
+    states.filter((s) => current !== null && s.group === current && s.status !== 'pending' && s.status !== 'unreadable'),
+  );
   // The app's own rule (MatchSummary): a photo with its own area counts as found only when that
-  // area is not empty.
-  const found = $derived(states.filter((s) => s.status === 'found' || (s.status === 'edited' && s.hasArea)).length);
+  // area is not empty. Only the group's members count (an unticked photo has no group yet).
+  const found = $derived(
+    mine.filter((s) => s.member && (s.status === 'found' || (s.status === 'edited' && s.hasArea))).length,
+  );
+  const needLook = $derived.by(() => {
+    const ids = new Set(mine.map((s) => s.id));
+    return blockers.filter((id) => ids.has(id)).length;
+  });
+  /** The photos a removal takes: the members of every group. */
+  const members = $derived(states.filter((s) => s.member).length);
+  const leftovers = $derived(groups?.leftovers ?? 0);
   const blocked = $derived(blockers.length > 0);
+  /** The next steps wait for every "?" and every tick on its way. */
+  const held = $derived(blocked || ticking > 0 || backing);
 
   function message(e: unknown, fallback: string): string {
     const text = (e as Partial<UserError> | null)?.message;
@@ -64,35 +123,44 @@
   }
 
   async function refresh() {
-    const [list, now, stuck] = await Promise.all([listPhotos(), photoStates(), removalBlockers()]);
+    const [list, now, stuck, gs] = await Promise.all([listPhotos(), photoStates(), removalBlockers(), groupsState()]);
     names = new Map(list.map((p: PhotoInfo) => [p.id, p.name]));
     problems = new Map(list.flatMap((p: PhotoInfo) => (p.problem ? [[p.id, p.problem] as const] : [])));
     for (const s of now) if (versions[s.id] === undefined) bump(s.id);
     states = now;
     blockers = stuck;
+    groups = gs;
   }
 
   onMount(() => {
     void start();
     return () => {
-      if (matching && !leaving && search !== null) void stopJob(search);
       leaving = true;
+      if (matching && search !== null && !backing) void stopJob(search);
+      if (checkCall !== null) void stopJob(checkCall);
       setBusy(false);
     };
   });
 
+  /** Reads the groups and the photos, and matches the current group first when it was not. */
   async function start() {
+    loaded = false;
+    error = null;
     let first: PhotoState[];
+    let gs: GroupsState;
     try {
-      first = await photoStates();
+      [gs, first] = await Promise.all([groupsState(), photoStates()]);
     } catch (e) {
       if (!leaving) error = message(e, c.loadFailed);
       loaded = true;
       return;
     }
     if (leaving) return;
-    total = first.length;
-    if (first.some((s) => s.status === 'pending')) {
+    groups = gs;
+    const match = gs.current !== null && !gs.matched;
+    if (match) {
+      done = 0;
+      total = first.filter((s) => s.status === 'pending').length;
       matching = true;
       setBusy(true);
       try {
@@ -104,27 +172,63 @@
         });
         await search;
       } catch (e) {
-        if (!leaving) error = message(e, c.findingFailed);
+        if (leaving || backing) return;
+        error = message(e, c.findingFailed);
         loaded = true;
         return;
       } finally {
-        matching = false;
+        search = null;
+        // Stopped by Back: the wait stays on screen until step 2 shows.
+        if (!backing) matching = false;
         setBusy(false);
       }
+      // The photos matched now have new areas: every tile loads its picture again.
+      versions = {};
     }
-    if (leaving) return;
+    if (leaving || backing) return;
     try {
       await refresh();
     } catch (e) {
-      if (!leaving) error = message(e, first.some((s) => s.status === 'pending') ? c.refreshFailed : c.loadFailed);
+      if (!leaving) error = message(e, match ? c.refreshFailed : c.loadFailed);
     }
     loaded = true;
   }
 
-  function stop() {
-    leaving = true;
-    if (search !== null) void stopJob(search);
-    wizard.back();
+  /**
+   * Back from step 3, on every path (the grid, the wait while matching, an empty or failed
+   * screen): to step 2 of the current group with its drawing kept. Matching still running is
+   * stopped first, and step 2 waits for the stop to be taken. A group started from a saved
+   * watermark gets its photos for step 2 first.
+   */
+  async function back() {
+    if (backing) return;
+    backing = true;
+    const running = matching ? search : null;
+    if (running !== null) await stopJob(running);
+    const drawing = wizard.current;
+    if (drawing !== null && drawing.outcome === null) {
+      try {
+        const outcome: DetectOutcome = await groupSample();
+        // A new drawing, never one changed in place (the wizard does not proxy drawings).
+        wizard.current = { ...drawing, outcome };
+      } catch (e) {
+        backing = false;
+        if (leaving) return;
+        matching = false;
+        error = message(e, c.loadFailed);
+        if (running !== null || !loaded) {
+          try {
+            await refresh();
+          } catch {
+            // The error above is already shown.
+          }
+          loaded = true;
+        }
+        return;
+      }
+    }
+    if (leaving) return;
+    wizard.go('check');
   }
 
   async function tick(s: PhotoState, box: HTMLInputElement) {
@@ -132,7 +236,6 @@
     error = null;
     ticking++;
     try {
-      let stuck: PhotoId[];
       try {
         await setIncluded(s.id, on);
       } catch (e) {
@@ -141,21 +244,28 @@
         box.checked = s.included;
         return;
       }
+      const read = ++reads;
       try {
-        stuck = await removalBlockers();
+        // A tick can move a photo out of its group: read everything it changes, together, so
+        // the tiles, the counts and the buttons always agree.
+        const [now, stuck, gs] = await Promise.all([photoStates(), removalBlockers(), groupsState()]);
+        if (read !== reads) return;
+        const after = now.find((x) => x.id === s.id);
+        // Out of an earlier group: its area is gone from the picture.
+        if (after !== undefined && after.group !== s.group) bump(s.id);
+        states = now;
+        blockers = stuck;
+        groups = gs;
+        box.checked = after?.included ?? on;
       } catch {
-        // The change was kept; read everything again so the list and Remove agree.
+        // The change was kept; read everything again so the list and the buttons agree.
         try {
           await refresh();
         } catch (e) {
           error = message(e, c.loadFailed);
         }
         box.checked = states.find((x) => x.id === s.id)?.included ?? s.included;
-        return;
       }
-      // Both together, so Remove never sees one without the other.
-      states = states.map((x) => (x.id === s.id ? { ...x, included: on } : x));
-      blockers = stuck;
     } finally {
       ticking--;
     }
@@ -181,6 +291,85 @@
     if (root?.parentElement) root.parentElement.scrollTop = scrollTop;
   }
 
+  /** "Find the next watermark": a saved watermark is looked for first, as on Add photos. */
+  async function findNext() {
+    if (held || next !== null) return;
+    const ask = ++asked;
+    error = null;
+    next = { kind: 'checking' };
+    setBusy(true);
+    const call = suggestSaved();
+    checkCall = call;
+    let suggestion: Suggestion | null = null;
+    try {
+      suggestion = await call;
+    } catch {
+      // The offer is a bonus; without it the first guess runs.
+    }
+    if (ask !== asked || leaving) return;
+    checkCall = null;
+    if (suggestion !== null) {
+      setBusy(false);
+      next = { kind: 'offer', suggestion };
+    } else {
+      next = { kind: 'finding' };
+    }
+  }
+
+  /** Back while the saved watermarks are checked: the check stops, and the grid shows again. */
+  async function stopChecking() {
+    asked++;
+    const call = checkCall;
+    checkCall = null;
+    if (call !== null) await stopJob(call);
+    backToGrid();
+  }
+
+  function backToGrid() {
+    next = null;
+    setBusy(false);
+  }
+
+  function guessNext() {
+    next = { kind: 'finding' };
+    setBusy(true);
+  }
+
+  /** "Yes" on the offer: the next group comes from the saved watermark, matched right here. */
+  async function useOffered(suggestion: Suggestion) {
+    if (using) return;
+    using = true;
+    setBusy(true);
+    try {
+      await startFromSaved(wizard, suggestion.id);
+    } catch (e) {
+      next = null;
+      error = message(e, copy.saved.useFailed);
+      return;
+    } finally {
+      using = false;
+      setBusy(false);
+    }
+    next = null;
+    await start();
+  }
+
+  function foundNext(outcome: DetectOutcome) {
+    wizard.startDraft(outcome);
+    backToGrid();
+    wizard.go('check');
+  }
+
+  function chooseSaved() {
+    wizard.savedMode = 'choose';
+    wizard.go('saved');
+  }
+
+  function removeAll() {
+    asking = false;
+    wizard.go('remove');
+  }
+
   const badge = (s: PhotoState) =>
     s.status === 'unsure'
       ? 'unsure'
@@ -198,17 +387,38 @@
   {/if}
 
   <section class="grid-page" hidden={open !== null}>
-    {#if matching}
+    {#if current !== null && current >= 2}
+      <h2>{g.checkAllHeading(current)}</h2>
+    {/if}
+    {#if next !== null}
+      {#if next.kind === 'checking'}
+        <Waiting sentence={copy.addPhotos.checkingSaved} fraction={null} onCancel={stopChecking} cancelLabel={copy.common.back} />
+      {:else if next.kind === 'offer'}
+        {@const suggestion = next.suggestion}
+        <div class="offer" role="status">
+          <p>{copy.addPhotos.offer(suggestion.name)}</p>
+          <div class="buttons">
+            <button type="button" class="primary" disabled={using} onclick={() => useOffered(suggestion)}>
+              {copy.addPhotos.yes}
+            </button>
+            <button type="button" disabled={using} onclick={guessNext}>{copy.addPhotos.no}</button>
+            <button type="button" disabled={using} onclick={backToGrid}>{copy.common.back}</button>
+          </div>
+        </div>
+      {:else}
+        <Finding first={copy.finding.neutral} run={detect} onDone={foundNext} onBack={backToGrid} />
+      {/if}
+    {:else if matching}
       <Waiting
         sentence={c.finding(done, total)}
         fraction={total > 0 ? done / total : null}
-        onCancel={stop}
+        onCancel={back}
         cancelLabel={copy.common.back}
       />
     {:else if !loaded}
       <p class="summary">{c.loading}</p>
       <footer>
-        <button type="button" onclick={() => wizard.back()}>{copy.common.back}</button>
+        <button type="button" disabled={backing} onclick={back}>{copy.common.back}</button>
       </footer>
     {:else if states.length === 0}
       {#if error !== null}
@@ -217,19 +427,27 @@
         <p class="summary">{c.empty}</p>
       {/if}
       <footer>
-        <button type="button" onclick={() => wizard.back()}>{copy.common.back}</button>
+        <button type="button" disabled={backing} onclick={back}>{copy.common.back}</button>
       </footer>
     {:else}
-      <p class="summary">{c.summary(found, states.length, blockers.length)}</p>
+      <p class="summary">{c.summary(found, mine.length, needLook)}</p>
       {#if error !== null}
         <p class="error" role="alert">{error}</p>
       {/if}
       <ul class="grid" aria-label={c.list}>
         {#each states as s (s.id)}
           {@const name = names.get(s.id) ?? ''}
-          {@const kind = badge(s)}
           {@const unreadable = s.status === 'unreadable'}
-          {@const reason = unreadable ? copy.photoProblem[problems.get(s.id) ?? 'damaged'] : c.noAreaTip}
+          {@const earlier = s.member && s.group !== null && s.group !== current}
+          {@const ours = !earlier && current !== null && s.group === current}
+          {@const loose = !unreadable && !earlier && !ours}
+          {@const kind = earlier ? (s.status === 'edited' ? 'edited' : null) : ours ? badge(s) : null}
+          {@const locked = unreadable || (loose && !s.included) || (!s.included && !s.hasArea)}
+          {@const reason = unreadable
+            ? copy.photoProblem[problems.get(s.id) ?? 'damaged']
+            : loose
+              ? g.notInGroup
+              : c.noAreaTip}
           <li class="tile" class:unsure={kind === 'unsure'}>
             <div class="pic">
               {#if unreadable}
@@ -244,6 +462,11 @@
                   <img src={imageUrl('grid', s.id, versions[s.id])} alt={name} loading="lazy" decoding="async" />
                 </button>
               {/if}
+              {#if earlier && s.group !== null}
+                <span class="group">{g.label(s.group)}</span>
+              {:else if !unreadable && !s.member}
+                <span class="group none">{g.noGroup}</span>
+              {/if}
               {#if kind === 'unsure'}
                 <span class="badge unsure" aria-hidden="true">{c.badgeUnsure}</span>
               {:else if kind === 'notFound'}
@@ -256,28 +479,54 @@
               type="checkbox"
               aria-label={c.include(name)}
               checked={s.included}
-              disabled={unreadable || (!s.included && !s.hasArea)}
-              title={unreadable || (!s.included && !s.hasArea) ? reason : undefined}
+              disabled={locked}
+              title={locked ? reason : undefined}
               onchange={(e) => tick(s, e.currentTarget)}
             />
-            {#if unreadable || (!s.included && !s.hasArea)}
+            {#if locked}
               <span class="why">{reason}</span>
             {/if}
           </li>
         {/each}
       </ul>
+      {#if leftovers > 0 && groups !== null}
+        <p class="line">{g.line(groups.groups, leftovers)}</p>
+      {/if}
       <footer>
-        <button type="button" onclick={() => wizard.back()}>{copy.common.back}</button>
+        <button type="button" disabled={backing} onclick={back}>{copy.common.back}</button>
         <div class="actions">
           <span class="hint" aria-live="polite">{blocked ? c.needLookHint : ''}</span>
-          <button type="button" class="primary" disabled={blocked || included === 0 || ticking > 0} onclick={() => wizard.go('remove')}>
-            {c.removeFrom(included)}
-          </button>
+          {#if leftovers > 0}
+            <button type="button" disabled={held || members === 0} onclick={() => (asking = true)}>
+              {c.removeFrom(members)}
+            </button>
+            <button type="button" disabled={held || members === 0} onclick={() => wizard.go('remove')}>
+              {g.leaveOut}
+            </button>
+            <button type="button" disabled={held} onclick={chooseSaved}>{g.useSaved}</button>
+            <button type="button" class="primary" disabled={held} onclick={findNext}>
+              {g.findNext(leftovers)}
+            </button>
+          {:else}
+            <button type="button" class="primary" disabled={held || members === 0} onclick={() => wizard.go('remove')}>
+              {c.removeFrom(members)}
+            </button>
+          {/if}
         </div>
       </footer>
     {/if}
   </section>
 </div>
+
+{#if asking}
+  <Dialog title={c.removeFrom(members)} onClose={() => (asking = false)}>
+    <p>{g.confirmLeftovers(leftovers, members)}</p>
+    {#snippet actions()}
+      <button type="button" class="primary" disabled={held || members === 0} onclick={removeAll}>{g.confirmRemove}</button>
+      <button type="button" onclick={() => (asking = false)}>{copy.common.back}</button>
+    {/snippet}
+  </Dialog>
+{/if}
 
 <style>
   /* The single-photo editor takes the whole height, like step 2. */
@@ -293,9 +542,26 @@
   .grid-page[hidden] {
     display: none;
   }
-  .summary,
-  .error {
+  h2 {
     margin: 0;
+    font-size: var(--text-large);
+    font-weight: 600;
+  }
+  .summary,
+  .line,
+  .error,
+  .offer p {
+    margin: 0;
+  }
+  .offer,
+  .offer .buttons {
+    display: flex;
+    flex-wrap: wrap;
+    align-items: center;
+    gap: var(--space-2);
+  }
+  .offer {
+    padding: var(--space-6) 0;
   }
   .error {
     color: var(--danger);
@@ -378,6 +644,24 @@
     border-radius: 999px;
     font-size: var(--text-small);
     font-weight: 600;
+  }
+  /* The group a tile is in, or that it is in none yet: top right, clear of the tick. */
+  .group {
+    position: absolute;
+    top: var(--space-2);
+    right: var(--space-2);
+    padding: 1px var(--space-2);
+    border-radius: 999px;
+    background: var(--surface);
+    color: var(--text);
+    border: 1px solid var(--border);
+    font-size: var(--text-small);
+    font-weight: 600;
+  }
+  .group.none {
+    background: var(--track);
+    color: var(--text-muted);
+    font-weight: 400;
   }
   .badge.unsure {
     background: var(--warning);
