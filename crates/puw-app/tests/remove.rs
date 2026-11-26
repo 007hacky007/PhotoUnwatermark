@@ -16,7 +16,7 @@ use common::{Recorder, fixture, model_fixture, rect_area};
 use image::{GrayImage, Rgb, RgbImage};
 use puw_app::images::{edit_size, jpeg};
 use puw_app::{
-    AppCore, AppError, Detail, LoadPurpose, PREVIEW_LONG_SIDE, ProgressEvent, Settings,
+    AppCore, AppError, AreaStatus, Detail, LoadPurpose, PREVIEW_LONG_SIDE, ProgressEvent, Settings,
     default_watermark_name, user_message,
 };
 use puw_core::{ModelKind, load};
@@ -975,6 +975,14 @@ fn one_run_removes_every_group() {
         .unwrap();
     f.core.confirm_new_group(ids[2]).unwrap();
     f.core.match_all(&|_| {}).unwrap();
+    // The logo moves, and its drawing reaches into a speck of the set's layer (scene the logo
+    // photos happen to share), so the photo the search finds it on is `Unsure`: the person
+    // opens it and keeps it.
+    for st in f.core.photo_states() {
+        if st.status == AreaStatus::Unsure && st.id == ids[3] {
+            f.core.open_photo(st.id).unwrap();
+        }
+    }
     common::settle(&f.core);
     let g = f.core.groups();
     assert_eq!(

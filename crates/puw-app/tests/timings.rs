@@ -812,9 +812,9 @@ fn shrunk(m: &[u8], ew: u32, eh: u32, r: u32) -> Vec<u8> {
 
 /// The drawings a person may confirm, made from the first guess `g` (edit-size bytes): as it
 /// is; cleaned up ([`cleaned_guess`]); with everything farther than 1 % of the long side from
-/// the watermark `mark` (native size) erased; with a band of 3 % of the height erased across its middle;
-/// with four brush dots (radius 1 % of the long side) on the scene away from it; grown and
-/// shrunk by 8 px.
+/// the watermark `mark` (native size) erased; with a band of 3 % of the height erased across
+/// its middle; with four brush dots (radius 1 % of the long side) on the scene away from it;
+/// grown and shrunk by 8 px and by 1, 2 and 3 % of the long side.
 fn edited_drawings(
     g: &[u8],
     ew: u32,
@@ -822,6 +822,7 @@ fn edited_drawings(
     mark: &puw_core::Mask,
 ) -> Vec<(&'static str, Vec<u8>)> {
     let m = puw_core::Mask::from_raw(ew, eh, g.to_vec()).unwrap();
+    let long = ew.max(eh);
     // Everything of the guess away from the mark erased, as a careful person erases the parts
     // of the scene the guess caught.
     let around = puw_core::mask::dilate(&puw_core::mask::resize(mark, ew, eh), ew.max(eh) / 100);
@@ -862,12 +863,28 @@ fn edited_drawings(
         ("brush dots", dots),
         ("grown 8 px", puw_core::mask::dilate(&m, 8).into_raw()),
         ("shrunk 8 px", shrunk(g, ew, eh, 8)),
+        (
+            "grown 1 %",
+            puw_core::mask::dilate(&m, long / 100).into_raw(),
+        ),
+        (
+            "grown 2 %",
+            puw_core::mask::dilate(&m, long / 50).into_raw(),
+        ),
+        (
+            "grown 3 %",
+            puw_core::mask::dilate(&m, long * 3 / 100).into_raw(),
+        ),
+        ("shrunk 1 %", shrunk(g, ew, eh, long / 100)),
+        ("shrunk 2 %", shrunk(g, ew, eh, long / 50)),
+        ("shrunk 3 %", shrunk(g, ew, eh, long * 3 / 100)),
     ]
 }
 
 /// Every 3-photo set of the real set-a (56), each with the drawings of [`edited_drawings`]
-/// confirmed as the group's area: step 3 places every photo at the reference's place (`Found`
-/// or `Unsure`, never elsewhere or not at all), and counts per drawing where the photos land. `PUW_TRIPLES=0,1,2;3,4,5`
+/// confirmed as the group's area: step 3 never puts a photo `Found` elsewhere, places every
+/// photo at the reference's place (`Found` or `Unsure`) unless the drawing was shrunk by 1 % of
+/// the long side or more, and counts per drawing where the photos land. `PUW_TRIPLES=0,1,2;3,4,5`
 /// runs only those sets, `PUW_DRAWINGS=as is;cleaned` only those drawings. Aggregates and set indices only. `cargo test -p puw-app --release --test
 /// timings real_triples -- --ignored --nocapture`; needs `PUW_MODELS_DIR` and `PUW_REAL_DIR`.
 #[test]
@@ -922,6 +939,11 @@ fn real_triples_with_edited_drawings() {
             if only.as_ref().is_some_and(|o| !o.iter().any(|d| d == name)) {
                 continue;
             }
+            if drawing.iter().all(|v| *v == 0) {
+                // Shrunk to nothing: there is no drawing to confirm.
+                line.push(format!("{name}: nothing left"));
+                continue;
+            }
             c.clear_groups().unwrap();
             c.put_draft(rep, ew, eh, drawing).unwrap();
             c.confirm_set_area(rep).unwrap();
@@ -958,9 +980,14 @@ fn real_triples_with_edited_drawings() {
             "{name}: at the saved place Found {f} Unsure {u}; not found {nf}; Unsure elsewhere {ue}; Found elsewhere {fe}"
         );
     }
-    // Every photo placed at the reference's place, whatever the person did to the drawing;
-    // `Unsure` stays allowed there.
+    // Never `Found` anywhere but the reference's place. Every photo placed there (`Unsure`
+    // allowed), whatever the person did to the drawing, except when it was shrunk by 1 % of
+    // the long side or more: that cuts into a thin mark (or leaves nothing), and the photo
+    // may then be not found or `Unsure` elsewhere.
     for (name, [_, _, nf, ue, fe]) in &counts {
-        assert_eq!((nf, ue, fe), (&0, &0, &0), "{name}");
+        assert_eq!(*fe, 0, "{name}: Found elsewhere");
+        if !name.starts_with("shrunk") || *name == "shrunk 8 px" {
+            assert_eq!((nf, ue), (&0, &0), "{name}");
+        }
     }
 }

@@ -170,11 +170,12 @@ fn faint_fixed(alpha: f32, dir: &Path) -> Vec<PathBuf> {
         .collect()
 }
 
-/// The finder's own first guess, grown further (28 px around it, so that it reaches about as
-/// far beyond the batch layer as the set position allows, 2.4 % of the long side), confirmed on
-/// a fainter copy of the fixed set. The search alone misses several photos with it, and much of
-/// the drawing lies off the set's batch layer. Yet every photo is found at the same place
-/// through the set's position, with the whole drawing as its area.
+/// The finder's own first guess, grown much further (60 px around it: about five times the
+/// watermark's area, as a generous hand drawing or the grown guess on a real set), confirmed
+/// on a fainter copy of the fixed set. The search alone misses most photos with it, and most
+/// of the drawing lies off the set's batch layer (so the drawing does not follow the layer).
+/// Yet every photo is found at the same place through the set's position, with the whole
+/// drawing as its area.
 #[test]
 fn grown_first_guess_still_matches_fixed_set() {
     let Some(f) = model_fixture() else { return };
@@ -185,7 +186,7 @@ fn grown_first_guess_still_matches_fixed_set() {
     let rep = out.representative;
     let (w, h) = f.core.edit_size(rep).unwrap();
     let guess = GrayImage::from_raw(w, h, f.core.start_area(rep).unwrap()).unwrap();
-    let drawing = puw_core::mask::dilate(&guess, 28);
+    let drawing = puw_core::mask::dilate(&guess, 60);
     let photos = f.core.photos();
     let img = |id: u32| image::open(&paths[id as usize]).unwrap().to_rgb8();
     let t = build_template(&img(rep), &drawing);
@@ -207,12 +208,12 @@ fn grown_first_guess_still_matches_fixed_set() {
     let on_layer = on as f64 / all as f64;
     eprintln!("search alone misses {missed} of 7; {on_layer:.2} of the drawing near the layer");
     assert!(
-        missed >= 3,
-        "premise: the search alone misses several photos ({missed})"
+        missed >= 4,
+        "premise: the search alone misses most photos ({missed})"
     );
     assert!(
-        on_layer < 0.6,
-        "premise: much of the drawing lies off the layer ({on_layer:.2})"
+        on_layer < 0.5,
+        "premise: the drawing does not follow the layer ({on_layer:.2})"
     );
 
     f.core
