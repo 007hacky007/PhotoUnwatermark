@@ -398,7 +398,7 @@ the target matters.
 
 Same harness and machine as "App timings (Plan 2)" (Core ML, models and cache warm). Aggregates
 only. The synthetic mixed set is 8 `fixed` photos, 4 logo photos and 2 photos with no watermark;
-the real set is set-a (8 photos of 24.0 MP) plus set-b as one set of 15 photos, with group 1 from
+the real set is set-a (8 photos of 24.0 MP) plus set-b (1 photo) as one set of 9 photos, with group 1 from
 set-a. One run.
 
 | Step | Time |
