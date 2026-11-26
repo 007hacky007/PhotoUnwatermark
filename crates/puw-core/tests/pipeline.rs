@@ -713,6 +713,9 @@ enum Patch {
     MovingFar,
     /// The mark moves; on photo 0 the patch ends 8 px above it.
     MovingNext,
+    /// As `MovingNext`, the mark cut to its top 30 rows (a thin line of text), so that all of
+    /// it lies close to the patch.
+    MovingNextThin,
     /// The mark stays, on every photo but the last (which is clean); the patch is far from it.
     CleanLastFar,
     /// As `CleanLastFar`, the patch ending 8 px above the mark.
@@ -738,7 +741,7 @@ fn patch_set(
     let gt = open_mask(&set.join("mask/00.png"));
     let src = open_rgb(&common::synth_dir().join("negative/clean/00.png"));
     let (px, py, pw, ph) = match kind {
-        Patch::MovingNext | Patch::CleanLastNext => (680, 510, 340, 250),
+        Patch::MovingNext | Patch::MovingNextThin | Patch::CleanLastNext => (680, 510, 340, 250),
         Patch::FixedNear => (1098, 760, 300, 120),
         _ => (1150, 700, 340, 250),
     };
@@ -751,12 +754,15 @@ fn patch_set(
                 img.put_pixel(px + x, py + y, *src.get_pixel(300 + x, 200 + y));
             }
         }
-        let moving = matches!(kind, Patch::MovingFar | Patch::MovingNext);
+        let moving = matches!(
+            kind,
+            Patch::MovingFar | Patch::MovingNext | Patch::MovingNextThin
+        );
         let (dx, dy) = if moving { shift } else { (0, 0) };
         let mut truth = Mask::new(w, h);
         if moving || i + 1 < n || matches!(kind, Patch::FixedNear) {
             for (x, y, v) in gt.enumerate_pixels() {
-                if v.0[0] == 0 {
+                if v.0[0] == 0 || (matches!(kind, Patch::MovingNextThin) && y >= 768 + 30) {
                     continue;
                 }
                 let (tx, ty) = ((x as i64 + dx) as u32, (y as i64 + dy) as u32);
@@ -892,15 +898,15 @@ fn erased_scene_part_keeps_the_set_position() {
 }
 
 /// A static patch of scene on every photo and a mark that moves: the first guess holds the
-/// patch's layer (it is added to every guess), yet the mark is never `Found` at the reference's
-/// place, and the search still places moved marks where they are (as `Unsure`: the drawing
-/// holds part of the layer, so a search `Found` elsewhere is held back). In sets of 3, 5 and 8 photos, with the
-/// patch far from the mark and ending 8 px above it. Before the drawing had to stay near the
-/// layer, every other photo was `Found` at the saved place (0.36-0.94).
+/// patch's layer (it is added to every guess), yet no photo is ever `Found` where its own mark
+/// is not. The set position is held back (the patch never changes from photo to photo, so it
+/// is no evidence of a mark): at most `Unsure`. In sets of 3, 5 and 8 photos, with the patch
+/// far from the mark, ending 8 px above it, and ending 8 px above a thin mark (its top 30 rows)
+/// that lies wholly within the drawing's reach of the patch. Before, every other photo was
+/// `Found` at the saved place (0.36-0.94; the thin mark 0.68-0.87 after the first fix).
 #[test]
 fn static_scene_never_places_a_moving_mark() {
-    for kind in [Patch::MovingFar, Patch::MovingNext] {
-        let mut right = 0;
+    for kind in [Patch::MovingFar, Patch::MovingNext, Patch::MovingNextThin] {
         for n in [3, 5, 8] {
             let dir = tempfile::tempdir().expect("tempdir");
             let (photos, truths, paths) = patch_set(kind, n, FIXED_ALPHA, dir.path());
@@ -909,17 +915,61 @@ fn static_scene_never_places_a_moving_mark() {
                 layers.get(1536, 1024).is_some(),
                 "premise: {kind:?} {n} has a layer"
             );
-            right += no_false_found(&format!("{kind:?} {n}"), &photos, &truths, &layers);
+            let label = format!("{kind:?} {n}");
+            let tmpl = build_template(&photos[0], &first_guess(&truths[0], &layers));
+            let prior = PositionPrior::new(&tmpl, &layers);
+            assert!(
+                prior.as_ref().is_some_and(|p| !p.supports()),
+                "{label}: the set position is not held back"
+            );
+            no_false_found(&label, &photos, &truths, &layers);
         }
-        assert!(right > 0, "{kind:?}: the search finds no moved mark");
     }
 }
 
-/// A drawing grown well beyond the mark (36 px around it, about three times the mark's area,
-/// as far as the drawing may reach beyond the layer at this size, see `PRIOR_REACH`) on the
-/// fixed set: the search alone finds it on none of the other photos, yet the layer lies inside
-/// the drawing, so the position is scored on the layer and every photo is `Found` at the saved
-/// position, with the whole drawing as its area.
+/// Drawings grown by 1, 2, 3 and 3.9 % of the long side (16, 31, 46 and 60 px) around the
+/// mark, on sets of 3 and of 8 photos of the fixed set: every other photo stays at the saved
+/// place, `Found`, never not found and never elsewhere (a person painting with a big brush
+/// overshoots).
+#[test]
+fn generous_drawings_stay_at_the_set_position() {
+    let set = common::synth_dir().join("fixed");
+    let truth = open_mask(&set.join("mask/00.png"));
+    for n in [3, 8] {
+        let paths: Vec<PathBuf> = (0..n)
+            .map(|i| set.join("marked").join(format!("0{i}.png")))
+            .collect();
+        let photos: Vec<RgbImage> = paths.iter().map(|p| open_rgb(p)).collect();
+        let layers = no_progress_layers(&paths);
+        for grow in [16, 31, 46, 60] {
+            let drawing = mask::dilate(&truth, grow);
+            let tmpl = build_template(&photos[0], &drawing);
+            for (i, p) in photos.iter().enumerate().skip(1) {
+                let m = match_photo(&tmpl, p, &layers);
+                eprintln!(
+                    "{n} photos, grown {grow} px, photo {i}: {:?} {:?} {:.3}",
+                    m.status, m.basis, m.confidence
+                );
+                assert_eq!(
+                    m.basis,
+                    MatchBasis::SetPosition,
+                    "{n} photos, {grow} px, photo {i}"
+                );
+                assert_eq!(
+                    m.status,
+                    MatchStatus::Found,
+                    "{n} photos, {grow} px, photo {i}"
+                );
+            }
+        }
+    }
+}
+
+/// A drawing grown far beyond the mark (60 px around it, about five times the mark's area,
+/// 3.9 % of the long side, as a person painting with a big brush draws it) on the fixed set:
+/// the search alone finds it on none of the other photos, and at least half of the drawing lies
+/// off the layer, yet the layer lies inside the drawing, so the position is scored on the layer
+/// and every photo is `Found` at the saved position, with the whole drawing as its area.
 #[test]
 fn prior_matches_a_drawing_grown_beyond_the_mark() {
     let set = common::synth_dir().join("fixed");
@@ -928,7 +978,7 @@ fn prior_matches_a_drawing_grown_beyond_the_mark() {
         .collect();
     let photos: Vec<RgbImage> = paths.iter().map(|p| open_rgb(p)).collect();
     let layers = no_progress_layers(&paths);
-    let drawing = mask::dilate(&open_mask(&set.join("mask/00.png")), 36);
+    let drawing = mask::dilate(&open_mask(&set.join("mask/00.png")), 60);
     let tmpl = build_template(&photos[0], &drawing);
     let prior = PositionPrior::new(&tmpl, &layers)
         .filter(PositionPrior::supports)

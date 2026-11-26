@@ -123,6 +123,29 @@ impl PackedLumas {
     }
 }
 
+impl PackedLumas {
+    /// Per pixel, how far apart the photos' lumas lie (largest minus smallest), row-major.
+    pub(crate) fn range(&self) -> Vec<f32> {
+        let px = (self.w as usize) * (self.h as usize);
+        let n = self.len();
+        (0..px)
+            .map(|i| {
+                let (mut lo, mut hi) = (u16::MAX, 0u16);
+                for k in 0..n {
+                    let v = self.data[k * px + i];
+                    lo = lo.min(v);
+                    hi = hi.max(v);
+                }
+                if n == 0 {
+                    0.0
+                } else {
+                    f32::from(hi - lo) / 256.0
+                }
+            })
+            .collect()
+    }
+}
+
 /// [`median_gradient`] over packed lumas.
 pub(crate) fn median_gradient_packed(lumas: &PackedLumas) -> Result<MagImage> {
     let n = lumas.len();
