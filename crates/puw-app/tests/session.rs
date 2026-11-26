@@ -171,8 +171,8 @@ fn faint_fixed(alpha: f32, dir: &Path) -> Vec<PathBuf> {
 }
 
 /// The finder's own first guess, grown much further (60 px around it: about five times the
-/// watermark's area, as a generous hand drawing or the grown guess on a real outline
-/// watermark), confirmed on a fainter copy of the fixed set. The search alone misses most
+/// watermark's area, as a generous hand drawing or the grown guess on a real set), confirmed
+/// on a fainter copy of the fixed set. The search alone misses most
 /// photos with it, and most of the drawing lies off the set's batch layer (so the drawing
 /// does not follow the layer). Yet every photo is found at the same place through the set's
 /// position, with the whole drawing as its area.

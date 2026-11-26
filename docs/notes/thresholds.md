@@ -256,6 +256,9 @@ and none of the lines.
 
 ## Position prior (`match_photo`)
 
+This section describes the prior as Plan 2 made it; Plan 2b's final fix changed what is scored
+and the order of the checks, see "Position prior on the layer inside the drawing" below.
+
 `match_photo` calls `find`; when that is not `Found`, the photo has the template's size and the
 set has a batch layer for it, and at least 50 % of the saved placement lies in the layer grown
 by `grow_for(w, h, 0.004)`, the photo must also show the mark at the saved position. The score
@@ -284,6 +287,83 @@ the batch layer, so the layer supports its own placement by construction): `find
 (4 Unsure, 3 NotFound). Saved-position score min 0.234, median 0.329, max 0.435. `match_photo`:
 Found 6 / Unsure 1 / NotFound 0. The one photo of the other real set (different size) stays not
 `Found` (the prior does not apply).
+
+## Position prior on the layer inside the drawing (Plan 2b final fix, C1)
+
+The template of a group is learnt from the drawing, and the drawing is usually the first guess:
+the detector's area and the batch layer, grown by `grow_for(0.004)`. On real set 1 that guess
+covers 9.3 % of the photo, its main piece 2.1 M px against 0.43 M px of layer. Scored at the
+saved position, such a thick band is mostly scene: the other photos of the set
+scored 0.09-0.16, under `PRIOR_UNSURE`, so the prior never fired; the search alone found 1 photo
+(at the wrong place, IoU 0.42 with the saved placement), 2 unsure (also misplaced) and 4 not
+found. In step 2 two of the three strip photos said "not found".
+
+`pipeline::PositionPrior` (worked out once per matching pass, and per drawing in the strip) now
+has two support rules, with `g` = `grow_for(0.004)` and "placement" = the template's pieces at
+their saved position:
+
+| rule | test | scored with |
+|---|---|---|
+| 1, the layer is the mark under the drawing | at least `PRIOR_LAYER_INSIDE` 0.9 of the layer lies in the placement grown by `g`, and the layer inside the placement is at least `PRIOR_LAYER_SHARE` 0.1 of it | the template cut down to the raw layer (`template::within`: same boxes and edges, shapes cut) |
+| 2, the drawing follows the layer (as before) | at least 0.5 of the placement lies in the layer grown by `g` | the template itself |
+
+A set-position result still pastes the whole template, so removal covers the whole drawing.
+`match_with` then decides, for a photo of the template's size:
+- set-position score >= `PRIOR_FOUND` 0.28: `Found` at the saved position, no search;
+- else the search runs; below `PRIOR_UNSURE` 0.16 its result stands; a search `Found` whose area
+  overlaps the saved placement by IoU >= 0.8 stands; anything else is `Unsure` at the saved
+  position (a search `Found` elsewhere on a set that shows the mark here is not trusted).
+
+Before, `find` ran first and its `Found` was kept wherever it was; that is how the real set got a
+`Found` at the wrong place.
+
+Support measured on the synthetic sets (true area of each photo, grown by 0, 8, 24 and 48 px):
+
+| set | share of the layer in the grown placement | layer share of the placement | rule 2 share |
+|---|---|---|---|
+| fixed (8 photos x 4 growths) | 1.00 every time | 1.00 / 0.81 / 0.55 / 0.36 | 1.00 / 1.00 / 0.71 / 0.46 |
+| random (12) and styles (5) | 0.00-1.00, most below 0.8 | 0.00-0.18 | 0.00-0.48 |
+
+On random and styles the layer holds static scene edges and the marks move. Of their 56
+drawings on photos whose size has a layer, rule 1 passes for 4 (the true area of two photos whose
+size group has a small layer next to the mark, grown by 0 or 8 px); the cut template there scores
+0.00-0.13 on the other photos of that size, under `PRIOR_UNSURE`. A cut template of a few scene
+pixels can score high on photos without the mark (up to 0.62 on random, for a drawing holding
+2 % of its layer), so rule 1 needs the layer to lie inside the drawing, and to be a real part of
+it: styles' tiled and full-frame drawings hold all of their small layer, but it is 1 % of them.
+Test `prior_never_places_a_moving_mark` pins that no set-position result lands where a photo of
+those sets has no mark.
+
+Grown drawing on the fixed set (the true area of photo 0 grown by 40 and 60 px, 4.7 % and 6.4 %
+of the photo for a mark of 1.22 %):
+
+| photos | the drawing at the saved position | cut to the layer | `find` alone | `match_photo` now |
+|---|---|---|---|---|
+| stored (alpha 0.25), +40 px | 0.30-0.40 | 0.46-0.56 | 0 Found of 7 | 7 Found |
+| stored, +60 px | 0.28-0.38 (rule 2 fails, so no prior before) | 0.46-0.56 | 0 Found | 7 Found |
+| faint (alpha 0.12), +60 px | 0.00-0.17 | 0.13-0.27 | 0 Found | 5 Unsure, 2 NotFound |
+
+The faint photos with the true area alone score 0.18-0.33 (4 Found, 3 Unsure), so the cut
+template loses a little there (it is the layer, the mark grown by 3 px, not the mark itself) but
+far less than the grown drawing. Tests: `prior_matches_a_drawing_grown_beyond_the_mark` (puw-core,
+stored photos, +60 px, all 7 `Found` at the saved position) and
+`grown_first_guess_still_matches_fixed_set` (puw-app, models: the finder's own guess on the fixed
+set at alpha 0.14 grown by 60 px more; the search alone misses 5 of 7 and only 0.34 of the
+drawing follows the layer, yet matching finds 8 of 8 at the set position).
+
+Real set 1 + real set 2 as one set (9 photos, 8 of one size with a fixed mark, 1 of another
+size), group 1 from the finder's own guess as it is (`timings.rs`
+`real_group_from_the_first_guess`, Core ML):
+
+| | before | after |
+|---|---|---|
+| step-2 strip, the 2 other sample photos | both "not found" | 2 of 2 `Found`, placed at the saved position |
+| group 1 over the 8 photos of the mark's size (the reference counts as found) | 2 Found (the reference and 1 misplaced), 2 Unsure (misplaced), 4 NotFound; 7 photos left over | 6 Found, 2 Unsure, all at the saved position (IoU 1.00) |
+| the photo of the other size | not found | not found |
+| set-position scores of the 7 other photos | 0.09-0.16 (the drawing) | 0.233-0.381 (cut to the layer) |
+
+The two Unsure photos (0.233, 0.254) are opened by the person before removal, as for any unsure
+photo. No `Found` lands anywhere but the saved position.
 
 ## Detector specks in the first guess (Plan 2 fix wave, C1)
 
@@ -418,3 +498,20 @@ two parts and nothing else; a saved watermark skips the first guess and costs on
 pass (0.4 s synthetic). Both rows fit. The real place_on is on a photo that does not carry the
 second watermark (not found), and it does not get faster on a repeat: it reads and matches the 24 MP photo each time, so painting in step 2 on a big photo
 is the thing to watch by hand (checklist section 11).
+
+Plan 2b final fix, same harness (`real_group_from_the_first_guess`), real set as above, group 1
+from the finder's own guess:
+
+| Step | Before | After |
+|---|---|---|
+| place_on, 24 MP strip photo, first look | 5.5-5.8 s | 1.17 s at most (reads both photos, scores the set position, no search) |
+| place_on after a stroke on the drawing, per strip photo | 5-6 s (matched again) | 0.70 s for the first (learns the drawing again), 0.01 s for the rest (placement kept) |
+| place_on with the drawing sent back unchanged | 5.9 s (the draft was upsampled and never equal) | 0.01 s |
+| full search on a 24 MP photo (a drawing with no set position) | | 7.8 s |
+| stop half a second into that search: the call ends after | the rest of the search (about 7 s) | 0.04 s |
+| match_all, group 1 (8 photos to match) | 12.2 s (scratch run of the review) | 6.0-6.7 s (three runs) |
+| "Looks right" unchanged on a 24 MP photo | group marked edited, matching reset | nothing changes (0.0 s) |
+
+A placement is kept per strip photo while the drawing's main box moves by at most 1 % of the
+reference's sides (`KEEP_PLACEMENT`), for `Found` and `Unsure`; `NotFound` is looked for again
+after every change of the drawing, as the change may be what finds it.

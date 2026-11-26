@@ -152,5 +152,9 @@ under `local/timing/mixed/marked` (and `target/synth/negative/marked` 04 and 05 
 - [ ] "Looks right" pressed while a strip photo is still being placed: nothing breaks and the drawing used is the one shown.
 - [ ] With several groups, one "Saved" line per group on Done is easy to understand.
 - [ ] Timings for the second group: ____ s (first guess plus matching).
+- [ ] Real set 1 + 2 as one set, group 1 from the first guess unedited: step 2's strip shows the drawing in place on every strip photo of the mark's size (measured: 2 of 2, up to 1.2 s each on 24 MP), and step 3 groups the 8 photos of that size (measured: 6 found, 2 unsure, all in place) and not the other photo.
+- [ ] Step 2 on 24 MP photos: after a stroke, switching to another strip photo shows it within about a second (measured: 0.7 s for the first photo after a change, 0.01 s for the rest).
+- [ ] Stop while a strip photo is being placed (switch photos during "Finding the watermark on this photo..."): the next photo starts at once (measured: a stopped 7.8 s search ends 0.04 s after the stop).
+- [ ] "Looks right" with the drawing unchanged on a 24 MP photo of a group: step 3 keeps every result and tick, and a saved watermark stays unedited.
 
 Result summary (fill in last): macOS ____ passed / ____ problems; Windows ____ / ____.

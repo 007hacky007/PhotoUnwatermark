@@ -612,7 +612,7 @@ fn negatives_stay_not_found() {
 }
 
 /// A drawing grown far beyond the mark (60 px around it, about five times the mark's area,
-/// like the grown first guess on a real outline mark) on the fixed set: the search alone finds
+/// like the grown first guess on a real set) on the fixed set: the search alone finds
 /// it on none of the other photos, and at least half of the drawing lies off the layer, yet the
 /// layer lies inside the drawing, so the position is scored on the layer and every photo is
 /// `Found` at the saved position, with the whole drawing as its area.
