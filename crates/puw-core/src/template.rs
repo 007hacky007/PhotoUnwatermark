@@ -18,6 +18,7 @@ use image::codecs::png::PngEncoder;
 use image::imageops::{self, FilterType};
 use image::{ExtendedColorType, GrayImage, ImageBuffer, ImageEncoder, ImageFormat, Luma, RgbImage};
 use serde::{Deserialize, Serialize};
+use std::sync::atomic::{AtomicBool, Ordering};
 
 /// Minimum score for [`MatchStatus::Found`]. Synthetic sets: visible marks score >= 0.515 at
 /// their true placement, and photos without the mark score <= 0.33 with any reference. One
@@ -244,6 +245,13 @@ pub fn build_template(img: &RgbImage, mask: &Mask) -> WatermarkTemplate {
 /// outcome gives the status. A damaged template (undecodable shape, wrong edge size) gives
 /// `NotFound`.
 pub fn find(t: &WatermarkTemplate, img: &RgbImage) -> MatchResult {
+    find_until(t, img, &AtomicBool::new(false))
+}
+
+/// [`find`] that gives up as soon as `stop` is set: the search looks at the flag before each
+/// scale and each refinement, and returns `NotFound` (confidence 0) once it is set. Such a
+/// result says nothing about the photo, so a caller that set the flag drops it.
+pub fn find_until(t: &WatermarkTemplate, img: &RgbImage, stop: &AtomicBool) -> MatchResult {
     let (w, h) = img.dimensions();
     let not_found = |confidence: f32| MatchResult {
         status: MatchStatus::NotFound,
@@ -264,7 +272,7 @@ pub fn find(t: &WatermarkTemplate, img: &RgbImage) -> MatchResult {
         return not_found(0.0);
     };
     let (pieces, carried) = split_carried(all);
-    let target = Target::new(img);
+    let target = Target::new(img, stop);
 
     let singles: Vec<Tmpl> = (0..pieces.len())
         .map(|i| Tmpl::new(&pieces, &[i]))
@@ -286,6 +294,9 @@ pub fn find(t: &WatermarkTemplate, img: &RgbImage) -> MatchResult {
         }
     }
 
+    if target.stopped() {
+        return not_found(0.0);
+    }
     let Some(best) = best else {
         return not_found(0.0);
     };
@@ -375,7 +386,8 @@ pub fn saved_score(t: &WatermarkTemplate, img: &RgbImage) -> Option<f32> {
     let singles: Vec<Tmpl> = (0..pieces.len())
         .map(|i| Tmpl::new(&pieces, &[i]))
         .collect();
-    let target = Target::new(img);
+    let never = AtomicBool::new(false);
+    let target = Target::new(img, &never);
     fast_path(t, &pieces, &singles, &target).map(|o| o.score.clamp(0.0, 1.0))
 }
 
@@ -399,6 +411,58 @@ pub(crate) fn saved_placement(t: &WatermarkTemplate) -> Option<Mask> {
         paste(&mut out, &p, &pl, (w, h), (ww, wh));
     }
     Some(out)
+}
+
+/// `t` with each piece's shape cut down to the pixels set in `keep` (a mask of the reference
+/// photo's native size): what the watermark looks like inside `keep` only. Every piece keeps its
+/// box and edges, so the cut template scores the same placements, counting only the kept pixels
+/// (the correlation ignores pixels outside the shape). Pieces with no pixel left are dropped.
+/// `None` when `keep` has another size, no pixel of any piece is kept, or the template is damaged.
+pub fn within(t: &WatermarkTemplate, keep: &Mask) -> Option<WatermarkTemplate> {
+    let (w, h) = (t.ref_w, t.ref_h);
+    if keep.dimensions() != (w, h) || w == 0 || h == 0 {
+        return None;
+    }
+    let mut pieces = Vec::new();
+    for p in &t.pieces {
+        let mut shape = image::load_from_memory_with_format(&p.shape, ImageFormat::Png)
+            .ok()?
+            .to_luma8();
+        let x0 = (p.rel_bbox[0] * w as f32).round() as i64;
+        let y0 = (p.rel_bbox[1] * h as f32).round() as i64;
+        let mut any = false;
+        for (x, y, v) in shape.enumerate_pixels_mut() {
+            if v.0[0] == 0 {
+                continue;
+            }
+            let (kx, ky) = (x0 + x as i64, y0 + y as i64);
+            let kept = (0..w as i64).contains(&kx)
+                && (0..h as i64).contains(&ky)
+                && keep.get_pixel(kx as u32, ky as u32).0[0] != 0;
+            if kept {
+                any = true;
+            } else {
+                v.0[0] = 0;
+            }
+        }
+        if any {
+            pieces.push(Piece {
+                rel_bbox: p.rel_bbox,
+                shape: encode_png(&shape),
+                edges: p.edges.clone(),
+                edges_w: p.edges_w,
+                edges_h: p.edges_h,
+            });
+        }
+    }
+    if pieces.is_empty() {
+        return None;
+    }
+    Some(WatermarkTemplate {
+        pieces,
+        ref_w: w,
+        ref_h: h,
+    })
 }
 
 /// Size of an image of native size `w` x `h` in the reference space (long side 1536).
@@ -675,17 +739,19 @@ fn overlaps(a: &[f32; 4], b: &[f32; 4]) -> bool {
 }
 
 /// The photo being searched, in reference space.
-struct Target {
+struct Target<'a> {
     nw: u32,
     nh: u32,
     w: usize,
     h: usize,
     luma: Vec<f32>,
     edges: Vec<f32>,
+    /// Set when the caller no longer wants the result: the search stops early.
+    stop: &'a AtomicBool,
 }
 
-impl Target {
-    fn new(img: &RgbImage) -> Self {
+impl<'a> Target<'a> {
+    fn new(img: &RgbImage, stop: &'a AtomicBool) -> Self {
         let (nw, nh) = img.dimensions();
         let (w, h) = ref_dims(nw, nh);
         let luma = working_luma(img, w, h);
@@ -697,7 +763,12 @@ impl Target {
             h,
             luma,
             edges,
+            stop,
         }
+    }
+
+    fn stopped(&self) -> bool {
+        self.stop.load(Ordering::Relaxed)
     }
 
     /// Size of k-space.
@@ -867,6 +938,9 @@ fn search(target: &Target, tm: &Tmpl, claimed: &[[f32; 4]]) -> Option<Placement>
     // (score, k, template centre x, y in k-space)
     let mut cands: Vec<(f32, f32, f32, f32)> = Vec::new();
     for k in SCALES {
+        if target.stopped() {
+            return None;
+        }
         let cw = ((target.w as f32 / (COARSE_DOWN * k)).round() as usize).max(1);
         let ch = ((target.h as f32 / (COARSE_DOWN * k)).round() as usize).max(1);
         if cw < tm.cw || ch < tm.ch {
@@ -929,6 +1003,7 @@ fn search(target: &Target, tm: &Tmpl, claimed: &[[f32; 4]]) -> Option<Placement>
     checked.truncate(CANDIDATES);
     checked
         .into_iter()
+        .take_while(|_| !target.stopped())
         .map(|p| refine(target, tm, p, claimed))
         .max_by(|a, b| a.score.total_cmp(&b.score))
 }

@@ -27,7 +27,7 @@
 
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::Ordering;
+use std::sync::atomic::{AtomicBool, Ordering};
 
 use crate::batch::{
     BATCH_HIGH, BATCH_LOW, PackedLumas, batch_lines, filter_layer, median_gradient_packed,
@@ -39,8 +39,8 @@ use crate::image_io::{LoadedPhoto, load, save_result, upright_size};
 use crate::inpaint::{Progress, inpaint};
 use crate::mask::{self, Mask, is_empty};
 use crate::template::{
-    MatchBasis, MatchResult, MatchStatus, Transform, WatermarkTemplate, find, saved_placement,
-    saved_score,
+    self, MatchBasis, MatchResult, MatchStatus, Transform, WatermarkTemplate, find_until,
+    saved_placement, saved_score,
 };
 use crate::{Error, Result};
 use image::RgbImage;
@@ -241,8 +241,21 @@ pub fn build_set_layers(paths: &[PathBuf], progress: &Progress) -> Result<SetLay
 
 /// Share of the saved placement's pixels that must lie in the grown batch layer.
 const PRIOR_SUPPORT: f64 = 0.5;
-/// Growth of the batch layer for the support check, as a fraction of the long side.
+/// Growth of the batch layer (and of the saved placement) for the support checks, as a
+/// fraction of the long side.
 const PRIOR_GROW: f32 = 0.004;
+/// Share of the batch layer's pixels that must lie in the grown saved placement for the layer
+/// to be taken as the mark under the drawing (the second support rule). Synthetic fixed set,
+/// the true area grown by 0-48 px: 1.00 every time. Random and styles sets (the layer holds
+/// static scene edges, the marks move): mostly 0.0-0.8, up to 1.0 for a few photos whose layer
+/// is tiny or whose area covers most of the photo.
+const PRIOR_LAYER_INSIDE: f64 = 0.9;
+/// With that rule, the layer inside the drawing must also make up at least this share of the
+/// drawing's pixels (a drawing up to about ten times the mark's own lines). Synthetic fixed
+/// set 0.36-1.00; the real set's grown first guess 0.19; random and styles photos that pass
+/// [`PRIOR_LAYER_INSIDE`] 0.01-0.15. Keeps a few static scene pixels under a large drawing
+/// from becoming the template the position is scored with.
+const PRIOR_LAYER_SHARE: f64 = 0.1;
 /// Score at the saved position (masked NCC, +-2 px, scale 1) for `Found` on set support.
 /// Calibrated on the synthetic fixed set with its own layer and the template of photo 0:
 /// photos without the mark (the clean/ originals other than the reference's scene, and the
@@ -252,56 +265,143 @@ pub const PRIOR_FOUND: f32 = 0.28;
 /// Score at the saved position for `Unsure` on set support (the user opens the photo).
 pub const PRIOR_UNSURE: f32 = 0.16;
 
-/// [`find`] with a position prior for marks stamped at the same place on every photo.
+/// Overlap (intersection over union) at which a search result and the saved placement are the
+/// same place: a search `Found` that agrees with the set position is kept as it is.
+const PRIOR_AGREE: f64 = 0.8;
+
+/// The position prior of one template over one set, worked out once and used for every photo of
+/// the template's size ([`match_with`]).
 ///
-/// When `find` does not return `Found`, `img` has exactly the template's reference size and
-/// `layers` has a layer for that size, the template's pieces are placed at their saved
-/// position and scale 1. If at least half of those pixels lie inside the layer grown by
-/// [`mask::grow_for`] (0.004), the photo itself must also show the mark there: the template's
-/// score at the saved position (the fast path of [`find`], +-2 px) decides. At least
-/// [`PRIOR_FOUND`] gives `Found`, at least [`PRIOR_UNSURE`] gives `Unsure`, both with
-/// [`MatchBasis::SetPosition`], that score as the confidence and the saved placement as the
-/// mask. In every other case the `find` result is returned as is.
-pub fn match_photo(t: &WatermarkTemplate, img: &RgbImage, layers: &SetLayers) -> MatchResult {
-    let found = find(t, img);
-    let (w, h) = img.dimensions();
-    if found.status == MatchStatus::Found || (w, h) != (t.ref_w, t.ref_h) {
-        return found;
-    }
-    let Some(layer) = layers.get(w, h) else {
-        return found;
-    };
-    let Some(placed) = saved_placement(t) else {
-        return found;
-    };
-    let grown = mask::dilate(layer, mask::grow_for(w, h, PRIOR_GROW));
+/// It exists when `layers` has a layer for the template's reference size and the layer shows a
+/// mark stamped where the template was learned. With `g` = [`mask::grow_for`] (0.004) and
+/// "placement" = the template's pieces at their saved position:
+/// 1. at least 90 % of the layer lies in the placement grown by `g`, and the layer inside the
+///    placement is at least 10 % of it (see [`PRIOR_LAYER_INSIDE`], [`PRIOR_LAYER_SHARE`]): the
+///    layer is the mark, and the position is scored with the template cut down to the raw layer
+///    ([`template::within`]). A drawing grown well beyond the mark (the first guess is grown,
+///    and people draw generously) is then judged on the mark's own edges, not on the scene
+///    around it;
+/// 2. else, at least half of the placement lies in the layer grown by `g` (the drawing follows
+///    the layer): the position is scored with the template itself.
+///
+/// Either way a set-position result places the whole template, so removal covers all of the
+/// drawing.
+#[derive(Debug, Clone)]
+pub struct PositionPrior {
+    /// The template's pieces at their saved position, binary: the area of a set-position result.
+    placed: Mask,
+    /// What is scored at the saved position: the template within the layer (rule 1) or the
+    /// template itself (rule 2).
+    scored: WatermarkTemplate,
+}
+
+/// Pixels set in `a`, and how many of them are also set in `b`.
+fn count_in(a: &Mask, b: &Mask) -> (u64, u64) {
     let (mut total, mut inside) = (0u64, 0u64);
-    for (p, g) in placed.pixels().zip(grown.pixels()) {
-        if p.0[0] != 0 {
+    for (p, q) in a.as_raw().iter().zip(b.as_raw()) {
+        if *p != 0 {
             total += 1;
-            inside += (g.0[0] != 0) as u64;
+            inside += (*q != 0) as u64;
         }
     }
-    if total == 0 || (inside as f64) < PRIOR_SUPPORT * total as f64 {
+    (total, inside)
+}
+
+impl PositionPrior {
+    /// See [`PositionPrior`]; `None` when the set does not support the template's position.
+    pub fn new(t: &WatermarkTemplate, layers: &SetLayers) -> Option<PositionPrior> {
+        let (w, h) = (t.ref_w, t.ref_h);
+        let layer = layers.get(w, h)?;
+        let placed = mask::binarize(&saved_placement(t)?);
+        let g = mask::grow_for(w, h, PRIOR_GROW);
+        let (layer_px, layer_in) = count_in(layer, &mask::dilate(&placed, g));
+        let (placed_px, on_layer) = count_in(&placed, layer);
+        let layer_is_mark = layer_px > 0
+            && layer_in as f64 >= PRIOR_LAYER_INSIDE * layer_px as f64
+            && on_layer as f64 >= PRIOR_LAYER_SHARE * placed_px as f64;
+        if layer_is_mark && let Some(scored) = template::within(t, layer) {
+            return Some(PositionPrior { placed, scored });
+        }
+        let (total, inside) = count_in(&placed, &mask::dilate(layer, g));
+        if total == 0 || (inside as f64) < PRIOR_SUPPORT * total as f64 {
+            return None;
+        }
+        Some(PositionPrior {
+            placed,
+            scored: t.clone(),
+        })
+    }
+
+    /// The template the saved position is scored with.
+    pub fn scored(&self) -> &WatermarkTemplate {
+        &self.scored
+    }
+
+    fn result(&self, status: MatchStatus, score: f32) -> MatchResult {
+        MatchResult {
+            status,
+            confidence: score,
+            mask: self.placed.clone(),
+            basis: MatchBasis::SetPosition,
+            transform: Some(Transform::IDENTITY),
+        }
+    }
+}
+
+/// Share of the pixels set in both masks among those set in either.
+fn overlap(a: &Mask, b: &Mask) -> f64 {
+    let (mut inter, mut uni) = (0u64, 0u64);
+    for (p, q) in a.as_raw().iter().zip(b.as_raw()) {
+        let (x, y) = (*p != 0, *q != 0);
+        inter += (x && y) as u64;
+        uni += (x || y) as u64;
+    }
+    inter as f64 / uni.max(1) as f64
+}
+
+/// [`find`] with a position prior for marks stamped at the same place on every photo:
+/// [`match_with`] with the [`PositionPrior`] of `t` over `layers`, worked out for this call.
+/// Matching many photos, work the prior out once and call [`match_with`].
+pub fn match_photo(t: &WatermarkTemplate, img: &RgbImage, layers: &SetLayers) -> MatchResult {
+    let prior = PositionPrior::new(t, layers);
+    match_with(t, prior.as_ref(), img, &AtomicBool::new(false))
+}
+
+/// [`find_until`] with the set's position `prior` (see [`PositionPrior`]).
+///
+/// Without a prior, or for a photo of another size than the template's reference, this is
+/// [`find_until`]. Otherwise the photo itself must show the mark at the saved position: the
+/// score there ([`saved_score`] of the cut template, +-2 px, scale 1) decides first.
+/// - At least [`PRIOR_FOUND`]: `Found` at the saved position, with no search.
+/// - Else the search runs. Below [`PRIOR_UNSURE`] its result is returned as it is. Else a search
+///   `Found` whose area overlaps the saved placement by at least 0.8 is returned as it is, and
+///   anything else gives `Unsure` at the saved position (a search `Found` somewhere else on a
+///   set that shows the mark here is not trusted; the person opens the photo).
+///
+/// A set-position result has basis [`MatchBasis::SetPosition`], the score as its confidence,
+/// the saved placement of the whole template as its mask and [`Transform::IDENTITY`].
+///
+/// Once `stop` is set the result means nothing (see [`find_until`]).
+pub fn match_with(
+    t: &WatermarkTemplate,
+    prior: Option<&PositionPrior>,
+    img: &RgbImage,
+    stop: &AtomicBool,
+) -> MatchResult {
+    let prior = prior.filter(|p| p.placed.dimensions() == img.dimensions());
+    let Some((p, score)) = prior.and_then(|p| saved_score(&p.scored, img).map(|s| (p, s))) else {
+        return find_until(t, img, stop);
+    };
+    if score >= PRIOR_FOUND {
+        return p.result(MatchStatus::Found, score);
+    }
+    let found = find_until(t, img, stop);
+    if score < PRIOR_UNSURE
+        || (found.status == MatchStatus::Found && overlap(&found.mask, &p.placed) >= PRIOR_AGREE)
+    {
         return found;
     }
-    let Some(score) = saved_score(t, img) else {
-        return found;
-    };
-    let status = if score >= PRIOR_FOUND {
-        MatchStatus::Found
-    } else if score >= PRIOR_UNSURE {
-        MatchStatus::Unsure
-    } else {
-        return found;
-    };
-    MatchResult {
-        status,
-        confidence: score,
-        mask: mask::binarize(&placed),
-        basis: MatchBasis::SetPosition,
-        transform: Some(Transform::IDENTITY),
-    }
+    p.result(MatchStatus::Unsure, score)
 }
 
 /// How near, as a share of the photo's long side, the detector must come to a pixel of the

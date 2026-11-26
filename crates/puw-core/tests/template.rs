@@ -4,8 +4,8 @@ use image::{GrayImage, Luma, RgbImage};
 use puw_core::mask::Mask;
 use puw_core::ncc::masked_ncc;
 use puw_core::template::{
-    MatchResult, MatchStatus, Transform, WatermarkTemplate, build_template, find, main_bbox,
-    saved_score,
+    MatchResult, MatchStatus, Transform, WatermarkTemplate, build_template, find, find_until,
+    main_bbox, saved_score, within,
 };
 use std::path::Path;
 use std::time::Instant;
@@ -783,4 +783,84 @@ fn score_sweep() {
             r.status, r.confidence
         );
     }
+}
+
+/// `within` cuts each piece's shape down to the kept pixels, keeping its box and edges, and drops
+/// pieces with nothing left; a mask of another size, or one that keeps nothing, gives `None`.
+#[test]
+fn within_cuts_the_pieces_to_the_kept_pixels() {
+    let set = common::synth_dir().join("random");
+    let names = names(&set);
+    let truth = gt(&set, &names[0]);
+    let b = puw_core::mask::bbox(&truth).expect("mark");
+    let (w, h) = truth.dimensions();
+    let dx: i64 = if b.left() > 320 { -300 } else { 300 };
+    let dot = (
+        i64::from(if dx < 0 { b.left() } else { b.right() }) + dx,
+        i64::from(b.top()) + i64::from(b.height()) / 2,
+    );
+    let img = rgb(&set, "marked", &names[0]);
+    let t = build_template(&img, &with_dot(&truth, dot.0, dot.1));
+    assert_eq!(t.pieces.len(), 2);
+
+    // Keep the left half of the mark only: the dot's piece goes, the mark's keeps its box.
+    let cols = b.left() as u32..b.left() as u32 + b.width() / 2;
+    let rows = b.top() as u32..=b.bottom() as u32;
+    let keep = GrayImage::from_fn(w, h, |x, y| {
+        Luma([if cols.contains(&x) && rows.contains(&y) {
+            255
+        } else {
+            0
+        }])
+    });
+    let cut = within(&t, &keep).expect("part of the mark is kept");
+    assert_eq!(cut.pieces.len(), 1);
+    let (mark, kept) = (
+        t.pieces
+            .iter()
+            .find(|p| p.rel_bbox == cut.pieces[0].rel_bbox)
+            .expect("same box"),
+        &cut.pieces[0],
+    );
+    assert_eq!((kept.edges_w, kept.edges_h), (mark.edges_w, mark.edges_h));
+    assert_eq!(kept.edges, mark.edges);
+    let px = |p: &puw_core::template::Piece| {
+        image::load_from_memory(&p.shape)
+            .expect("png")
+            .to_luma8()
+            .pixels()
+            .filter(|v| v.0[0] != 0)
+            .count()
+    };
+    assert!(
+        px(kept) > 0 && px(kept) < px(mark),
+        "{} of {}",
+        px(kept),
+        px(mark)
+    );
+    // Kept everywhere: the template as it was.
+    let all = GrayImage::from_pixel(w, h, Luma([255]));
+    assert_eq!(within(&t, &all).as_ref(), Some(&t));
+    assert!(within(&t, &GrayImage::new(w, h)).is_none());
+    assert!(within(&t, &GrayImage::new(w / 2, h)).is_none());
+}
+
+/// A search that is told to stop gives up at once with `NotFound`.
+#[test]
+fn find_until_gives_up_when_told() {
+    let set = common::synth_dir().join("random");
+    let names = names(&set);
+    let t = build_template(&rgb(&set, "marked", &names[0]), &gt(&set, &names[0]));
+    let img = rgb(&set, "marked", &names[4]);
+    assert_eq!(find(&t, &img).status, MatchStatus::Found, "premise");
+    let stop = std::sync::atomic::AtomicBool::new(true);
+    let start = Instant::now();
+    let r = find_until(&t, &img, &stop);
+    let secs = start.elapsed().as_secs_f32();
+    assert_eq!(r.status, MatchStatus::NotFound);
+    assert_eq!(r.confidence, 0.0);
+    assert!(r.transform.is_none());
+    let (_, full) = timed_find(&t, &img);
+    eprintln!("stopped find {secs:.3} s, full find {full:.3} s");
+    assert!(secs < full, "{secs:.3} s vs {full:.3} s");
 }

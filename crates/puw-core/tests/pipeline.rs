@@ -15,9 +15,9 @@ use puw_core::mask::{self, Mask, is_empty};
 use puw_core::pipeline::{PRIOR_FOUND, PRIOR_UNSURE, keep_mark_parts};
 use puw_core::template::MatchBasis;
 use puw_core::{
-    Engine, Error, LoadedPhoto, MatchStatus, ModelPaths, Progress, SetLayers, Transform,
-    build_set_layers, build_template, find, guess_photo, load, match_photo, output_dir_for,
-    pick_representative, remove_one, representative_sample,
+    Engine, Error, LoadedPhoto, MatchStatus, ModelPaths, PositionPrior, Progress, SetLayers,
+    Transform, build_set_layers, build_template, find, guess_photo, load, match_photo, match_with,
+    output_dir_for, pick_representative, remove_one, representative_sample,
 };
 
 fn engine() -> Option<&'static Engine> {
@@ -609,4 +609,92 @@ fn negatives_stay_not_found() {
         assert_ne!(m.status, MatchStatus::Found, "negative {i} without a layer");
         assert_eq!(m.basis, MatchBasis::Search);
     }
+}
+
+/// A drawing grown far beyond the mark (60 px around it, about five times the mark's area,
+/// like the grown first guess on a real outline mark) on the fixed set: the search alone finds
+/// it on none of the other photos, and at least half of the drawing lies off the layer, yet the
+/// layer lies inside the drawing, so the position is scored on the layer and every photo is
+/// `Found` at the saved position, with the whole drawing as its area.
+#[test]
+fn prior_matches_a_drawing_grown_beyond_the_mark() {
+    let set = common::synth_dir().join("fixed");
+    let paths: Vec<PathBuf> = (0..8)
+        .map(|i| set.join("marked").join(format!("0{i}.png")))
+        .collect();
+    let photos: Vec<RgbImage> = paths.iter().map(|p| open_rgb(p)).collect();
+    let layers = no_progress_layers(&paths);
+    let drawing = mask::dilate(&open_mask(&set.join("mask/00.png")), 60);
+    let tmpl = build_template(&photos[0], &drawing);
+    let prior = PositionPrior::new(&tmpl, &layers).expect("the set supports the position");
+    assert!(
+        prior.scored() != &tmpl,
+        "scored on the layer, not on the drawing"
+    );
+    for (i, p) in photos.iter().enumerate().skip(1) {
+        assert_ne!(
+            find(&tmpl, p).status,
+            MatchStatus::Found,
+            "premise, photo {i}"
+        );
+        let m = match_photo(&tmpl, p, &layers);
+        assert_eq!(m.status, MatchStatus::Found, "photo {i}");
+        assert_eq!(m.basis, MatchBasis::SetPosition, "photo {i}");
+        assert_eq!(m.transform, Some(Transform::IDENTITY), "photo {i}");
+        assert!(iou(&m.mask, &drawing) >= 0.99, "photo {i}");
+        let again = match_with(&tmpl, Some(&prior), p, &AtomicBool::new(false));
+        assert_eq!((again.status, again.confidence), (m.status, m.confidence));
+    }
+}
+
+/// On the random and styles sets the batch layer holds static scene edges and the marks move.
+/// Whatever the drawing (the true area, or grown by 48 px), the set position never places the
+/// template on a photo whose own mark is elsewhere.
+#[test]
+fn prior_never_places_a_moving_mark() {
+    let synth = common::synth_dir();
+    let mut priors = 0;
+    for set in ["random", "styles"] {
+        let mut names: Vec<String> = fs::read_dir(synth.join(set).join("marked"))
+            .expect("read dir")
+            .map(|e| e.expect("entry").file_name().to_string_lossy().into_owned())
+            .collect();
+        names.sort();
+        let paths: Vec<PathBuf> = names
+            .iter()
+            .map(|n| synth.join(set).join("marked").join(n))
+            .collect();
+        let layers = no_progress_layers(&paths);
+        let photos: Vec<RgbImage> = paths.iter().map(|p| open_rgb(p)).collect();
+        let truths: Vec<Mask> = names
+            .iter()
+            .map(|n| open_mask(&synth.join(set).join("mask").join(n)))
+            .collect();
+        for (i, img) in photos.iter().enumerate() {
+            for grow in [0, 48] {
+                let drawing = if grow == 0 {
+                    truths[i].clone()
+                } else {
+                    mask::dilate(&truths[i], grow)
+                };
+                let tmpl = build_template(img, &drawing);
+                let Some(prior) = PositionPrior::new(&tmpl, &layers) else {
+                    continue;
+                };
+                priors += 1;
+                for (j, p) in photos.iter().enumerate() {
+                    if j == i || p.dimensions() != img.dimensions() {
+                        continue;
+                    }
+                    let m = match_with(&tmpl, Some(&prior), p, &AtomicBool::new(false));
+                    if m.basis == MatchBasis::SetPosition {
+                        let q = iou(&m.mask, &truths[j]);
+                        assert!(q > 0.0, "{set} {i} grow {grow} on {j}: {:?}", m.status);
+                    }
+                }
+            }
+        }
+    }
+    // Some drawings do pass a support rule (a tiny layer near the mark): the scores decide.
+    assert!(priors > 0, "premise: no prior was ever made");
 }
