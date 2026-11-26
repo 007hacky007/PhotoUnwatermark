@@ -128,4 +128,29 @@ into `%LOCALAPPDATA%\PhotoUnwatermark\models`; or download once from the Welcome
 - [ ] Toolbar buttons do not take the focus on click; the AltGr layouts' [ and ] keys change the brush size.
 - [ ] Drag and drop of a folder works; Explorer opens with "Open folder".
 
+## 11. Watermark groups
+
+Set up: the mixed set is `target/synth/fixed/marked` plus the logo photos the timings run writes
+under `local/timing/mixed/marked` (and `target/synth/negative/marked` 04 and 05 for photos with no watermark).
+
+- [ ] Mixed set: group 1 from the `fixed` photos, then "Find the next watermark" for the logo photos.
+- [ ] Step 2 of group 2: one drawing is shown on every photo in the strip, and painting on one photo changes all of them.
+- [ ] Strip photos: an unsure or not-found note shows on the photo, with painting off there.
+- [ ] Undo works across strip photos (it undoes the last stroke wherever it was painted).
+- [ ] The group heading in step 2 and step 3 reads "group 2" for the second group.
+- [ ] Earlier-group labels show on step-3 tiles, "No group yet" tiles show for the rest, and unticking a photo of an earlier group works.
+- [ ] The summary line counts each photo once (in a group, no group yet, or unreadable) and "Found in X of Y" leaves unreadable photos out of Y.
+- [ ] "Find the next watermark": the saved-watermark check comes first, then the wait; Back keeps everything.
+- [ ] "Use a saved watermark..." and "Use for these photos" work from Add photos and from step 3; step 3 shows the result with no wait screen.
+- [ ] "Leave them out" and the Remove dialog agree on which photos are left out.
+- [ ] Done: the list of left-out photos shows, and there is one "Saved" row per group.
+- [ ] Back from step 2 of group 1 to Add photos clears the groups and keeps the drawing.
+- [ ] Label placement on small step-3 tiles: the group label does not cover the badge or the checkbox.
+- [ ] Step-3 footer with four buttons: it wraps cleanly at narrow window widths.
+- [ ] The saved-watermark offer in step 3: layout and wording are clear.
+- [ ] Painting speed on a 24 MP photo in step 2 with the shared drawing (the whole red layer is redrawn per stroke): no lag you can feel.
+- [ ] "Looks right" pressed while a strip photo is still being placed: nothing breaks and the drawing used is the one shown.
+- [ ] With several groups, one "Saved" line per group on Done is easy to understand.
+- [ ] Timings for the second group: ____ s (first guess plus matching).
+
 Result summary (fill in last): macOS ____ passed / ____ problems; Windows ____ / ____.

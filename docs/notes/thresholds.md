@@ -393,3 +393,28 @@ compile (17 s + 22 s) happens once per machine and models folder; every later st
 about 3 s. Where the preview time goes was not profiled here (the photo is decoded at full
 size, the area is applied at the working size, then LaMa runs); that is the place to look if
 the target matters.
+
+## App timings (Plan 2b, watermark groups)
+
+Same harness and machine as "App timings (Plan 2)" (Core ML, models and cache warm). Aggregates
+only. The synthetic mixed set is 8 `fixed` photos, 4 logo photos and 2 photos with no watermark;
+the real set is set-a (8 photos of 24.0 MP) plus set-b as one set of 15 photos, with group 1 from
+set-a. One run.
+
+| Step | Time |
+|---|---|
+| detect of the leftovers, synthetic mixed set (6 photos left, 3 looked at) | 4.2 s |
+| place_on, one synthetic strip photo, first call (learns the drawing) | 0.34 s |
+| place_on, the next 2 synthetic strip photos | 0.57 s in all |
+| match_all of group 2, synthetic mixed set (6 photos; 4 found, 2 not found) | 0.3 s |
+| use_saved, then match_all for a saved logo watermark (6 photos; 4 found, 2 not found) | 0.00 s + 0.4 s |
+| detect of the leftovers, real (7 photos left, 3 looked at) | 23.4 s |
+| match_all of group 2, real (7 photos; 1 found, 6 not found) | 6.1 s |
+| place_on, one 24 MP strip photo, first call and again | 5.5 s and 5.1 s |
+
+Against the spec's budget (one sample first guess plus one matching pass over the photos with no
+group, and nothing more): a new group on the real set costs 23.4 + 6.1 = 29.5 s, which is those
+two parts and nothing else; a saved watermark skips the first guess and costs only the matching
+pass (0.4 s synthetic). Both rows fit. The real place_on is on a photo that does not carry the
+second watermark (not found), and it does not get faster on a repeat: it reads and matches the 24 MP photo each time, so painting in step 2 on a big photo
+is the thing to watch by hand (checklist section 11).

@@ -10,8 +10,9 @@ use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 use std::time::Instant;
 
+use puw_app::images::jpeg;
 use puw_app::{AppCore, DataDirs, Detail, LoadPurpose, ProgressEvent, Settings};
-use puw_core::ModelKind;
+use puw_core::{Library, ModelKind, SavedWatermark, build_template};
 
 fn secs(t: Instant) -> f64 {
     t.elapsed().as_secs_f64()
@@ -71,6 +72,15 @@ fn truth_area(core: &AppCore, id: u32, mask: &Path) {
     core.put_draft(id, gt.width(), gt.height(), gt.into_raw())
         .unwrap();
     core.confirm_set_area(id).unwrap();
+}
+
+/// Unticks every ticked unsure photo nobody opened, as the UI asks before the next group.
+fn settle(core: &AppCore) {
+    for st in core.photo_states() {
+        if st.status == puw_app::AreaStatus::Unsure && st.included && !st.reviewed {
+            core.set_included(st.id, false).unwrap();
+        }
+    }
 }
 
 #[test]
@@ -142,6 +152,96 @@ fn app_timings() {
         sum.not_found
     ));
 
+    // Synthetic mixed set (Plan 2b): group 1 is done, then the second group by hand.
+    let mdir = work.join("mixed");
+    let c = core(&models, &cache, &work.join("data-mixed"), Detail::Best);
+    let m = common::mixed_set(&c, &mdir);
+    load_times(&c);
+    truth_area(
+        &c,
+        m.fixed[0],
+        &synth.join("fixed").join("mask").join("00.png"),
+    );
+    c.match_all(&|_| {}).unwrap();
+    settle(&c);
+    let t = Instant::now();
+    let out = c.detect(&|_| {}).unwrap();
+    say(format!(
+        "detect leftovers, synthetic mixed set ({} photos left, 3 looked at): {:.1} s (sample {})",
+        c.groups().leftovers,
+        secs(t),
+        out.sample.len()
+    ));
+    let reference = m.logos[0];
+    let truth = &m.logo_truths[0];
+    c.put_draft(
+        reference,
+        truth.width(),
+        truth.height(),
+        truth.as_raw().clone(),
+    )
+    .unwrap();
+    let t = Instant::now();
+    c.place_on(reference, m.logos[1]).unwrap();
+    say(format!(
+        "place_on, synthetic strip photo, first call: {:.2} s",
+        secs(t)
+    ));
+    let t = Instant::now();
+    for id in &m.logos[2..] {
+        c.place_on(reference, *id).unwrap();
+    }
+    say(format!(
+        "place_on, next 2 strip photos (drawing already learned): {:.2} s",
+        secs(t)
+    ));
+    c.confirm_new_group(reference).unwrap();
+    let t = Instant::now();
+    let sum = c.match_all(&|_| {}).unwrap();
+    say(format!(
+        "match_all group 2, synthetic mixed set ({} photos): {:.1} s ({} found, {} unsure, {} not found)",
+        sum.total,
+        secs(t),
+        sum.found,
+        sum.unsure,
+        sum.not_found
+    ));
+
+    // The same logo as a saved watermark: use_saved, then match_all.
+    let c = core(&models, &cache, &work.join("data-saved"), Detail::Best);
+    let m = common::mixed_set(&c, &mdir);
+    load_times(&c);
+    truth_area(
+        &c,
+        m.fixed[0],
+        &synth.join("fixed").join("mask").join("00.png"),
+    );
+    c.match_all(&|_| {}).unwrap();
+    settle(&c);
+    let logo = image::open(mdir.join("marked").join("logo-00.png"))
+        .unwrap()
+        .to_rgb8();
+    let w = SavedWatermark::new(
+        "Ring",
+        build_template(&logo, &m.logo_truths[0]),
+        jpeg(&image::RgbImage::new(4, 4), 80),
+    );
+    let lib = DataDirs::at(&work.join("data-saved")).watermarks;
+    Library::open(&lib).unwrap().save(&w).unwrap();
+    let t = Instant::now();
+    c.use_saved(&w.id).unwrap();
+    let used = secs(t);
+    let t = Instant::now();
+    let sum = c.match_all(&|_| {}).unwrap();
+    say(format!(
+        "use_saved {used:.2} s, then match_all ({} photos): {:.1} s ({} found, {} unsure, {} not found)",
+        sum.total,
+        secs(t),
+        sum.found,
+        sum.unsure,
+        sum.not_found
+    ));
+
     // Real set-a.
     let Some(real) = std::env::var_os("PUW_REAL_DIR").map(PathBuf::from) else {
         eprintln!("PUW_REAL_DIR not set, real set skipped");
@@ -180,6 +280,51 @@ fn app_timings() {
         sum.unsure,
         sum.not_found
     ));
+
+    // Real set-a and set-b as one set: two groups (group 2 = the set-b photo).
+    let b = photos_in(&real.join("set-b"));
+    let c2 = core(&models, &cache, &work.join("data-real2"), Detail::Best);
+    let mut all = a.clone();
+    all.extend(b.iter().cloned());
+    let ids2 = add(&c2, &all);
+    let out = c2.detect(&|_| {}).unwrap();
+    c2.confirm_set_area(out.representative).unwrap();
+    c2.match_all(&|_| {}).unwrap();
+    settle(&c2);
+    let t = Instant::now();
+    let out2 = c2.detect(&|_| {}).unwrap();
+    say(format!(
+        "detect leftovers, real set-a + set-b ({} photos left, 3 looked at): {:.1} s (sample {})",
+        c2.groups().leftovers,
+        secs(t),
+        out2.sample.len()
+    ));
+    c2.confirm_new_group(out2.representative).unwrap();
+    let t = Instant::now();
+    let sum = c2.match_all(&|_| {}).unwrap();
+    say(format!(
+        "match_all group 2, real ({} photos): {:.1} s ({} found, {} unsure, {} not found)",
+        sum.total,
+        secs(t),
+        sum.found,
+        sum.unsure,
+        sum.not_found
+    ));
+    let strip = ids2
+        .iter()
+        .copied()
+        .find(|id| *id != out2.representative)
+        .unwrap();
+    let t = Instant::now();
+    let p = c2.place_on(out2.representative, strip).unwrap();
+    say(format!(
+        "place_on, 24 MP strip photo, first call: {:.1} s ({:?})",
+        secs(t),
+        p.status
+    ));
+    let t = Instant::now();
+    c2.place_on(out2.representative, strip).unwrap();
+    say(format!("place_on, same photo again: {:.2} s", secs(t)));
 
     // Preview of one photo: remover load, then the preview itself.
     let target = out.representative;
