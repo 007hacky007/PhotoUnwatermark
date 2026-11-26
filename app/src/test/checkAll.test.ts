@@ -735,8 +735,67 @@ describe('Check all photos', () => {
     expect(wizard.current).toEqual({ group: 1, outcome: sample });
   });
 
+  it('failedRematchShowsTheAppsStateAndHoldsTheNextSteps', async () => {
+    // Review fix 1: "Yes" on the offer, then the new group's matching fails.
+    suggestSaved.mockResolvedValue({ id: 's1', name: 'Studio' });
+    useSaved.mockImplementation(async () => {
+      // As the app does: the photos with no group are reset for group 2.
+      current = 2;
+      matchedFlag = false;
+      store = store.map((s) => (s.member ? s : st(s.id, 'pending', { included: false })));
+      return 2;
+    });
+    const wizard = setup([st(1, 'found'), st(2, 'found', { included: false }), st(3, 'notFound')]);
+    await fireEvent.click(await screen.findByRole('button', { name: 'Find the next watermark in these 2' }));
+    matchAll.mockRejectedValueOnce({ message: '', details: '' });
+    await fireEvent.click(await screen.findByRole('button', { name: copy.addPhotos.yes }));
+    expect(await screen.findByText(copy.checkAll.findingFailed)).toBeTruthy();
+    expect(wizard.groups).toBe(2);
+    // The tiles show what the app has now, not the grid from before.
+    await waitFor(() => expect(within(tile(2)).getByText(copy.groups.notInGroup)).toBeTruthy());
+    expect(box(2).checked).toBe(false);
+    expect(box(2).disabled).toBe(true);
+    expect(within(tile(1)).getByText(copy.groups.label(1))).toBeTruthy();
+    // Matching is still open in the app: every next step waits for it.
+    for (const name of [
+      'Find the next watermark in these 2',
+      copy.groups.useSaved,
+      copy.groups.leaveOut,
+      'Remove watermark from 1 photo',
+    ]) {
+      expect(button(name).disabled, name).toBe(true);
+    }
+    expect(button(copy.common.back).disabled).toBe(false);
+  });
+
+  it('backWhileReadingStartsNoMatch', async () => {
+    // Review fix 2: Back during the first read of an unmatched saved group.
+    store = [st(1, 'pending', { included: false }), st(2, 'pending', { included: false })];
+    let read: () => void = () => {};
+    groupsState.mockImplementationOnce(() => new Promise((r) => (read = () => r(groupsOf(store)))));
+    let sampled: () => void = () => {};
+    groupSample.mockImplementation(() => new Promise((r) => (sampled = () => r(outcome))));
+    const wizard = createWizard();
+    wizard.go('add');
+    wizard.useGroup(1, [1, 2]);
+    wizard.go('checkAll');
+    render(CheckAll, { wizard });
+    await fireEvent.click(await screen.findByRole('button', { name: copy.common.back }));
+    await waitFor(() => expect(groupSample).toHaveBeenCalledTimes(1));
+    // The read comes back while step 2's photos are still on their way.
+    read();
+    await new Promise((r) => setTimeout(r, 0));
+    sampled();
+    await waitFor(() => expect(wizard.screen).toBe('check'));
+    await new Promise((r) => setTimeout(r, 0));
+    expect(matchAll).not.toHaveBeenCalled();
+    expect(wizard.busy).toBe(false);
+  });
+
   it('noBannedWordsRendered', async () => {
     suggestSaved.mockResolvedValue({ id: 's1', name: 'Studio' });
+    // Photo 5 left group 1 after group 2 was matched.
+    matchedFlag = true;
     setup(
       [
         st(1, 'found', { group: 1 }),

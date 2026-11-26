@@ -106,8 +106,11 @@
   const members = $derived(states.filter((s) => s.member).length);
   const leftovers = $derived(groups?.leftovers ?? 0);
   const blocked = $derived(blockers.length > 0);
-  /** The next steps wait for every "?" and every tick on its way. */
-  const held = $derived(blocked || ticking > 0 || backing);
+  /**
+   * The next steps wait for every "?", every tick on its way, and the current group's matching
+   * (the app refuses them until it has finished, for example after a failed one).
+   */
+  const held = $derived(blocked || ticking > 0 || backing || (groups !== null && !groups.matched));
 
   function message(e: unknown, fallback: string): string {
     const text = (e as Partial<UserError> | null)?.message;
@@ -155,7 +158,8 @@
       loaded = true;
       return;
     }
-    if (leaving) return;
+    // Back while reading: step 2 comes next, so nothing may start a job here.
+    if (leaving || backing) return;
     groups = gs;
     const match = gs.current !== null && !gs.matched;
     if (match) {
@@ -174,6 +178,16 @@
       } catch (e) {
         if (leaving || backing) return;
         error = message(e, c.findingFailed);
+        // A grid from before (a saved watermark used in place) shows what the app has now:
+        // the photos with no group were reset for the new group.
+        if (states.length > 0) {
+          versions = {};
+          try {
+            await refresh();
+          } catch {
+            // The error above is already shown.
+          }
+        }
         loaded = true;
         return;
       } finally {

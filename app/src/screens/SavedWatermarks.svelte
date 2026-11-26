@@ -184,13 +184,19 @@
                   {copy.saved.useForThese}
                 </button>
               {/if}
-              <button type="button" aria-label={copy.saved.renameOne(w.name)} onclick={() => startRename(w)}>
+              <button
+                type="button"
+                aria-label={copy.saved.renameOne(w.name)}
+                disabled={working}
+                onclick={() => startRename(w)}
+              >
                 {copy.saved.rename}
               </button>
               <button
                 type="button"
                 aria-label={copy.saved.deleteOne(w.name)}
                 aria-haspopup="dialog"
+                disabled={working}
                 onclick={() => {
                   deleteError = null;
                   deleting = w;
