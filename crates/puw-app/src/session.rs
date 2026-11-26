@@ -439,26 +439,29 @@ impl Session {
         group.is_some() && group != self.current_number()
     }
 
-    /// True when confirming `area` (full size) on photo `id` would change nothing: the photo
-    /// has no area of its own, the current group found it with this very area, and the
-    /// group's watermark was learned from that photo and area (or it is a saved watermark
-    /// used as it is). Learning from another photo makes another watermark, even with the
-    /// area it was found with there.
-    pub fn confirms_nothing_new(&self, id: PhotoId, area: &Area) -> bool {
+    /// True when confirming `shown` (the area as the editor shows it, at the photo's edit
+    /// size, binary) on photo `id` would change nothing: the photo has no area of its own, the
+    /// current group found it with this very area, and the group's watermark was learned from
+    /// that photo and area (or it is a saved watermark used as it is). Areas are compared at
+    /// `shown`'s size. Learning from another photo makes another watermark, even with the area
+    /// it was found with there.
+    pub fn confirms_nothing_new(&self, id: PhotoId, shown: &Mask) -> bool {
         let (Some(d), Some(g), Some(e)) = (self.data.get(&id), self.current(), self.photos.get(id))
         else {
             return false;
         };
+        let (w, h) = shown.dimensions();
+        let same = |a: &Area| a.resized(w, h) == *shown;
         let learned_here = g
             .confirmed
             .as_ref()
-            .is_none_or(|c| c.path == e.path && *c.area == *area);
+            .is_none_or(|c| c.path == e.path && same(&c.area));
         d.own.is_none()
             && d.group == Some(g.number)
             && learned_here
             && d.matched
                 .as_ref()
-                .is_some_and(|m| m.status == MatchStatus::Found && *m.area == *area)
+                .is_some_and(|m| m.status == MatchStatus::Found && same(&m.area))
     }
 
     /// The current group's matching has finished and nothing holds up removal, so the next

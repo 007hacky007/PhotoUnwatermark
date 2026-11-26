@@ -940,6 +940,87 @@ fn unchanged_saved_group_stays_saved() {
     assert!(!g.matched && g.current == Some(2), "{g:?}");
 }
 
+/// `n` photos of the fixed set at three times their size (4608 x 3072, above the 4096 edit
+/// size), as JPEGs in `dir`, with their ground truth at that size.
+fn big_fixed(dir: &Path, n: usize) -> Vec<(PathBuf, GrayImage)> {
+    use image::imageops::{FilterType, resize};
+    (0..n)
+        .map(|i| {
+            let name = format!("0{i}");
+            let img = image::open(synth("fixed").join("marked").join(format!("{name}.png")))
+                .unwrap()
+                .to_rgb8();
+            let (w, h) = (img.width() * 3, img.height() * 3);
+            let path = dir.join(format!("big-{name}.jpg"));
+            std::fs::write(&path, jpeg(&resize(&img, w, h, FilterType::Triangle), 95)).unwrap();
+            let truth = resize(&synth_truth("fixed", &name), w, h, FilterType::Nearest);
+            (path, truth)
+        })
+        .collect()
+}
+
+/// "Looks right" with the drawing unchanged, on photos larger than the edit size: the area
+/// comes back at edit size, which is not the full-size area it was shown from, yet nothing
+/// changes, for a group learned from a drawing and for a saved watermark used as it is.
+#[test]
+fn unchanged_confirm_on_a_big_photo_changes_nothing() {
+    let dir = tempfile::tempdir().unwrap();
+    let big = big_fixed(dir.path(), 3);
+    let paths: Vec<PathBuf> = big.iter().map(|b| b.0.clone()).collect();
+
+    // A group learned from the drawing on photo 0.
+    let f = fixture(None);
+    let ids: Vec<u32> = f
+        .core
+        .add_paths(&paths)
+        .unwrap()
+        .added
+        .iter()
+        .map(|p| p.id)
+        .collect();
+    let (w, h) = f.core.edit_size(ids[0]).unwrap();
+    assert!(w < 4608 && h < 3072, "premise: edited at a smaller size");
+    let small = image::imageops::resize(&big[0].1, w, h, image::imageops::FilterType::Nearest);
+    f.core.put_draft(ids[0], w, h, small.into_raw()).unwrap();
+    f.core.confirm_set_area(ids[0]).unwrap();
+    f.core.match_all(&noop).unwrap();
+    let before = f.core.photo_states();
+    assert!(
+        before.iter().all(|s| s.status == AreaStatus::Found),
+        "{before:?}"
+    );
+    let template = f.core.confirmed_template().unwrap();
+    // Twice: the unchanged area is still the same the second time.
+    for _ in 0..2 {
+        let same = f.core.area(ids[0]).unwrap();
+        f.core.put_draft(ids[0], w, h, same).unwrap();
+        f.core.confirm_set_area(ids[0]).unwrap();
+        assert_eq!(f.core.photo_states(), before);
+        assert!(f.core.groups().matched);
+    }
+    assert!(Arc::ptr_eq(
+        &template,
+        &f.core.confirmed_template().unwrap()
+    ));
+
+    // A saved watermark used as it is.
+    let f = fixture(None);
+    let id = save_from(&f, "Big", &big[0].0, &big[0].1);
+    f.core.add_paths(&paths).unwrap();
+    f.core.use_saved(&id).unwrap();
+    f.core.match_all(&noop).unwrap();
+    settle(&f.core);
+    let rep = f.core.group_sample().unwrap().representative;
+    let before = f.core.photo_states();
+    let same = f.core.area(rep).unwrap();
+    f.core.put_draft(rep, w, h, same).unwrap();
+    f.core.confirm_set_area(rep).unwrap();
+    let g = f.core.groups();
+    assert!(!g.groups[0].edited && !g.groups[0].can_save, "{g:?}");
+    assert!(g.matched, "{g:?}");
+    assert_eq!(f.core.photo_states(), before);
+}
+
 #[test]
 fn suggest_looks_only_at_photos_without_a_group() {
     let f = fixture(None);

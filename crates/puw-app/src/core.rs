@@ -699,6 +699,30 @@ impl AppCore {
                 s.start_area(id),
             )
         };
+        // The same area confirmed again (step 3, Back, "Looks right" unchanged): nothing to
+        // learn, and every match, tick and look in step 3 stays as it is. Compared at edit
+        // size, where the editor drew it: on a photo larger than that, an area sent back
+        // unchanged is not the full-size area it was shown from.
+        if !new_group {
+            let (ew, eh) = images::edit_size(w, h);
+            let shown = match (&draft, &start) {
+                (Some(d), _) => {
+                    Mask::from_raw(d.w, d.h, d.bytes.clone()).map(|m| mask::binarize(&m))
+                }
+                (None, Some(a)) => Some(a.resized(ew, eh)),
+                (None, None) => None,
+            };
+            let mut s = self.session();
+            if let Some(shown) = shown
+                && !mask::is_empty(&shown)
+                && s.confirms_nothing_new(id, &shown)
+            {
+                if let Some(d) = s.data.get_mut(&id) {
+                    d.draft = None;
+                }
+                return Ok(());
+            }
+        }
         let area = match (draft, start) {
             (Some(d), _) => area_from_edit(&d.bytes, d.w, d.h, w, h)?,
             (None, Some(a)) => a.to_full(),
@@ -706,17 +730,6 @@ impl AppCore {
         };
         if mask::is_empty(&area) {
             return Err(AppError::NothingToRemove);
-        }
-        // The same area confirmed again (step 3, Back, "Looks right" unchanged): nothing to
-        // learn, and every match, tick and look in step 3 stays as it is.
-        if !new_group && area.dimensions() == (w, h) {
-            let mut s = self.session();
-            if s.confirms_nothing_new(id, &Area::from_mask(&area)) {
-                if let Some(d) = s.data.get_mut(&id) {
-                    d.draft = None;
-                }
-                return Ok(());
-            }
         }
         let photo = load(&path)?;
         let area = if area.dimensions() == photo.rgb.dimensions() {
