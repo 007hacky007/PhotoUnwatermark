@@ -186,6 +186,9 @@ measured about 2.9 % on the same set with the same constants.
 Since the final fix wave the batch layer comes from `build_set_layers`, which reads photos one
 at a time and keeps an evenly spaced sample of each size group as 2-byte luma (`puw-dev layers
 --real`): set 1 still gives 2.91 % (1084 components, was 1083), in 4.3 s for the 8 photos.
+Since round 2 of the small-set fix (`batch::agree_count`: 6 of 8 photos must agree) set 1 gives
+0.99 % (53 components, the mark only), in 5.6 s (the photos are also kept at long side 1536
+for `SetLayers::edges`).
 
 Peak memory of `build_set_layers` on synthetic 36 MP JPEGs (7360x4912, release build, macOS
 peak memory footprint): 0.76 GB for 3 photos, 0.95 GB for 8, 1.53 GB for 40 and 1.53 GB for
@@ -391,7 +394,7 @@ Fix (`batch::AGREE`, `batch::agreed`): with 3 or 4 photos the layer's gradient t
 and per axis, the value 3 photos reach on the same side of zero (all 3, or 3 of 4) instead of
 the median. From 5 photos on the median of an odd count is that value already, so larger sets
 keep their numbers (set-a's 8-photo layer, the synthetic fixed, styles and negative sets are
-unchanged).
+unchanged). (Round 2 below replaced this by `batch::agree_count` for 3 to 11 photos.)
 
 | set-a triple (6 measured) | median of 3 | 3 agree |
 |---|---|---|
@@ -454,6 +457,97 @@ measurement the "cleanup" kept only the largest group of the guess, which on tri
 away half of the mark): then less than 90 % of the layer lies in the drawing, rule 1
 fails, rule 2 scores the drawing itself (0.07-0.10), and the search decides (Unsure, moved 128 and 105 px, and
 NotFound). The drawing then does not cover the mark anyway.
+
+### Sets of 4-7 photos and the set's own edges (round 2)
+
+After the first fix, subsets of 4-7 photos of set-a (the eight below, as is and cleaned) placed
+68 of 72 strip photos and 84 of 88 step-3 photos at the true place, but 48 of the 84 as Unsure,
+and set 1,3,5,6,7 gave NotFound for 2 strip photos.
+
+Root cause, measured with the finder's own first guess on one session per subset (code before
+this round):
+
+| photos | layer (% of the photo) | share of it off the mark | saved-position scores (rule 1) |
+|---|---|---|---|
+| 4 (2 sets) | 1.96-3.34 | 0.15-0.41 | 0.22-0.40 |
+| 5 (2 sets) | 3.42-4.87 | 0.33-0.47 | 0.13-0.33 |
+| 6 (2 sets) | 2.93-3.51 | 0.27-0.37 | 0.19-0.29 |
+| 7 (2 sets) | 2.29-3.17 | 0.10-0.33 | 0.17-0.33 |
+| 8 | 1.80 | 0.00 | 0.23-0.38 |
+
+"Off the mark" is the share of the layer more than 10 px from the 8-photo median layer. Rule 1 of
+the prior held every time (all of the layer inside the grown guess, layer share of the guess
+0.19-0.37). Over the 43 photos the scores ran 0.13-0.40, median 0.25: 16 at or over
+`PRIOR_FOUND` 0.28, 2 under `PRIOR_UNSURE` 0.16 (those went to the search, which found the
+scene: the NotFound of set 1,3,5,6,7).
+
+Two causes:
+1. The median keeps an edge that half of the photos share, and in a shoot two or three shots
+   nearly line up: 10-47 % of the 4-7 photo layers was scene. The cut template then holds scene
+   pixels that the other photos do not have.
+2. Even on the clean 8-photo layer the scores sat at 0.23-0.38: the cut template carries the
+   reference photo's edges, the faint mark plus the reference's own scene under it, and every
+   other photo has another scene there. The synthetic calibration behind `PRIOR_FOUND` had the
+   same spread (faint marked photos 0.175-0.331, photos without the mark up to 0.155).
+
+Changes:
+- `batch::agree_count`: an edge stays in the layer when `n - (n - 1) / 4` of the `n` photos
+  show it with the same sign, at most `AGREE_MAX` 6, and the median once that is half of the
+  photos or fewer (from 12 photos). 3 -> 3, 4 -> 4, 5 -> 4, 6 -> 5, 7 -> 6, 8 to 11 -> 6. Layers
+  of set-a subsets (the finder's own guess): 0.87-1.09 % of the photo, 0.00-0.01 off the mark
+  for 4-8 photos; the 8-photo layer itself 0.99 % (was 1.80 %).
+- `SetLayers::edges`: `build_set_layers` also keeps each sampled photo at long side 1536 and
+  takes the same agreed median of their gradients there. Rule 1 of the prior scores the cut
+  template on those edges (`template::with_edges`), the mark without any one photo's scene.
+- `PRIOR_LAYER_SHARE` 0.1 -> 0.05: the agreed layers hold the mark's lines only, so the real first
+  guess holds 0.12-0.14 of its layer, and a drawing 1.6 times as large fell under 0.1 (no set
+  position, the search found the scene). At 0.05 the layer grown by 120 px (16-18 % of the photo)
+  still passes and scores 0.49-0.58. No drawing of the random and styles sets, up to 96 px
+  grown, passes rule 1 on the new layers.
+- `keep_mark_parts`: a layer counts as the mark only when it also holds at least `SPECK_FRAC` of
+  the pixels of the detector's largest group. The styles set's layer shrank to 210 px of scene
+  that the detector happens to cover, and only the parts near it were kept (styles/05 recall
+  1.000 -> 0.475); that layer is 0.004-0.011 of the styles marks' groups, the fixed set's about
+  1, the real set's 3-10.
+
+Scores at the saved position after the change (rule 1, the set's edges):
+
+| photos | before | after |
+|---|---|---|
+| real set-a subsets of 4-8 photos, finder's guess (43 photos) | 0.13-0.40, median 0.25 | 0.41-0.57, median 0.52 |
+| synthetic fixed, faint (alpha 0.12), true area / grown 60 px | 0.18-0.33 / 0.13-0.27 | 0.51-0.95 / 0.45-0.95 |
+| synthetic photos without the mark (7 clean scenes, 6 negatives), true area / grown 60 px | 0.00-0.153 / 0.00-0.128 | 0.00-0.07 / 0.01-0.05 |
+| a clean photo inside the layer's own set (sets of 5 and 8) | 0.00-0.13 | 0.01-0.07 |
+| photos whose mark moved 400 px (fixed layer) | 0.00-0.10 | no set-position result (`prior_never_places_a_moving_mark`) |
+
+The thresholds stay (`PRIOR_FOUND` 0.28, `PRIOR_UNSURE` 0.16): the ceiling of photos without the
+mark fell from 0.155 to 0.07, and the real photos rose from a median of 0.25 to 0.52.
+`prior_unsure_on_weak_evidence` now uses the set's photo 5 faded to alpha 0.06 (0.23), since at
+0.12 it scores 0.49.
+
+Real acceptance (`real_small_sets_keep_the_set_position`, now 16 sets: the 8 triples and the 8
+subsets of 4-7 photos, each as is and cleaned, a fresh session each; strip placement on every
+other photo):
+
+| | before (round 1) | after |
+|---|---|---|
+| 3 photos: strip / step 3 | 32 of 32 (30 Found, 2 Unsure) / 48 of 48 (46 Found, 2 Unsure) | 32 of 32 Found / 48 of 48 Found |
+| 4-7 photos: strip / step 3 | 68 of 72 / 84 of 88 (36 Found, 48 Unsure), 4 NotFound | 72 of 72 Found / 88 of 88 Found |
+| strip placement, 24 MP | 0.94 s median, 2.06 s max (triples); 0.53 s median, 7.81 s max (4-7) | 0.45 s median, 1.26 s max (all 16 sets) |
+| Found elsewhere | 0 | 0 |
+
+8 + 1 acceptance (`real_group_from_the_first_guess`): group 1 8 Found, 0 Unsure, all at the saved
+place (was 6 Found, 2 Unsure); strip 2 of 2 Found, 1.11 s at most; match_all 1.1 s.
+
+Synthetic first guesses (`puw-dev guess --all`, Core ML): fixed unchanged (recall 1.000,
+coverage 2.61 %); random unchanged from round 1 (recall mean 0.975, min 0.704); styles recall mean
+0.805 -> 0.796 (styles/04, 0.047 -> 0.002: the old median layer, 20 components of scene, happened
+to cover 5 % of that photo's mark; the detector finds none of it either way), coverage mean 11.55
+-> 10.01 %.
+
+Memory and time: `build_set_layers` keeps each sampled photo at long side 1536 as well, 2 bytes
+per pixel (3 MB for a 3:2 photo, 72 MB for 24), on top of `BATCH_LUMA_BUDGET`; set 1's 8 photos
+take 5.6 s (was 4.3 s).
 
 ## Detector specks in the first guess (Plan 2 fix wave, C1)
 
