@@ -549,6 +549,99 @@ Memory and time: `build_set_layers` keeps each sampled photo at long side 1536 a
 per pixel (3 MB for a 3:2 photo, 72 MB for 24), on top of `BATCH_LUMA_BUDGET`; set 1's 8 photos
 take 5.6 s (was 4.3 s).
 
+### Review fixes: static scene, clean photos, edited drawings (fix round 1)
+
+The review of rounds 1-2 built synthetic sets (fixed set scenes, 1536x1024) where a set
+position gave a false `Found`. The same sets are now committed tests (`patch_set` in
+`tests/pipeline.rs`): a 340 x 250 patch of static scene on every photo, and the fixed mark
+either moving between photos ("A") or fixed but missing from the last photo ("B"). The patch is
+far from the mark or ends 8 px above it. The drawing is the first guess, emulated as
+`dilate(mark | layer, grow_for(0.004))`.
+
+| case (3, 4, 5, 8 photos) | 2170b2b | now |
+|---|---|---|
+| A far: moving mark | every other photo `Found` at the saved place (0.36-0.87), its mark not covered | cautious prior: the search places the moved marks where they are, as `Unsure` (0.37-0.58); one is not found |
+| A next to the patch | `Found` at the saved place (0.38-0.94), mark not covered | cautious prior: `Unsure` where the mark is (0.51-0.57), NotFound (0.26-0.34) or once `Unsure` (0.37) where it is not; never `Found` |
+| B far: clean last photo | clean photo `Found` (0.61-0.70) at 3-4 photos | clean photo NotFound (0.17-0.23); the marked photos `Found` at their mark |
+| B next to the patch | clean photo `Found` (0.45-0.80) at 3-5 photos | clean photo NotFound (0.28) at 3-4 photos, `Unsure` 0.45 / 0.17 at 5 / 8 (set position, a part of the layer missing) |
+
+Three causes, three changes (`pipeline::PositionPrior`, `match_with`):
+1. The first guess always holds the layer, so rule 1 held for every untouched guess. Now the
+   set must also explain the drawing (`explained_by_set`): no connected stretch of the drawing
+   farther than `PRIOR_REACH` (2.4 % of the long side) from the layer may hold more than
+   `PRIOR_UNEXPLAINED` 0.1 of it, unless the set's own edges over the far part stand out from
+   the photo's edges by at least `PRIOR_FAR_EDGES` 0.05 of how much they stand out over the
+   layer.
+   - Far part: real set-a triples' first guesses 0.09-0.25 in all (a layer of 3 photos misses
+     stretches of the faint mark); the 8-photo guess 0.107 in three blobs of scene of 0.04
+     each; the synthetic static-patch cases 0.24-0.44.
+   - Edge ratio of the far part: real triples 0.13-0.47 (the mark is there, too faint for the
+     layer); synthetic -0.09 to -0.03 (nothing is stamped there).
+   - A first version counted the whole far part against 0.1. It refused the 8-photo guess
+     (0.107), and the search then put a photo `Found` elsewhere. That led to the next point.
+   When the drawing holds part of the layer but the set does not support its position, the
+   prior now stays "cautious" (`PositionPrior::supports` false). Nothing is scored at the
+   saved position, and a search `Found` that does not overlap the saved placement by
+   `PRIOR_AGREE` 0.8 is `Unsure`. A drawing that holds no layer at all gets no prior, and the
+   search decides as before.
+2. Static scene in the same stencil as the mark lifted a clean photo. Rule 1 now also scores each
+   part of the layer under the drawing on its own: components grouped closer than
+   `PRIOR_PART_NEAR` 1 % of the long side, parts of at least `PRIOR_PART_MIN` 0.3 of the largest.
+   A photo whose weakest part scores under `PRIOR_UNSURE` is at most `Unsure`.
+   - Measured as the minimum over parts: synthetic marked photos 0.50-0.69, the clean photo
+     beside the patch 0.11-0.15; real set-a subsets of 3-8 photos 0.23-0.51. Counting every
+     small part as well drops real photos to 0.15, which is why small parts are left out.
+   - A plain minimum over parts as the score would have made most real photos Unsure, so the
+     parts only veto `Found`.
+3. With a set position, too (score under `PRIOR_UNSURE`), a search `Found` that does not
+   overlap the saved placement by `PRIOR_AGREE` is `Unsure`. On the real burst sets the search
+   found the moved scene at 0.68. A mark that really moved inside a fixed set keeps its place
+   and score, but is opened by the person.
+
+The owner's failing triple (a random 3 of set-a's 8, step 3: the reference Found, one photo
+Unsure with the drawing misplaced, one NotFound) came from an edited drawing: the owner erased
+the red blobs of scene from the first guess. Those blobs are parts of the 3-photo layer (scene the
+three photos share). Rule 1 asked 90 % of the whole layer to lie in the drawing, so erasing them
+left rule 2, which scores the reference's own edges. The faint mark scored low there, and the
+search found the scene. Rule 1 now looks only at the layer components that reach into the
+drawing: a component the person erased whole is scene, not the mark.
+
+All 56 triples of set-a, each with seven drawings (`timings.rs`
+`real_triples_with_edited_drawings`: the first guess as is, cleaned, everything farther than
+1 % of the long side from the mark erased, a band across the middle erased, four brush dots on
+the scene, grown and shrunk by 8 px; 112 photos per drawing):
+
+| drawing | 2170b2b | now |
+|---|---|---|
+| as is, cleaned, middle erased, brush dots, grown 8 px, shrunk 8 px | 112 of 112 `Found` at the saved place, each | 97 `Found`, 15 `Unsure` at the saved place, each; none elsewhere, none not found |
+| scene parts erased | 82 `Found` and 12 `Unsure` at the saved place, 10 not found, 5 `Unsure` and 3 `Found` elsewhere (15 of 56 triples wrong) | 112 of 112 `Found` at the saved place |
+
+The 15 `Unsure` photos come from 9 triples whose 3-photo layer holds a part (at least 0.3 of the
+largest) that scores under `PRIOR_UNSURE` on the other photos. On one of them the whole layer scores
+0.51, so only the part veto holds it back. Erasing the scene parts of the guess removes those parts
+from the drawing, and then all 112 photos are `Found`. This is the price of the I1 fix:
+`Unsure` there is opened by the person and not trusted blindly.
+
+Synthetic tests added: `static_scene_never_places_a_moving_mark`,
+`clean_photo_of_the_set_is_not_found` (B far and next, 3/4/5/8 photos),
+`erased_scene_part_keeps_the_set_position`, `thin_mark_in_a_generous_drawing_keeps_the_set_position`
+(pins `PRIOR_LAYER_SHARE` 0.05: the layer share 0.05-0.1, refused at 0.1),
+`photos_of_one_shoot_give_the_mark` and `photos_of_one_shoot_keep_the_set_position` (6 shots
+with 3 lined up). `prior_never_places_a_moving_mark` part 1 now uses the first guess, with a
+premise that the set has a layer. `prior_matches_a_drawing_grown_beyond_the_mark` grows the
+drawing by 36 px, as far as `PRIOR_REACH` lets it reach at 1536 (60 px is now refused: 30 % of
+it far from the layer, where the set shows nothing).
+
+Real acceptance with this code (Core ML):
+- `real_group_from_the_first_guess` (now asserts all 8 photos of the fixed set at the saved
+  place): 2 of 2 strip photos `Found` at the same place, 2.01 s at most (was 1.1-1.3 s: the
+  set's explanation of the drawing reads the layer at full size); group 1 8 `Found`, 0 elsewhere;
+  match_all 2.5 s (was 1.1-1.3 s).
+- `real_small_sets_keep_the_set_position` (16 sets, now asserts at most one set per size left
+  `Unsure`): 104 of 104 strip photos and 136 of 136 step-3 photos at the true place, 0
+  elsewhere. 3 photos: strip 28 `Found` and 4 `Unsure`, step 3 44 `Found` and 4 `Unsure` (one
+  triple, as is and cleaned). 4-7 photos: all `Found`. Strip 0.89 s median, 2.29 s max.
+
 ## Detector specks in the first guess (Plan 2 fix wave, C1)
 
 The first guess used to keep every component the detector found, union it with the batch layer
