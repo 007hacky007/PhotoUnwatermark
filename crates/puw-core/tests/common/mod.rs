@@ -33,7 +33,12 @@ fn workspace_root() -> &'static Path {
 }
 
 /// Synthetic test sets in `<workspace>/target/synth`, generated with tools/synth/make_sets.py
-/// when the folder is missing.
+/// when the folder is missing or incomplete.
+///
+/// A finished folder holds a `.complete` marker, written after generation succeeds. Without it
+/// the folder is treated as incomplete and rebuilt: a CI cache restore of `target/` can bring
+/// back an empty folder tree whose files were not cached, and a bare existence check would
+/// accept it.
 ///
 /// Tests in one binary share a single generation through a `OnceLock`. Separate test binaries
 /// may race, so each generates into its own `target/synth.tmp-<pid>` and renames it into place;
@@ -43,13 +48,19 @@ pub fn synth_dir() -> PathBuf {
     DIR.get_or_init(|| {
         let root = workspace_root();
         let dir = root.join("target").join("synth");
-        if !dir.exists() {
+        if !dir.join(COMPLETE_MARKER).is_file() {
+            // Only a folder without the marker is removed, so a complete one is never deleted.
+            if dir.exists() && !dir.join(COMPLETE_MARKER).is_file() {
+                let _ = std::fs::remove_dir_all(&dir);
+            }
             generate_into(root, &dir);
         }
         dir
     })
     .clone()
 }
+
+const COMPLETE_MARKER: &str = ".complete";
 
 fn generate_into(root: &Path, dir: &Path) {
     let tmp = dir.with_file_name(format!("synth.tmp-{}", std::process::id()));
@@ -72,10 +83,14 @@ fn generate_into(root: &Path, dir: &Path) {
         let _ = std::fs::remove_dir_all(&tmp);
         panic!("make_sets.py failed: {status}");
     }
+    std::fs::write(tmp.join(COMPLETE_MARKER), "ok").expect("write the completion marker");
     if let Err(err) = std::fs::rename(&tmp, dir) {
-        // Another test binary finished first; its folder is complete because it was renamed
-        // into place only after generation succeeded.
+        // Another test binary may have finished first; use its folder if it is complete.
         let _ = std::fs::remove_dir_all(&tmp);
-        assert!(dir.is_dir(), "rename {} failed: {err}", tmp.display());
+        assert!(
+            dir.join(COMPLETE_MARKER).is_file(),
+            "rename {} failed: {err}",
+            tmp.display()
+        );
     }
 }
