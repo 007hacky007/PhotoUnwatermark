@@ -10,9 +10,9 @@
     onDragDrop,
     removePhoto,
     suggestSaved,
-    useSaved,
   } from '../lib/api';
   import { copy } from '../lib/copy';
+  import { startFromSaved } from '../lib/groups';
   import { stopJob, stopping } from '../lib/jobs.svelte';
   import type { DetectOutcome, PhotoInfo, ProgressEvent, Skipped, Suggestion, UserError } from '../lib/types';
   import { sameSet, type Wizard } from '../lib/wizard.svelte';
@@ -194,7 +194,7 @@
     wizard.busy = true;
     try {
       await stopCheck();
-      wizard.useGroup(await useSaved(id), ids);
+      await startFromSaved(wizard, id, ids);
     } catch (e) {
       error = (e as Partial<UserError> | null)?.message || copy.saved.useFailed;
       return;
@@ -203,6 +203,19 @@
       wizard.busy = false;
     }
     wizard.go('checkAll');
+  }
+
+  /** Saved watermarks: with photos to start a group for, each one can be used for them. */
+  async function openSaved() {
+    if (adding || job !== null) return;
+    adding = true;
+    try {
+      await stopCheck();
+    } finally {
+      adding = false;
+    }
+    wizard.savedMode = photos.length > 0 ? 'choose' : 'manage';
+    wizard.go('saved');
   }
 
   function leave() {
@@ -289,7 +302,7 @@
     {/if}
 
     <footer>
-      <button type="button" onclick={() => wizard.go('saved')}>{copy.addPhotos.savedWatermarks}</button>
+      <button type="button" onclick={openSaved}>{copy.addPhotos.savedWatermarks}</button>
       <button
         type="button"
         class="primary"

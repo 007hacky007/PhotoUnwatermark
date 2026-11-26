@@ -247,7 +247,15 @@
     </fieldset>
 
     <div class="links">
-      <button type="button" onclick={() => wizard.go('saved')}>{copy.settings.savedWatermarks}</button>
+      <button
+        type="button"
+        onclick={() => {
+          wizard.savedMode = 'manage';
+          wizard.go('saved');
+        }}
+      >
+        {copy.settings.savedWatermarks}
+      </button>
       <button type="button" onclick={() => wizard.go('about')}>{copy.settings.about}</button>
     </div>
 

@@ -1,8 +1,9 @@
 <script lang="ts">
   import { onMount } from 'svelte';
-  import { deleteSaved, imageUrl, listSaved, renameSaved } from '../lib/api';
+  import { deleteSaved, imageUrl, listPhotos, listSaved, renameSaved } from '../lib/api';
   import Dialog from '../lib/components/Dialog.svelte';
   import { copy } from '../lib/copy';
+  import { startFromSaved } from '../lib/groups';
   import type { SavedInfo, UserError } from '../lib/types';
   import type { Wizard } from '../lib/wizard.svelte';
 
@@ -17,6 +18,9 @@
   let deleting: SavedInfo | null = $state(null);
   let deleteError: string | null = $state(null);
   let working = $state(false);
+  /** 'choose' (opened for photos that need a watermark): each row can start the next group. */
+  const choosing = $derived(wizard.savedMode === 'choose');
+  let useError: string | null = $state(null);
 
   const messageOf = (e: unknown, fallback: string) => (e as Partial<UserError> | null)?.message || fallback;
 
@@ -95,6 +99,25 @@
     await refresh();
   }
 
+  /** Starts the next group from `w` for the photos with no group, then shows it in step 3. */
+  async function use(w: SavedInfo) {
+    if (working) return;
+    working = true;
+    useError = null;
+    wizard.busy = true;
+    try {
+      const ids = (await listPhotos()).map((p) => p.id);
+      await startFromSaved(wizard, w.id, ids);
+    } catch (e) {
+      useError = messageOf(e, copy.saved.useFailed);
+      return;
+    } finally {
+      working = false;
+      wizard.busy = false;
+    }
+    wizard.go('checkAll');
+  }
+
   function closeDelete() {
     if (working) return;
     deleting = null;
@@ -106,12 +129,15 @@
 
 <section class="saved">
   <div class="top">
-    <button type="button" onclick={() => wizard.back()}>{copy.common.back}</button>
+    <button type="button" disabled={working} onclick={() => wizard.back()}>{copy.common.back}</button>
     <h1>{copy.saved.title}</h1>
   </div>
 
   {#if error !== null}
     <p class="error" role="alert">{error}</p>
+  {/if}
+  {#if useError !== null}
+    <p class="error" role="alert">{useError}</p>
   {/if}
 
   {#if list !== null && list.length === 0}
@@ -147,6 +173,17 @@
           </div>
           {#if editing !== w.id}
             <div class="buttons">
+              {#if choosing}
+                <button
+                  type="button"
+                  class="primary"
+                  aria-label={copy.saved.useOne(w.name)}
+                  disabled={working}
+                  onclick={() => use(w)}
+                >
+                  {copy.saved.useForThese}
+                </button>
+              {/if}
               <button type="button" aria-label={copy.saved.renameOne(w.name)} onclick={() => startRename(w)}>
                 {copy.saved.rename}
               </button>

@@ -13,6 +13,7 @@ vi.mock('../lib/api', () => ({
   detect: vi.fn(),
   useSaved: vi.fn(),
   photoStates: vi.fn(),
+  groupsState: vi.fn(),
   listSaved: vi.fn(),
   imageUrl: vi.fn((route: string, id: number) => `puw://${route}/${id}`),
   onDragDrop: vi.fn(),
@@ -76,7 +77,7 @@ describe('Add photos', () => {
     const { wizard } = await start();
     vi.mocked(api.listSaved).mockResolvedValueOnce([]);
     await fireEvent.click(screen.getByRole('button', { name: copy.addPhotos.savedWatermarks }));
-    expect(wizard.screen).toBe('saved');
+    await waitFor(() => expect(wizard.screen).toBe('saved'));
     expect(await screen.findByText(copy.saved.empty)).toBeTruthy();
   });
 
@@ -390,6 +391,42 @@ describe('Add photos', () => {
     await fireEvent.click(await screen.findByRole('button', { name: copy.common.downloadAgain }));
     expect(wizard.screen).toBe('welcome');
     expect(wizard.busy).toBe(false);
+  });
+
+  it('savedLinkStopsTheCheckAndOpensChooseMode', async () => {
+    let taken: () => void = () => {};
+    cancelJob.mockImplementation(() => new Promise<void>((r) => (taken = r)));
+    const { wizard } = await checkRunning();
+    vi.mocked(api.listSaved).mockResolvedValue([{ id: 's1', name: 'Studio', created: '2026-11-20T10:00:00Z' }]);
+    await fireEvent.click(screen.getByRole('button', { name: copy.addPhotos.savedWatermarks }));
+    await waitFor(() => expect(cancelJob).toHaveBeenCalledTimes(1));
+    // The next screen waits until the check's stop is taken.
+    await new Promise((r) => setTimeout(r, 0));
+    expect(wizard.screen).toBe('add');
+    taken();
+    await waitFor(() => expect(wizard.screen).toBe('saved'));
+    expect(wizard.savedMode).toBe('choose');
+    expect(await screen.findByRole('button', { name: copy.saved.useOne('Studio') })).toBeTruthy();
+  });
+
+  it('savedLinkWithoutPhotosManages', async () => {
+    const { wizard } = await start();
+    wizard.savedMode = 'choose';
+    vi.mocked(api.listSaved).mockResolvedValue([{ id: 's1', name: 'Studio', created: '2026-11-20T10:00:00Z' }]);
+    await fireEvent.click(screen.getByRole('button', { name: copy.addPhotos.savedWatermarks }));
+    await waitFor(() => expect(wizard.screen).toBe('saved'));
+    expect(wizard.savedMode).toBe('manage');
+    await screen.findByAltText('Studio');
+    expect(screen.queryByRole('button', { name: copy.saved.useOne('Studio') })).toBeNull();
+    expect(cancelJob).not.toHaveBeenCalled();
+  });
+
+  it('noBannedWordsRenderedWithTheUseButton', async () => {
+    const { container } = await start([photo(1)]);
+    vi.mocked(api.listSaved).mockResolvedValue([{ id: 's1', name: 'Studio', created: '2026-11-20T10:00:00Z' }]);
+    await fireEvent.click(screen.getByRole('button', { name: copy.addPhotos.savedWatermarks }));
+    await screen.findByRole('button', { name: copy.saved.useOne('Studio') });
+    assertPlainText(container);
   });
 
   it('noBannedWordsRendered', async () => {

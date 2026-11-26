@@ -13,6 +13,9 @@ vi.mock('../lib/api', () => ({
   listSaved: vi.fn(),
   renameSaved: vi.fn(),
   deleteSaved: vi.fn(),
+  listPhotos: vi.fn(),
+  useSaved: vi.fn(),
+  cancelJob: vi.fn(),
   imageUrl: vi.fn((route: string, id: string) => `puw://${route}/${id}`),
   openReleasesPage: vi.fn(),
   RELEASES_URL: 'https://github.com/007hacky007/PhotoUnwatermark/releases',
@@ -36,6 +39,8 @@ const listSaved = vi.mocked(api.listSaved);
 const renameSaved = vi.mocked(api.renameSaved);
 const deleteSaved = vi.mocked(api.deleteSaved);
 const openReleasesPage = vi.mocked(api.openReleasesPage);
+const listPhotos = vi.mocked(api.listPhotos);
+const useSaved = vi.mocked(api.useSaved);
 
 const status = (platform: string): AppStatus => ({ modelsReady: true, missingBytes: 0, platform, version: '1.2.3' });
 const defaults: SettingsData = {
@@ -244,8 +249,11 @@ describe('Settings', () => {
 
   it('linksToSavedAndAbout', async () => {
     const { wizard } = await openSettings();
+    wizard.savedMode = 'choose';
     await fireEvent.click(screen.getByRole('button', { name: copy.settings.savedWatermarks }));
     expect(wizard.screen).toBe('saved');
+    // From Settings the saved watermarks are only managed.
+    expect(wizard.savedMode).toBe('manage');
     wizard.back();
     await fireEvent.click(screen.getByRole('button', { name: copy.settings.about }));
     expect(wizard.screen).toBe('about');
@@ -266,15 +274,28 @@ describe('Settings', () => {
 
 const saved = (id: string, name: string): SavedInfo => ({ id, name, created: '2026-11-20T10:00:00Z' });
 
-async function openSaved(list: SavedInfo[]) {
+async function openSaved(list: SavedInfo[], wizard = createWizard()) {
   listSaved.mockResolvedValue(list);
-  const wizard = createWizard();
-  wizard.go('settings');
+  if (wizard.screen === 'welcome') wizard.go('settings');
   wizard.go('saved');
   const view = render(SavedWatermarks, { wizard });
   await waitFor(() => expect(listSaved).toHaveBeenCalled());
   return { wizard, ...view };
 }
+
+/** A wizard in step 3 of group 1 that opened the saved watermarks to choose one. */
+function choosing(): ReturnType<typeof createWizard> {
+  const wizard = createWizard();
+  wizard.go('add');
+  wizard.startDraft({ sample: [1], representative: 1 }, [1, 2]);
+  wizard.confirmDraft();
+  wizard.go('check');
+  wizard.go('checkAll');
+  wizard.savedMode = 'choose';
+  return wizard;
+}
+
+const photo = (id: number) => ({ id, name: `p${id}.jpg`, folder: '/x', width: 10, height: 10 });
 
 describe('Saved watermarks', () => {
   beforeEach(() => {
@@ -367,10 +388,66 @@ describe('Saved watermarks', () => {
     expect(wizard.screen).toBe('settings');
   });
 
+  it('chooseModeOffersUse', async () => {
+    listPhotos.mockResolvedValue([photo(1), photo(2), photo(3)]);
+    useSaved.mockResolvedValue(2);
+    const { wizard } = await openSaved([saved('a1', 'Studio'), saved('b2', 'Wedding')], choosing());
+    const use = await screen.findByRole('button', { name: copy.saved.useOne('Wedding') });
+    expect(use.textContent?.trim()).toBe(copy.saved.useForThese);
+    expect(screen.getByRole('button', { name: copy.saved.useOne('Studio') })).toBeTruthy();
+    await fireEvent.click(use);
+    await waitFor(() => expect(wizard.screen).toBe('checkAll'));
+    expect(useSaved).toHaveBeenCalledWith('b2');
+    expect(wizard.groups).toBe(2);
+    expect(wizard.current).toEqual({ group: 2, outcome: null });
+    // Only group 1 keeps the photo list it was made for.
+    expect(wizard.outcomePhotos).toEqual([1, 2]);
+    expect(wizard.busy).toBe(false);
+  });
+
+  it('useFromAddPhotosStartsGroupOne', async () => {
+    listPhotos.mockResolvedValue([photo(1), photo(2), photo(3)]);
+    useSaved.mockResolvedValue(1);
+    const wizard = createWizard();
+    wizard.go('add');
+    wizard.savedMode = 'choose';
+    await openSaved([saved('a1', 'Studio')], wizard);
+    await fireEvent.click(await screen.findByRole('button', { name: copy.saved.useOne('Studio') }));
+    await waitFor(() => expect(wizard.screen).toBe('checkAll'));
+    expect(wizard.current).toEqual({ group: 1, outcome: null });
+    expect(wizard.outcomePhotos).toEqual([1, 2, 3]);
+  });
+
+  it('failedUseSaysSo', async () => {
+    listPhotos.mockResolvedValue([photo(1)]);
+    useSaved.mockRejectedValue({ message: '', details: 'x' });
+    const { wizard, container } = await openSaved([saved('a1', 'Studio')], choosing());
+    await fireEvent.click(await screen.findByRole('button', { name: copy.saved.useOne('Studio') }));
+    expect(await screen.findByText(copy.saved.useFailed)).toBeTruthy();
+    expect(wizard.screen).toBe('saved');
+    expect(wizard.groups).toBe(1);
+    expect(wizard.busy).toBe(false);
+    assertPlainText(container);
+  });
+
+  it('manageModeHasNoUse', async () => {
+    await openSaved([saved('a1', 'Studio')]);
+    await screen.findByAltText('Studio');
+    expect(screen.queryByRole('button', { name: copy.saved.useOne('Studio') })).toBeNull();
+    expect(screen.queryByText(copy.saved.useForThese)).toBeNull();
+    expect(screen.getByRole('button', { name: copy.saved.renameOne('Studio') })).toBeTruthy();
+  });
+
   it('noBannedWordsRendered', async () => {
     const { container } = await openSaved([saved('a1', 'Studio')]);
     await screen.findByAltText('Studio');
     await fireEvent.click(screen.getByRole('button', { name: copy.saved.renameOne('Studio') }));
+    assertPlainText(container);
+  });
+
+  it('noBannedWordsRenderedWhenChoosing', async () => {
+    const { container } = await openSaved([saved('a1', 'Studio')], choosing());
+    await screen.findByRole('button', { name: copy.saved.useOne('Studio') });
     assertPlainText(container);
   });
 });
