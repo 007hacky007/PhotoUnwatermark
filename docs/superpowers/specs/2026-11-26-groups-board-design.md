@@ -64,7 +64,9 @@ Problems they hit with the current build:
 
 - All Plan 2 rules hold: copy only in app/src/lib/copy.ts, api.ts the only Tauri importer, no Unicode dashes, plain
   words, no real photos or real photo names in the repo, Core ML on Apple silicon, CPU fallback, one job at a time
-  with per-call tickets, Stop on every long job.
+  with per-call tickets, Stop on every long job. One exception to "one job at a time" (owner's choice): finding runs
+  in the background while the person works on the groups screen; plain board calls (moves, painting, spots, picks)
+  run alongside it, every other job waits for it.
 - Speed budget (Windows VM, CPU only, 1536x1024): first guess about 40-55 s per sample photo; matching about 0.2 s per
   photo with a clean drawing. On Apple silicon the first guess is about 3 s per 24 MP photo.
 - More photos help finding only for photos of the same pixel size: the set layer (median of edges across photos)
@@ -99,12 +101,33 @@ Steps: **1 Add photos, 2 Finding watermarks, 3 Check the groups, 4 Choose photos
   automatically in step 2 (below).
 - Button: "Find watermarks".
 
-### 2 Finding watermarks
+### 2 Finding watermarks (until the first group exists)
 
-- One progress bar for the whole set, a live line ("Found 2 watermarks so far. Group 1: 140 photos. Group 2: 52
-  photos. Still looking at 38 photos."), and "Stop and check what was found" (photos not yet sorted go to
-  "Not grouped"). Back returns to Add photos and drops the result.
-- How the groups are made (see the next section). Finding ends on the groups screen.
+- One progress bar and a live line, as below. As soon as the first group exists (a saved watermark found, or the
+  first round's group), the app opens the groups screen by itself and finding goes on in the background (owner's
+  choice, added after approval: "If anything happens in the background, let the user know with visible progress and
+  live state update"). Back returns to Add photos and stops and drops the finding.
+- How the groups are made (see the next section).
+
+### Finding in the background (owner's choice)
+
+- While finding goes on, the groups screen shows a progress strip above the rows: a bar, the live line ("Finding
+  watermarks: found 2 so far. Group 1: 140 photos. Group 2: 52 photos. Still looking at 38 photos.") and "Stop
+  looking" (photos not yet sorted go to "Not grouped"). When finding ends, the strip says so briefly ("Finding done:
+  3 groups, 12 photos not grouped.") and then goes away; when the round cap stopped it, it says that instead and
+  stays until closed.
+- The board updates live: new groups appear as rows, photos move from the "Still looking" count into rows, counts
+  change as they happen. A new group or photo that arrives gets a short highlight so the change is seen. Nothing the
+  person is doing is interrupted: the current group, the photo in the editor, a drag in progress, a selection and
+  the editor's view stay as they are.
+- While finding runs the person can paint, erase, use both Move drawing tools, drag photos between groups, pick the
+  current group and look at photos. Finding never moves a photo the person has placed or settled, and never changes
+  a group's shape. A photo the person dragged while finding was about to sort it stays where the person put it.
+- Actions that need the app's full attention wait while finding runs and say why next to them ("Waiting for the
+  search to finish"): "Look for this watermark in the not grouped photos", "Preview on this photo", "Copy drawing
+  from..." with a saved watermark, Add more photos, and "Next: choose photos to clean".
+- Every background job in the app follows the same rule: visible progress and a live state update on the screen
+  that shows its results, never a silent change.
 
 ### 3 Check the groups
 
@@ -215,13 +238,19 @@ edited gets no row; an edited one offers "<saved name> (edited)").
    progress line says when the cap stopped the search.
 5. "Found 2 watermarks so far" counts groups.
 
-**Time budget (owner's choice).** Finding for about 200 photos of 24 MP must finish within about 5 minutes on the
-owner's Mac (Apple silicon, Core ML), on a mix of 2-3 watermarks. Measured today, matching costs about 4 s per 24 MP
+**Time budget (owner's choice, Windows added after approval).** Finding for about 200 photos of 24 MP must finish
+within about 5 minutes, on a mix of 2-3 watermarks, both on the owner's Mac (Apple silicon, Core ML) and on a Windows
+PC without a usable graphics card (the Windows test VM is the reference). The owner finds even 5 minutes long, so the
+groups screen must open early: the first group within about 40 s on the Mac and about 2 minutes on the Windows PC.
+On a PC without a usable graphics card the first guess may be lighter (fewer scales and segmenters, fewer sample
+photos per round) and matching may run on smaller copies, at the cost of rougher first drawings there; which
+levers and how far is the builder's call, measured against the synthetic sets' recall so the loss is known and
+recorded. If the budget cannot be met, the builder stops and reports instead of relaxing it. Measured today, matching costs about 4 s per 24 MP
 photo per drawing tried, and a full search on a photo without the watermark 7.8 s, so this needs engine speed work
 first, which is allowed to trade some first-spot precision (the person fixes spots on the board): for example
 matching on smaller copies of the photos, reading and decoding each photo once for all drawings and rounds, trying
-the fast same-spot test before the full search, and trying saved watermarks on a sample first. The Windows PC time
-is measured and recorded, not capped. Timings go in docs/notes as aggregates.
+the fast same-spot test before the full search, and trying saved watermarks on a sample first. Timings go in
+docs/notes as aggregates.
 
 ## What changes in today's app
 
