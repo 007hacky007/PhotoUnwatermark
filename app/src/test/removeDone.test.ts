@@ -1,7 +1,7 @@
 import { fireEvent, render, screen, waitFor, within } from '@testing-library/svelte';
 import { tick } from 'svelte';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
-import type { ProgressEvent, RemoveReport } from '../lib/types';
+import type { GroupInfo, GroupsState, ProgressEvent, RemoveReport } from '../lib/types';
 
 vi.mock('../lib/api', () => ({
   appStatus: vi.fn(),
@@ -14,6 +14,7 @@ vi.mock('../lib/api', () => ({
   cancelJob: vi.fn(),
   saveWatermark: vi.fn(),
   defaultWatermarkName: vi.fn(),
+  groupsState: vi.fn(),
   clearPhotos: vi.fn(),
   revealItemInDir: vi.fn(),
   onCloseRequested: vi.fn(),
@@ -39,6 +40,7 @@ const m = {
   cancelJob: vi.mocked(api.cancelJob),
   saveWatermark: vi.mocked(api.saveWatermark),
   defaultWatermarkName: vi.mocked(api.defaultWatermarkName),
+  groupsState: vi.mocked(api.groupsState),
   clearPhotos: vi.mocked(api.clearPhotos),
   revealItemInDir: vi.mocked(api.revealItemInDir),
   onCloseRequested: vi.mocked(api.onCloseRequested),
@@ -87,6 +89,21 @@ function stepFour(platform = 'windows'): Wizard {
 }
 
 const report = (r: Partial<RemoveReport> = {}): RemoveReport => ({ done: [], failed: [], leftOut: [], cancelled: false, ...r });
+const info = (number: number, g: Partial<GroupInfo> = {}): GroupInfo => ({
+  number,
+  photos: 2,
+  savedName: null,
+  edited: false,
+  canSave: true,
+  ...g,
+});
+const state = (...groups: GroupInfo[]): GroupsState => ({
+  groups,
+  current: groups.at(-1)?.number ?? null,
+  matched: true,
+  leftovers: 0,
+  unreadable: 0,
+});
 const done = (id: number, output = `/photos/Without watermark/p${id}.jpg`) => ({ id, output });
 
 function wizardWith(r: RemoveReport): Wizard {
@@ -133,6 +150,7 @@ beforeEach(() => {
   m.closeWindow.mockResolvedValue();
   m.defaultWatermarkName.mockResolvedValue('Watermark from 2026-11-25');
   m.saveWatermark.mockResolvedValue('w1');
+  m.groupsState.mockResolvedValue(state(info(1)));
   m.onCloseRequested.mockImplementation(async (h) => {
     closeHandler = h;
     return unlisten as unknown as () => void;
@@ -583,7 +601,7 @@ describe('Done', () => {
     first.unmount();
     // Done -> Settings -> Back shows the step again.
     render(Done, { wizard });
-    expect(screen.getByText(copy.done.savedWatermark)).toBeTruthy();
+    expect(await screen.findByText(copy.done.savedWatermark)).toBeTruthy();
     expect(screen.queryByRole('button', { name: copy.done.saveWatermark })).toBeNull();
     expect(screen.getByText('Photo 2 of 3')).toBeTruthy();
     expect(screen.getByAltText(copy.beforeAfter.before).getAttribute('src')).toBe('puw://original/2');
@@ -604,17 +622,6 @@ describe('Done', () => {
     expect(screen.queryByRole('button', { name: 'Save this watermark for next time' })).toBeNull();
   });
 
-  it('saveWatermarkSavesTheCurrentGroup', async () => {
-    const wizard = wizardWith(report({ done: [done(1)] }));
-    wizard.useGroup(2);
-    render(Done, { wizard });
-    await screen.findByDisplayValue('Watermark from 2026-11-25');
-    await fireEvent.click(screen.getByRole('button', { name: copy.done.saveWatermark }));
-    expect(await screen.findByText(copy.done.savedWatermark)).toBeTruthy();
-    expect(m.saveWatermark).toHaveBeenCalledWith(2, 'Watermark from 2026-11-25');
-    expect(wizard.savedGroups).toEqual([2]);
-  });
-
   it('saveWatermarkTakesTheTypedNameAndNeedsOne', async () => {
     stepFive(report({ done: [done(1)] }));
     const field = (await screen.findByDisplayValue('Watermark from 2026-11-25')) as HTMLInputElement;
@@ -629,6 +636,75 @@ describe('Done', () => {
     await fireEvent.click(screen.getByRole('button', { name: copy.done.saveWatermark }));
     expect(m.saveWatermark).toHaveBeenLastCalledWith(1, 'Studio');
     expect(await screen.findByText(copy.done.savedWatermark)).toBeTruthy();
+  });
+
+  it('leftOutListed', async () => {
+    stepFive(report({ done: [done(1)], leftOut: [{ id: 5, name: 'a.jpg' }, { id: 6, name: 'b.jpg' }] }));
+    expect(await screen.findByText('Left out: 2 photos')).toBeTruthy();
+    expect(screen.getByText('a.jpg')).toBeTruthy();
+    expect(screen.getByText('b.jpg')).toBeTruthy();
+  });
+
+  it('oneSaveRowPerGroup', async () => {
+    m.groupsState.mockResolvedValue(state(info(1), info(2)));
+    stepFive(report({ done: [done(1)] }));
+    const one = await screen.findByLabelText(copy.done.groupName(1));
+    const two = screen.getByLabelText(copy.done.groupName(2));
+    expect((one as HTMLInputElement).value).toBe('Watermark from 2026-11-25 (group 1)');
+    expect((two as HTMLInputElement).value).toBe('Watermark from 2026-11-25 (group 2)');
+    expect(screen.getAllByRole('button', { name: copy.done.saveWatermark })).toHaveLength(2);
+  });
+
+  it('savedGroupWithoutEditsHasNoRow', async () => {
+    m.groupsState.mockResolvedValue(state(info(1, { savedName: 'Studio', canSave: false }), info(2)));
+    stepFive(report({ done: [done(1)] }));
+    expect(await screen.findByLabelText(copy.done.groupName(2))).toBeTruthy();
+    expect(screen.queryByLabelText(copy.done.groupName(1))).toBeNull();
+    expect(screen.getAllByRole('button', { name: copy.done.saveWatermark })).toHaveLength(1);
+  });
+
+  it('editedSavedGroupDefaultsToTheEditedName', async () => {
+    m.groupsState.mockResolvedValue(state(info(1, { savedName: 'Studio', edited: true })));
+    stepFive(report({ done: [done(1)] }));
+    expect(await screen.findByDisplayValue('Studio (edited)')).toBeTruthy();
+    await fireEvent.click(screen.getByRole('button', { name: copy.done.saveWatermark }));
+    expect(m.saveWatermark).toHaveBeenCalledWith(1, 'Studio (edited)');
+  });
+
+  it('savedShowsPerGroup', async () => {
+    m.groupsState.mockResolvedValue(state(info(1), info(2)));
+    const wizard = wizardWith(report({ done: [done(1)] }));
+    const first = render(Done, { wizard });
+    await screen.findByLabelText(copy.done.groupName(2));
+    await fireEvent.click(screen.getAllByRole('button', { name: copy.done.saveWatermark })[1]);
+    expect(await screen.findByText(copy.done.savedWatermark)).toBeTruthy();
+    expect(m.saveWatermark).toHaveBeenCalledWith(2, 'Watermark from 2026-11-25 (group 2)');
+    expect(screen.getAllByText(copy.done.savedWatermark)).toHaveLength(1);
+    expect(screen.getAllByRole('button', { name: copy.done.saveWatermark })).toHaveLength(1);
+    expect(wizard.savedGroups).toEqual([2]);
+    first.unmount();
+    render(Done, { wizard });
+    await screen.findByLabelText(copy.done.groupName(1));
+    expect(screen.getAllByText(copy.done.savedWatermark)).toHaveLength(1);
+    expect(screen.getAllByRole('button', { name: copy.done.saveWatermark })).toHaveLength(1);
+    expect(m.saveWatermark).toHaveBeenCalledTimes(1);
+  });
+
+  it('singleGroupKeepsTheOldDefault', async () => {
+    stepFive(report({ done: [done(1)] }));
+    expect(await screen.findByLabelText(copy.done.name)).toBeTruthy();
+    expect(screen.getByDisplayValue('Watermark from 2026-11-25')).toBeTruthy();
+  });
+
+  it('newSetClearsGroups', async () => {
+    const wizard = stepFive(report({ done: [done(1)] }));
+    await screen.findByDisplayValue('Watermark from 2026-11-25');
+    await fireEvent.click(screen.getByRole('button', { name: copy.done.saveWatermark }));
+    await screen.findByText(copy.done.savedWatermark);
+    await fireEvent.click(screen.getByRole('button', { name: copy.done.startNewSet }));
+    await waitFor(() => expect(wizard.screen).toBe('add'));
+    expect(wizard.savedGroups).toEqual([]);
+    expect(wizard.groups).toBe(0);
   });
 
   it('newSetClearsAndGoesToAdd', async () => {
@@ -653,14 +729,16 @@ describe('Done', () => {
   });
 
   it('noBannedWordsRendered', async () => {
+    m.groupsState.mockResolvedValue(state(info(1), info(2, { savedName: 'Studio', edited: true })));
     stepFive(
       report({
         done: [done(1), done(2)],
         failed: [{ id: 3, name: 'x.jpg', reason: 'The photo could not be read.' }],
+        leftOut: [{ id: 7, name: 'z.jpg' }],
         cancelled: true,
       }),
     );
-    await screen.findByDisplayValue('Watermark from 2026-11-25');
+    await screen.findByDisplayValue('Studio (edited)');
     assertPlainText(document.body);
   });
 });

@@ -8,7 +8,7 @@
   // (arrow buttons, or Left and Right), the photos that could not be finished, and the ways on:
   // open the folder, save the watermark for the next set, start a new set.
   import { onMount } from 'svelte';
-  import { clearPhotos, defaultWatermarkName, imageUrl, revealItemInDir, saveWatermark } from '../lib/api';
+  import { clearPhotos, defaultWatermarkName, groupsState, imageUrl, revealItemInDir, saveWatermark } from '../lib/api';
   import BeforeAfter from '../lib/components/BeforeAfter.svelte';
   import { copy } from '../lib/copy';
   import type { RemoveReport, UserError } from '../lib/types';
@@ -19,18 +19,22 @@
   const c = copy.done;
   const EMPTY: RemoveReport = { done: [], failed: [], leftOut: [], cancelled: false };
   // svelte-ignore state_referenced_locally
-  const group = wizard.current?.group ?? 1;
-
-  // svelte-ignore state_referenced_locally
   const report = wizard.report ?? EMPTY;
   const version = ++visits;
   const fieldId = $props.id();
 
-  let name = $state('');
-  let saving = $state(false);
+  /** One save row per group that can be saved. */
+  interface Row {
+    group: number;
+    name: string;
+    saving: boolean;
+    error: string | null;
+  }
+  let rows: Row[] = $state([]);
+  /** More than one group was made, so names and labels say which. */
+  let several = $state(false);
   /** "Photo X of Y" for screen readers, said when the person browses. */
   let announced = $state('');
-  let saveError: string | null = $state(null);
   let error: string | null = $state(null);
   let starting = $state(false);
 
@@ -53,14 +57,35 @@
   }
 
   onMount(() => {
-    defaultWatermarkName()
-      .then((n) => {
-        if (name === '') name = n;
-      })
-      .catch(() => {
-        // The field stays empty for a name of one's own.
-      });
+    void loadRows();
   });
+
+  async function loadRows() {
+    const base = await defaultWatermarkName().catch(() => '');
+    try {
+      const { groups } = await groupsState();
+      several = groups.length > 1;
+      rows = groups
+        .filter((g) => g.canSave)
+        .map((g) => ({
+          group: g.number,
+          name:
+            g.savedName !== null && g.edited
+              ? c.editedName(g.savedName)
+              : base !== '' && several
+                ? c.groupDefault(base, g.number)
+                : base,
+          saving: false,
+          error: null,
+        }));
+    } catch {
+      // No rows, so nothing to save.
+    }
+  }
+
+  const update = (group: number, change: Partial<Row>) => {
+    rows = rows.map((r) => (r.group === group ? { ...r, ...change } : r));
+  };
 
   function browse(step: number) {
     const next = Math.min(count - 1, Math.max(0, index + step));
@@ -88,22 +113,20 @@
     }
   }
 
-  async function save(e: SubmitEvent) {
+  async function save(e: SubmitEvent, row: Row) {
     e.preventDefault();
-    saveError = null;
-    const chosen = name.trim();
+    const chosen = row.name.trim();
     if (chosen === '') {
-      saveError = copy.saved.emptyName;
+      update(row.group, { error: copy.saved.emptyName });
       return;
     }
-    saving = true;
+    update(row.group, { error: null, saving: true });
     try {
-      await saveWatermark(group, chosen);
-      if (!wizard.savedGroups.includes(group)) wizard.savedGroups = [...wizard.savedGroups, group];
+      await saveWatermark(row.group, chosen);
+      if (!wizard.savedGroups.includes(row.group)) wizard.savedGroups = [...wizard.savedGroups, row.group];
+      update(row.group, { saving: false });
     } catch (err) {
-      saveError = message(err, c.saveFailed);
-    } finally {
-      saving = false;
+      update(row.group, { saving: false, error: message(err, c.saveFailed) });
     }
   }
 
@@ -168,21 +191,40 @@
     </div>
   {/if}
 
+  {#if report.leftOut.length > 0}
+    <div class="failed">
+      <p>{c.leftOut(report.leftOut.length)}</p>
+      <ul>
+        {#each report.leftOut as l (l.id)}
+          <li>{l.name}</li>
+        {/each}
+      </ul>
+    </div>
+  {/if}
+
   <div class="keep">
-    {#if wizard.savedGroups.includes(group)}
-      <p class="saved" role="status">{c.savedWatermark}</p>
-    {:else}
-      <form onsubmit={save}>
-        <label for="{fieldId}-name">{c.name}</label>
-        <div class="row">
-          <input id="{fieldId}-name" type="text" bind:value={name} disabled={saving} />
-          <button type="submit" disabled={saving}>{c.saveWatermark}</button>
-        </div>
-        {#if saveError !== null}
-          <p class="error" role="alert">{saveError}</p>
-        {/if}
-      </form>
-    {/if}
+    {#each rows as row (row.group)}
+      {#if wizard.savedGroups.includes(row.group)}
+        <p class="saved" role="status">{c.savedWatermark}</p>
+      {:else}
+        <form onsubmit={(e) => save(e, row)}>
+          <label for="{fieldId}-name-{row.group}">{several ? c.groupName(row.group) : c.name}</label>
+          <div class="row">
+            <input
+              id="{fieldId}-name-{row.group}"
+              type="text"
+              value={row.name}
+              oninput={(e) => update(row.group, { name: e.currentTarget.value })}
+              disabled={row.saving}
+            />
+            <button type="submit" disabled={row.saving}>{c.saveWatermark}</button>
+          </div>
+          {#if row.error !== null}
+            <p class="error" role="alert">{row.error}</p>
+          {/if}
+        </form>
+      {/if}
+    {/each}
   </div>
 
   <footer>
@@ -241,6 +283,11 @@
   }
   .failed ul {
     padding-left: var(--space-5);
+  }
+  .keep {
+    display: flex;
+    flex-direction: column;
+    gap: var(--space-3);
   }
   form {
     display: flex;
