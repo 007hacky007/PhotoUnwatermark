@@ -642,6 +642,105 @@ Real acceptance with this code (Core ML):
   elsewhere. 3 photos: strip 28 `Found` and 4 `Unsure`, step 3 44 `Found` and 4 `Unsure` (one
   triple, as is and cleaned). 4-7 photos: all `Found`. Strip 0.89 s median, 2.29 s max.
 
+### Static scene told apart by its luma, generous drawings kept (fix round 2)
+
+The re-review found the first fix incomplete:
+- A thin moving mark (case A with the mark cut to its top 30 rows) lies wholly within
+  `PRIOR_REACH` of the static patch, so the set still supported the position. With 5 photos all
+  4 others were `Found` at the saved place (0.68-0.87), none covering its mark.
+- At 8 photos, `held_back` let a search `Found` (0.49) through at the saved place while the
+  prior was cautious.
+- Drawings grown by 3.4 % or more of the long side on the fixed set lost the set position (5
+  NotFound and 2 `Unsure` of 7 at 52-60 px), because of the 2.4 % reach.
+
+What tells a mark from static scene is the photos' luma under the layer, not where the layer
+is. A blended mark lets the different scenes behind it show through; a piece of scene that
+stays put has the same luma on every photo. `build_set_layers` keeps, at long side 1536, the
+spread of the photos' lumas per pixel (largest minus smallest; `SetLayers::spread_ratio`). The
+prior compares the mean spread under the layer the drawing holds with the mean over the whole
+photo:
+
+| set | spread ratio |
+|---|---|
+| synthetic static patch, with a moving mark (far, next to it, thin next to it; 3/5/8 photos; alpha 0.12 and 0.25) | 0.06-0.11 |
+| synthetic static patch with the mark missing from the layer (clean last photo, 3 photos) | 0.06-0.11 |
+| synthetic fixed mark and a static patch in one layer | 0.42-0.84 |
+| synthetic fixed set (3/5/8 photos, alpha 0.12 and 0.25) | 0.74-1.11 |
+| real set-a subsets of 3-8 photos | 1.41-1.80 |
+
+`PRIOR_VARIES` 0.25: below it the set is no evidence of a mark. An opaque mark that never
+changes looks the same, and gets `Unsure` too.
+
+Any drawing that reaches into the layer now gets a prior; only a drawing that touches none of
+it is left to the search alone. The prior supports the position (`Found` possible) only when
+all three hold:
+- rule 1 (90 % of the layer components it reaches into lie in it, and at least 5 % of it lies
+  on the layer) or "the drawing follows the layer";
+- the spread test;
+- the set explains the drawing (`explained_by_set`).
+
+Otherwise the prior is cautious and never gives `Found`:
+- The template is always cut to the layer under the drawing and scored on the set's edges.
+- If the drawing holds at least `PRIOR_HELD` 0.5 of the layer, or lies on it by 5 %, a score
+  from `PRIOR_UNSURE` up gives `Unsure` at the saved place.
+- Else the search runs, and any search `Found`, even at the saved place, is `Unsure`.
+- The prior is held back even for a moving logo whose drawing touches a speck of a layer of
+  scene: it is now `Unsure` where the search finds it, and the removal test opens it before
+  removing.
+
+`PRIOR_REACH` went from 2.4 % to 4 % of the long side: the first guess's detector reach (2 %)
+plus as much for a big brush. Static scene beside the mark is caught by the spread test, so the
+reach no longer has to stay tight.
+
+Reviewer's cases now (`static_scene_never_places_a_moving_mark`, `clean_photo_of_the_set_is_not_found`):
+
+| case | after the first fix | now |
+|---|---|---|
+| thin moving mark next to the patch, 5 photos | 4 of 4 `Found` at the saved place (0.68-0.87), mark covered 0.00 | 4 `Unsure` at the saved place (cautious prior) |
+| the same, 8 photos | one search `Found` at the saved place (0.49), mark covered 0.00 | 7 `Unsure` at the saved place |
+| moving mark far from / next to the patch | `Unsure` where the mark is, or NotFound | `Unsure` at the saved place (0.36-0.94); never `Found` |
+| clean last photo, patch far / next, 3-4 photos | NotFound | `Unsure` at the saved place (0.61-0.80); the marked photos `Unsure` there too |
+| clean last photo, 5-8 photos | NotFound (far), `Unsure` (next) | the same; the marked photos `Found` |
+
+Moving marks beside static scene now show `Unsure` at the reference's place instead of where
+the mark moved. That is the price of never `Found` there. The search no longer runs for them,
+which also saves its 2-9 s.
+
+Generous drawings: `generous_drawings_stay_at_the_set_position` (fixed set, 3 and 8 photos, the
+true area grown by 16, 31, 46 and 60 px = 1, 2, 3 and 3.9 % of the long side) gives every other
+photo `Found` at the saved place, 0.78-0.98. `prior_matches_a_drawing_grown_beyond_the_mark` and
+`grown_first_guess_still_matches_fixed_set` are back at 60 px, with their original assertions,
+and pass.
+
+Real acceptance (Core ML; the machine was loaded by other work during part of the small-set run):
+- `real_group_from_the_first_guess`: 8 of 8 `Found` at the saved place; strip 2.01 s at most,
+  match_all 2.5 s.
+- `real_small_sets_keep_the_set_position`: unchanged, 104/104 strip and 136/136 step 3 at the
+  true place (4 strip and 4 step-3 `Unsure`, one triple); strip 0.92 s median, 2.39 s max.
+- `real_triples_with_edited_drawings`, all 56 triples, 13 drawings each (112 photos per
+  drawing; drawings shrunk to nothing are left out):
+
+| drawing | at the saved place Found / Unsure | not found | Unsure elsewhere | Found elsewhere |
+|---|---|---|---|---|
+| as is, cleaned, middle erased, brush dots, grown / shrunk 8 px | 97 / 15 | 0 | 0 | 0 |
+| scene parts erased | 112 / 0 | 0 | 0 | 0 |
+| grown 1 % of the long side | 96 / 16 | 0 | 0 | 0 |
+| grown 2 % | 78 / 34 | 0 | 0 | 0 |
+| grown 3 % | 5 / 107 | 0 | 0 | 0 |
+| shrunk 1 % (112 photos) | 21 / 42 | 9 | 40 | 0 |
+| shrunk 2 % (18 photos; 47 triples shrunk to nothing) | 5 / 5 | 2 | 6 | 0 |
+| shrunk 3 % (4 photos) | 2 / 1 | 0 | 1 | 0 |
+
+The re-review measured grown 2 % at 2 NotFound and grown 3 % at 7 of 8 NotFound plus one
+`Unsure` elsewhere on 4 triples, at 2170b2b and at the first fix. Now every grown drawing keeps
+every photo at the right place, most of the 3 % ones as `Unsure` (the band beyond the 4 %
+reach is scene, so the set does not explain it). Shrinking by 1 % of the long side cuts into
+the thin mark and leaves scraps of the guess. Those photos may be not found or `Unsure`
+elsewhere, but never `Found` elsewhere: at the first stage of this fix one scrap of 6394 px,
+only 3 % on the layer, was `Found` elsewhere at 0.50 by the search. Any drawing that reaches
+into the layer now holds the search back. The test asserts no `Found` elsewhere for every
+drawing, and the right place for all but the shrunk ones.
+
 ## Detector specks in the first guess (Plan 2 fix wave, C1)
 
 The first guess used to keep every component the detector found, union it with the batch layer
