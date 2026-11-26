@@ -13,8 +13,18 @@ use std::sync::OnceLock;
 pub fn shipping_options() -> EngineOptions {
     EngineOptions {
         prefer_gpu: cfg!(target_os = "macos"),
+        cache_dir: Some(test_cache_dir()),
         ..EngineOptions::default()
     }
+}
+
+/// Compiled-model cache shared by the model tests of this crate, in `<workspace>/target`. Without
+/// a cache folder, Core ML compiles into a new temp folder on every load and never removes it.
+pub fn test_cache_dir() -> PathBuf {
+    workspace_root()
+        .join("target")
+        .join("test-model-cache")
+        .join("puw-core")
 }
 
 /// Folder with the model files, from `PUW_MODELS_DIR`. Tests that need models return early

@@ -205,6 +205,10 @@ fn open_engine(models: Option<PathBuf>, gpu: bool) -> BoxResult<Engine> {
         &paths,
         EngineOptions {
             prefer_gpu: gpu,
+            // Without a cache folder, Core ML leaves a new temp folder on every load.
+            cache_dir: Some(
+                Path::new(env!("CARGO_MANIFEST_DIR")).join("../../target/test-model-cache/puw-dev"),
+            ),
             ..EngineOptions::default()
         },
     )?;

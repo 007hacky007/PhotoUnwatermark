@@ -167,6 +167,9 @@ pub struct EngineOptions {
     /// (Intel Macs and other platforms). Each model
     /// gets a subfolder named after its file's size and modification time, and subfolders left by
     /// older files of the same model are deleted.
+    ///
+    /// With `None`, Core ML compiles into a new folder in the temp dir on every load and ONNX
+    /// Runtime does not remove it, so callers on macOS should always set this.
     pub cache_dir: Option<PathBuf>,
 }
 

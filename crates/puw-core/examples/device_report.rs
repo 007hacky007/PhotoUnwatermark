@@ -31,6 +31,11 @@ fn main() {
         EngineOptions {
             prefer_gpu,
             gpu_helper_dir: helper,
+            // Without a cache folder, Core ML leaves a new temp folder on every load.
+            cache_dir: Some(
+                std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+                    .join("../../target/test-model-cache/puw-example"),
+            ),
             ..EngineOptions::default()
         },
     )

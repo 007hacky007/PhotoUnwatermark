@@ -31,6 +31,7 @@ fn gpu_lock() -> MutexGuard<'static, ()> {
 fn engine(prefer_gpu: bool) -> Option<Engine> {
     engine_with(EngineOptions {
         prefer_gpu,
+        cache_dir: Some(common::test_cache_dir()),
         ..EngineOptions::default()
     })
 }
@@ -503,4 +504,32 @@ fn gpu_matches_cpu() {
     } else {
         eprintln!("LaMa on CPU ({:?}), not compared", report.lama);
     }
+}
+
+/// ONNX Runtime's Core ML provider writes `onnxruntime-<uuid>-<pid>-<n>.model.mlmodel(c)` into
+/// the temp dir on every load without a cache folder and never removes it; tests once left
+/// 46,000 of them (158 GB). Loads with the shipping options must not leave any.
+#[cfg(target_os = "macos")]
+#[test]
+fn core_ml_loads_leave_no_temp_folders() {
+    let _gpu = gpu_lock();
+    let pid = format!("-{}-", std::process::id());
+    let leftovers = || -> Vec<String> {
+        std::fs::read_dir(std::env::temp_dir())
+            .expect("read temp dir")
+            .filter_map(|e| e.ok())
+            .map(|e| e.file_name().to_string_lossy().into_owned())
+            .filter(|n| n.starts_with("onnxruntime-") && n.contains(&pid))
+            .collect()
+    };
+    for _ in 0..2 {
+        let Some(engine) = engine_with(common::shipping_options()) else {
+            return;
+        };
+        // The face model compiles quickly and is enough to trigger a Core ML compile.
+        engine.load(ModelKind::Face).expect("face loads");
+        engine.run_face(&face_input(), 640, 640).expect("face runs");
+    }
+    let found = leftovers();
+    assert!(found.is_empty(), "Core ML left temp folders: {found:?}");
 }
