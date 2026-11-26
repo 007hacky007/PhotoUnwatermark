@@ -54,7 +54,7 @@ mod saved;
 mod step3;
 mod strip;
 
-pub use remove::{Done, Failed, OutputCheck, PREVIEW_LONG_SIDE, RemoveReport};
+pub use remove::{Done, Failed, LeftOut, OutputCheck, PREVIEW_LONG_SIDE, RemoveReport};
 pub use saved::{SavedInfo, default_watermark_name};
 pub use step3::{AreaStatus, GroupInfo, GroupsState, MatchSummary, PhotoState};
 pub use strip::{Placed, StripPlacement};

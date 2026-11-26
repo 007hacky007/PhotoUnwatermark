@@ -135,7 +135,7 @@ fn first_guess_matches_fixed_set_and_is_offered() {
     eprintln!("first guess as the set area: {sum:?}");
     assert_eq!(sum.found, 8, "{sum:?}");
 
-    let id = f.core.save_watermark("From the guess").unwrap();
+    let id = f.core.save_watermark(1, "From the guess").unwrap();
     f.core.clear_photos().unwrap();
     add_fixed(&f.core);
     let start = Instant::now();
@@ -738,7 +738,8 @@ fn unsure_blocks_until_opened_or_unticked() {
     assert_eq!(s.status, AreaStatus::Unsure);
     assert!(s.included && !s.reviewed && s.has_area, "{s:?}");
     assert_eq!(f.core.removal_blockers(), vec![ten]);
-    assert_eq!(f.core.to_remove(), vec![five, ten]);
+    // Not a member of the group until somebody has looked at it.
+    assert_eq!(f.core.to_remove(), vec![five]);
 
     // Opening it in the editor is enough.
     f.core.open_photo(ten).unwrap();

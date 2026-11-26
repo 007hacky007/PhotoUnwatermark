@@ -785,7 +785,7 @@ fn save_watermark_roundtrip() {
     let paths = copy_fixed(tmp.path(), 1);
     let id = add(&f.core, &paths)[0];
     assert!(matches!(
-        f.core.save_watermark("x"),
+        f.core.save_watermark(1, "x"),
         Err(AppError::NothingToRemove)
     ));
     let gt = truth("00.png");
@@ -795,7 +795,7 @@ fn save_watermark_roundtrip() {
     f.core.confirm_set_area(id).unwrap();
 
     let name = default_watermark_name(Date::from_calendar_date(2026, Month::November, 25).unwrap());
-    let saved = f.core.save_watermark(&name).unwrap();
+    let saved = f.core.save_watermark(1, &name).unwrap();
     let list = f.core.list_saved().unwrap();
     assert_eq!(list.len(), 1);
     assert_eq!(
@@ -836,7 +836,7 @@ fn save_watermark_roundtrip() {
     assert_eq!(f.core.list_saved().unwrap()[0].name, "Studio");
     let e = f.core.rename_saved(&saved, "   ").unwrap_err();
     assert!(user_message(&e).contains("name"), "{}", user_message(&e));
-    assert!(f.core.save_watermark(" ").is_err());
+    assert!(f.core.save_watermark(1, " ").is_err());
     assert_eq!(f.core.list_saved().unwrap().len(), 1);
 
     f.core.delete_saved(&saved).unwrap();
@@ -862,7 +862,7 @@ fn saved_picture_leaves_out_a_stray_dot() {
         .put_draft(id, gt.width(), gt.height(), gt.into_raw())
         .unwrap();
     f.core.confirm_set_area(id).unwrap();
-    let saved = f.core.save_watermark("Dot").unwrap();
+    let saved = f.core.save_watermark(1, "Dot").unwrap();
     let png = f.core.saved_thumbnail(&saved).unwrap();
     let (tw, th) = image::load_from_memory(&png)
         .unwrap()
@@ -930,4 +930,109 @@ fn fallback_outside_a_run_is_not_missed() {
     let rec = Recorder::default();
     f.core.preview(id, &|e| rec.push(e)).unwrap();
     assert_eq!(notices(&rec.events()), 0);
+}
+
+/// One run removes the watermark of every group, each with its own area, and reports the
+/// photos it left alone and the ones it could not read.
+#[test]
+fn one_run_removes_every_group() {
+    let Some(f) = model_fixture() else { return };
+    let tmp = tempfile::tempdir().unwrap();
+    let marked = fixed().join("marked");
+    let photos = tmp.path().join("photos");
+    fs::create_dir_all(&photos).unwrap();
+    let copy = |from: &Path, name: &str| {
+        let to = photos.join(name);
+        fs::copy(from, &to).unwrap();
+        to
+    };
+    let logos = common::logo_photos(tmp.path(), 2);
+    let plain_src = common::synth_dir()
+        .join("negative")
+        .join("marked")
+        .join("04.png");
+    let jpg = jpeg(
+        &RgbImage::from_fn(300, 200, |x, y| Rgb([x as u8, y as u8, 90])),
+        85,
+    );
+    let broken = photos.join("broken.jpg");
+    fs::write(&broken, &jpg[..jpg.len() * 2 / 3]).unwrap();
+    let paths = vec![
+        copy(&marked.join("00.png"), "a-fixed-00.png"),
+        copy(&marked.join("01.png"), "a-fixed-01.png"),
+        copy(&logos[0].0, "b-logo-0.png"),
+        copy(&logos[1].0, "b-logo-1.png"),
+        copy(&plain_src, "c-plain.png"),
+        broken,
+    ];
+    let ids = add(&f.core, &paths);
+    let originals: Vec<RgbImage> = paths[..4].iter().map(|p| load(p).unwrap().rgb).collect();
+
+    confirm_and_match_one(&f.core, ids[0]);
+    let gt = &logos[0].1;
+    f.core
+        .put_draft(ids[2], gt.width(), gt.height(), gt.clone().into_raw())
+        .unwrap();
+    f.core.confirm_new_group(ids[2]).unwrap();
+    f.core.match_all(&|_| {}).unwrap();
+    common::settle(&f.core);
+    let g = f.core.groups();
+    assert_eq!(
+        g.groups.iter().map(|i| i.photos).collect::<Vec<_>>(),
+        [2, 2],
+        "{g:?}"
+    );
+
+    let report = f.core.remove(&|_| {}).unwrap();
+    assert!(!report.cancelled);
+    assert_eq!(
+        report.done.iter().map(|d| d.id).collect::<Vec<_>>(),
+        ids[..4],
+        "{report:?}"
+    );
+    let truths = [
+        truth("00.png"),
+        truth("01.png"),
+        logos[0].1.clone(),
+        logos[1].1.clone(),
+    ];
+    for (k, d) in report.done.iter().enumerate() {
+        let after = load(Path::new(&d.output)).unwrap().rgb;
+        let (mut sum, mut n) = (0u64, 0u64);
+        for (x, y, p) in truths[k].enumerate_pixels() {
+            if p.0[0] > 127 {
+                let (a, b) = (after.get_pixel(x, y).0, originals[k].get_pixel(x, y).0);
+                sum += (0..3)
+                    .map(|c| (a[c] as i32 - b[c] as i32).unsigned_abs() as u64)
+                    .sum::<u64>();
+                n += 3;
+            }
+        }
+        let mean = sum as f64 / n as f64;
+        assert!(mean > 10.0, "photo {k}: {mean}");
+    }
+    assert_eq!(
+        report.left_out.iter().map(|l| l.id).collect::<Vec<_>>(),
+        [ids[4]]
+    );
+    assert_eq!(report.left_out[0].name, "c-plain.png");
+    assert_eq!(report.failed.len(), 1, "{report:?}");
+    assert_eq!(report.failed[0].id, ids[5]);
+    assert!(
+        report.failed[0].reason.contains("could not be opened"),
+        "{}",
+        report.failed[0].reason
+    );
+    assert_eq!(
+        report.done.len() + report.failed.len() + report.left_out.len(),
+        f.core.photos().len()
+    );
+}
+
+fn confirm_and_match_one(core: &AppCore, id: u32) {
+    let gt = truth("00.png");
+    core.put_draft(id, gt.width(), gt.height(), gt.into_raw())
+        .unwrap();
+    core.confirm_set_area(id).unwrap();
+    core.match_all(&|_| {}).unwrap();
 }

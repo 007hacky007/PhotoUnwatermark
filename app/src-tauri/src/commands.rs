@@ -455,11 +455,11 @@ pub async fn remove(
     self::job(job, move || core.remove(&sender(&on_event))).await
 }
 
-/// Saves the set's watermark and returns its id.
+/// Saves group `group`'s watermark and returns its id.
 #[tauri::command]
-pub async fn save_watermark(shell: State<'_, Shell>, name: String) -> Res<String> {
+pub async fn save_watermark(shell: State<'_, Shell>, group: u32, name: String) -> Res<String> {
     let core = shell.core.clone();
-    blocking(move || core.save_watermark(&name)).await
+    blocking(move || core.save_watermark(group, &name)).await
 }
 
 /// Today's date from the local time when it is known, else from UTC moved by the offset read

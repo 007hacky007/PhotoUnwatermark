@@ -39,6 +39,15 @@ impl Problem {
             _ => None,
         }
     }
+
+    /// The sentence saying what is wrong with the photo.
+    pub fn message(self) -> String {
+        let e = match self {
+            Problem::Gone => Error::Io(std::io::ErrorKind::NotFound.into()),
+            Problem::Damaged => Error::Image(String::new()),
+        };
+        user_message(&AppError::Core(e))
+    }
 }
 
 /// What the interface shows about a photo. Width and height are the upright size.

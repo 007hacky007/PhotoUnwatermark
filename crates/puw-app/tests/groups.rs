@@ -20,7 +20,7 @@ use puw_app::{
     AppCore, AppError, AreaStatus, DeviceState, GroupInfo, PhotoState, Placed, ProgressEvent,
     StripPlacement, with_ticket,
 };
-use puw_core::{Library, SavedWatermark, build_template};
+use puw_core::{Library, MatchStatus, SavedWatermark, build_template, find};
 
 /// The members of every group, plus the photos with no group yet, plus the ones that cannot be
 /// read, are all the photos. Each count is checked against other calls too: the photo states,
@@ -1074,4 +1074,65 @@ fn stopped_leftover_guess_changes_nothing() {
     // Removing a photo it looked at forgets it.
     core.remove_photo(first.sample[0]).unwrap();
     assert_eq!(core.last_detect(), None);
+}
+
+// ---- Removal and saving per group ----
+
+#[test]
+fn removal_waits_for_the_current_matching() {
+    let f = fixture(None);
+    let dir = tempfile::tempdir().unwrap();
+    let m = mixed_set(&f.core, dir.path());
+    group_one(&f.core, &m);
+    put_truth(&f.core, m.logos[0], &m.logo_truths[0]);
+    f.core.confirm_new_group(m.logos[0]).unwrap();
+    assert!(!f.core.groups().matched);
+
+    let rec = Recorder::default();
+    assert!(matches!(
+        f.core.remove(&|e| rec.push(e)),
+        Err(AppError::NotReady)
+    ));
+    assert!(rec.events().is_empty());
+}
+
+#[test]
+fn each_group_saves_its_own_watermark() {
+    let f = fixture(None);
+    let dir = tempfile::tempdir().unwrap();
+    two_groups(&f.core, dir.path());
+    let (a, b) = (
+        f.core.save_watermark(1, "A").unwrap(),
+        f.core.save_watermark(2, "B").unwrap(),
+    );
+    let lib = Library::open(&f.dirs.watermarks).unwrap();
+    let saved = lib.list().unwrap();
+    assert_eq!(saved.len(), 2);
+    let template = |id: &str| {
+        let w = saved.iter().find(|w| w.id == id).unwrap();
+        (w.name.clone(), w.template.clone())
+    };
+    let (an, at) = template(&a);
+    let (bn, bt) = template(&b);
+    assert_eq!((an.as_str(), bn.as_str()), ("A", "B"));
+
+    let fixed = image::open(synth("fixed").join("marked").join("01.png"))
+        .unwrap()
+        .to_rgb8();
+    assert_eq!(find(&at, &fixed).status, MatchStatus::Found);
+    let logo = image::open(dir.path().join("marked").join("logo-01.png"))
+        .unwrap()
+        .to_rgb8();
+    assert_eq!(find(&bt, &logo).status, MatchStatus::Found);
+
+    // Unknown group, and a group that came from a saved watermark: nothing to save.
+    assert!(matches!(
+        f.core.save_watermark(9, "C"),
+        Err(AppError::NothingToRemove)
+    ));
+    let n = f.core.use_saved(&a).unwrap();
+    assert!(matches!(
+        f.core.save_watermark(n, "D"),
+        Err(AppError::NothingToRemove)
+    ));
 }

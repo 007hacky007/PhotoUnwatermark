@@ -104,9 +104,9 @@ impl PhotoState {
             || (self.status == AreaStatus::Unsure && self.included && !self.reviewed)
     }
 
-    /// Ticked with an area.
+    /// A member of a group (ticked, with an area from it).
     pub(crate) fn is_to_remove(&self) -> bool {
-        self.included && self.has_area
+        self.member
     }
 }
 
@@ -312,7 +312,7 @@ impl AppCore {
         self.session().removal_blockers()
     }
 
-    /// The ticked photos with an area, in list order.
+    /// The members of every group, in list order.
     pub fn to_remove(&self) -> Vec<PhotoId> {
         self.photo_states()
             .into_iter()

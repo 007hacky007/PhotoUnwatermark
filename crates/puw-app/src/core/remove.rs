@@ -11,7 +11,7 @@ use puw_core::mask::{self, Mask};
 use puw_core::{Engine, Error, ModelKind, Progress, load, remove_one};
 use serde::Serialize;
 
-use super::{AppCore, lock, no_photo, not_found};
+use super::{AppCore, AreaStatus, lock, no_photo, not_found};
 use crate::images::{self, jpeg};
 use crate::jobs::{Events, LoadPurpose, ProgressEvent};
 use crate::output::{output_dirs, remove_stale_partials};
@@ -55,7 +55,17 @@ pub struct Failed {
 pub struct RemoveReport {
     pub done: Vec<Done>,
     pub failed: Vec<Failed>,
+    /// The photos with no group when the run started, in list order. They are not touched.
+    pub left_out: Vec<LeftOut>,
     pub cancelled: bool,
+}
+
+/// A photo that belongs to no group, so the run leaves it alone.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct LeftOut {
+    pub id: PhotoId,
+    pub name: String,
 }
 
 /// One photo of a run, as it was when the run started.
@@ -207,8 +217,8 @@ impl AppCore {
         })
     }
 
-    /// Removes the watermark from every ticked photo with an area, one photo at a time, and
-    /// saves the results in the output folders (the originals are never written).
+    /// Removes the watermark from every member of every group (each with its own area), one
+    /// photo at a time, in list order, and saves the results in the output folders (the originals are never written).
     ///
     /// The photos and their areas are taken when the run starts; changes made in step 3 while
     /// it runs count from the next run on. A photo an earlier run finished with the same area,
@@ -223,6 +233,9 @@ impl AppCore {
     /// through the photos ([`ProgressEvent::Removing`]: one event when a photo starts, its
     /// progress, and one when it is finished).
     ///
+    /// [`RemoveReport::left_out`] lists the photos with no group (they are not touched), and
+    /// [`RemoveReport::failed`] starts with the photos already known to be unreadable.
+    ///
     /// A photo that fails (moved, deleted, damaged, or the remover failed on it) is listed in
     /// [`RemoveReport::failed`] and the run goes on. Cancelling discards the photo being worked
     /// on and keeps the finished ones (`cancelled: true`). When a model moves from the graphics
@@ -232,7 +245,7 @@ impl AppCore {
         let job = self.jobs.start()?;
         let rule = self.output_rule();
         let detail = self.settings().detail;
-        let (blocked, todo, finished) = {
+        let (blocked, todo, finished, left_out, unreadable) = {
             let s = self.session();
             let states = s.states();
             let mut finished = Vec::new();
@@ -262,10 +275,38 @@ impl AppCore {
                 })
                 .collect();
             let open = s.matching_open();
+            let named = |id: PhotoId| {
+                s.photos
+                    .get(id)
+                    .map(|e| e.info.name.clone())
+                    .unwrap_or_default()
+            };
+            let left_out: Vec<LeftOut> = states
+                .iter()
+                .filter(|st| st.status != AreaStatus::Unreadable && !st.member)
+                .map(|st| LeftOut {
+                    id: st.id,
+                    name: named(st.id),
+                })
+                .collect();
+            let unreadable: Vec<Failed> = s
+                .photos
+                .infos()
+                .into_iter()
+                .filter_map(|i| {
+                    Some(Failed {
+                        id: i.id,
+                        name: i.name,
+                        reason: i.problem?.message(),
+                    })
+                })
+                .collect();
             (
                 states.iter().any(|st| st.blocks_removal(open)),
                 todo,
                 finished,
+                left_out,
+                unreadable,
             )
         };
         if blocked {
@@ -277,7 +318,9 @@ impl AppCore {
         if todo.is_empty() {
             return Ok(RemoveReport {
                 done: finished,
-                ..RemoveReport::default()
+                failed: unreadable,
+                left_out,
+                cancelled: false,
             });
         }
         let paths: Vec<PathBuf> = todo.iter().map(|t| t.path.clone()).collect();
@@ -291,7 +334,9 @@ impl AppCore {
 
         let mut report = RemoveReport {
             done: finished,
-            ..RemoveReport::default()
+            failed: unreadable,
+            left_out,
+            cancelled: false,
         };
         let engine = match self.ensure_models_in(&job, &[ModelKind::Lama], LoadPurpose::Remover, ev)
         {
@@ -456,12 +501,13 @@ mod tests {
                 output: "/a/b.jpg".into(),
             }],
             failed: vec![],
+            left_out: vec![],
             cancelled: false,
         };
         let json = serde_json::to_string(&r).unwrap();
         assert_eq!(
             json,
-            r#"{"done":[{"id":1,"output":"/a/b.jpg"}],"failed":[],"cancelled":false}"#
+            r#"{"done":[{"id":1,"output":"/a/b.jpg"}],"failed":[],"leftOut":[],"cancelled":false}"#
         );
     }
 }
