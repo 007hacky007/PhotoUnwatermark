@@ -602,3 +602,157 @@ fn real_group_from_the_first_guess() {
     assert_eq!(other_found, 0);
     assert_eq!(strip_ok, strip_others);
 }
+
+/// The drawing a person makes of the first guess before switching photos: its specks removed
+/// (every group of parts, grouped as the template groups them, with less than a quarter of the
+/// largest group's pixels) and a band of 1 % of the photo's height erased across its top.
+/// Edit-size bytes in, edit-size bytes out.
+fn cleaned_guess(guess: &[u8], ew: u32, eh: u32) -> Vec<u8> {
+    let m = puw_core::Mask::from_raw(ew, eh, guess.to_vec()).unwrap();
+    let comps = puw_core::mask::components(&m);
+    let groups = puw_core::mask::group_near(&comps, 0.02 * ew.max(eh) as f32);
+    let size = |g: &Vec<usize>| g.iter().map(|&i| u64::from(comps[i].pixels)).sum::<u64>();
+    let most = groups.iter().map(size).max().unwrap();
+    let kept: Vec<usize> = groups
+        .iter()
+        .filter(|g| 4 * size(g) >= most)
+        .flatten()
+        .copied()
+        .collect();
+    let mut out = puw_core::Mask::new(ew, eh);
+    for c in kept.iter().map(|&i| &comps[i]) {
+        let (ox, oy) = (c.bbox.left() as u32, c.bbox.top() as u32);
+        for (x, y, p) in c.mask.enumerate_pixels() {
+            if p.0[0] != 0 {
+                out.put_pixel(ox + x, oy + y, *p);
+            }
+        }
+    }
+    let top = puw_core::mask::bbox(&out).unwrap().top() as u32;
+    for y in top..(top + eh / 100).min(eh) {
+        for x in 0..ew {
+            out.put_pixel(x, y, image::Luma([0]));
+        }
+    }
+    out.into_raw()
+}
+
+/// Small sets of the real set-a (three photos each, one fixed watermark): the step-2 strip
+/// places the first guess, as it is and cleaned up by hand ([`cleaned_guess`]), at the same
+/// place on the two other photos, and step 3 finds all three photos there. Times each strip
+/// placement. Aggregates only. `cargo test -p puw-app --release --test timings real_small --
+/// --ignored --nocapture`; needs `PUW_MODELS_DIR` and `PUW_REAL_DIR`.
+#[test]
+#[ignore = "acceptance run, needs models and local photos"]
+fn real_small_sets_keep_the_set_position() {
+    let Some(models) = common::models_dir() else {
+        eprintln!("skipped: PUW_MODELS_DIR not set");
+        return;
+    };
+    let Some(real) = std::env::var_os("PUW_REAL_DIR").map(PathBuf::from) else {
+        eprintln!("skipped: PUW_REAL_DIR not set");
+        return;
+    };
+    let work = common::synth_dir()
+        .parent()
+        .and_then(Path::parent)
+        .unwrap()
+        .join("local")
+        .join("timing");
+    let a = photos_in(&real.join("set-a"));
+    assert_eq!(a.len(), 8, "set-a has 8 photos");
+    let triples: [[usize; 3]; 8] = [
+        [0, 1, 2],
+        [3, 4, 5],
+        [5, 6, 7],
+        [0, 3, 7],
+        [1, 4, 6],
+        [2, 5, 7],
+        [0, 2, 4],
+        [1, 3, 6],
+    ];
+    let (mut strip_ok, mut strip_all, mut times) = (0, 0, Vec::new());
+    let (mut match_ok, mut match_all, mut wrong_found) = (0, 0, 0);
+    let mut statuses = [0usize; 3];
+    let mut removed = Vec::new();
+    for (k, triple) in triples.iter().enumerate() {
+        for cleaned in [false, true] {
+            let data = work.join("data-small");
+            let _ = fs::remove_dir_all(&data);
+            let c = core(&models, &work.join("coreml-cache"), &data, Detail::Best);
+            let paths: Vec<PathBuf> = triple.iter().map(|&i| a[i].clone()).collect();
+            let ids = add(&c, &paths);
+            let out = c.detect(&|_| {}).unwrap();
+            let rep = out.representative;
+            let (ew, eh) = c.edit_size(rep).unwrap();
+            if cleaned {
+                let guess = c.start_area(rep).unwrap();
+                let d = cleaned_guess(&guess, ew, eh);
+                let px = |v: &[u8]| v.iter().filter(|p| **p != 0).count() as f64;
+                removed.push(1.0 - px(&d) / px(&guess));
+                c.put_draft(rep, ew, eh, d).unwrap();
+            }
+            let long = ew.max(eh) as f32;
+            let mut line = Vec::new();
+            for &id in ids.iter().filter(|&&id| id != rep) {
+                let t = Instant::now();
+                let p = c.place_on(rep, id).unwrap();
+                times.push(secs(t));
+                let same = (p.scale_x - 1.0).abs() < 0.01
+                    && (p.scale_y - 1.0).abs() < 0.01
+                    && p.dx.abs() < 0.01 * long
+                    && p.dy.abs() < 0.01 * long;
+                strip_all += 1;
+                if p.status != puw_app::Placed::NotFound && same {
+                    strip_ok += 1;
+                }
+                line.push(format!("{:?} same place {same}", p.status));
+            }
+            c.confirm_set_area(rep).unwrap();
+            c.match_all(&|_| {}).unwrap();
+            let saved = c.area(rep).unwrap();
+            for &id in &ids {
+                let st = c.photo_states().into_iter().find(|s| s.id == id).unwrap();
+                let q = area_iou(&c.area(id).unwrap(), &saved);
+                match_all += 1;
+                match st.status {
+                    puw_app::AreaStatus::Found if q >= 0.99 => {
+                        match_ok += 1;
+                        statuses[0] += 1;
+                    }
+                    puw_app::AreaStatus::Found => wrong_found += 1,
+                    puw_app::AreaStatus::Unsure if q >= 0.99 => {
+                        match_ok += 1;
+                        statuses[1] += 1;
+                    }
+                    _ => statuses[2] += 1,
+                }
+            }
+            eprintln!(
+                "triple {}{}: strip {}",
+                k + 1,
+                if cleaned { " cleaned" } else { "" },
+                line.join(", ")
+            );
+        }
+    }
+    let _ = fs::remove_dir_all(work.join("data-small"));
+    times.sort_by(f64::total_cmp);
+    eprintln!(
+        "strip: {strip_ok} of {strip_all} placed at the same place; {:.2} s median, {:.2} s max",
+        times[times.len() / 2],
+        times[times.len() - 1]
+    );
+    eprintln!(
+        "cleaning removed {:.1}-{:.1} % of the guess",
+        100.0 * removed.iter().cloned().fold(f64::MAX, f64::min),
+        100.0 * removed.iter().cloned().fold(0.0, f64::max)
+    );
+    eprintln!(
+        "match_all: {match_ok} of {match_all} at the saved place (Found {}, Unsure {}), {} other, {wrong_found} Found elsewhere",
+        statuses[0], statuses[1], statuses[2]
+    );
+    assert_eq!(strip_ok, strip_all);
+    assert_eq!(match_ok, match_all);
+    assert_eq!(wrong_found, 0);
+}

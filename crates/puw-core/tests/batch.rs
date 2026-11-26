@@ -1,7 +1,7 @@
 mod common;
 
 use image::{Luma, RgbImage, imageops};
-use puw_core::batch::{BATCH_HIGH, BATCH_LOW, batch_lines, filter_layer, median_gradient};
+use puw_core::batch::{AGREE, BATCH_HIGH, BATCH_LOW, batch_lines, filter_layer, median_gradient};
 use puw_core::mask::{self, Mask};
 use puw_core::{Error, Progress, build_set_layers};
 use std::path::{Path, PathBuf};
@@ -33,7 +33,8 @@ fn random_image(w: u32, h: u32, seed: u64) -> RgbImage {
     })
 }
 
-/// Reference: per-image Sobel (reflect boundary) on 601 luma, then median, then hypot.
+/// Reference: per-image Sobel (reflect boundary) on 601 luma, then median (for 3 or 4 images
+/// the value 3 of them agree on), then hypot.
 fn naive(images: &[&RgbImage]) -> Vec<f32> {
     let (w, h) = images[0].dimensions();
     let (w, h) = (w as i64, h as i64);
@@ -66,7 +67,17 @@ fn naive(images: &[&RgbImage]) -> Vec<f32> {
     let med = |mut v: Vec<f64>| {
         v.sort_by(f64::total_cmp);
         let n = v.len();
-        if n % 2 == 1 {
+        if (AGREE..2 * AGREE - 1).contains(&n) {
+            // 3 or 4 photos: the value AGREE of them reach on one side of zero.
+            let (hi, lo) = (v[n - AGREE], v[AGREE - 1]);
+            if hi > 0.0 {
+                hi
+            } else if lo < 0.0 {
+                lo
+            } else {
+                0.0
+            }
+        } else if n % 2 == 1 {
             v[n / 2]
         } else {
             (v[n / 2 - 1] + v[n / 2]) / 2.0
@@ -94,21 +105,89 @@ fn median_gradient_rejects_mixed_sizes() {
 
 #[test]
 fn median_is_per_image() {
-    let imgs = [
-        random_image(64, 48, 1),
-        random_image(64, 48, 2),
-        random_image(64, 48, 3),
-    ];
-    let refs: Vec<&RgbImage> = imgs.iter().collect();
-    let got = median_gradient(&refs).expect("median");
-    let want = naive(&refs);
-    let max = got
-        .as_raw()
+    // 3 and 4 images take the value 3 of them agree on, 5 and 6 the median.
+    for n in 3..=6 {
+        let imgs: Vec<RgbImage> = (1..=n).map(|s| random_image(64, 48, s)).collect();
+        let refs: Vec<&RgbImage> = imgs.iter().collect();
+        let got = median_gradient(&refs).expect("median");
+        let want = naive(&refs);
+        let max = got
+            .as_raw()
+            .iter()
+            .zip(&want)
+            .map(|(a, b)| (a - b).abs())
+            .fold(0f32, f32::max);
+        assert!(max < 1e-3, "{n} images: max abs diff {max}");
+    }
+}
+
+/// With 3 photos an edge that only 2 of them show is not in the layer's gradient; one all 3
+/// show is, at the weakest of the three.
+#[test]
+fn three_photos_keep_only_edges_all_show() {
+    let (w, h) = (40u32, 30u32);
+    // A vertical step at x = 20 of height `a` (0 = flat) on a grey photo.
+    let step = |a: u8| {
+        RgbImage::from_fn(w, h, |x, _| {
+            image::Rgb([if x >= 20 { 100 + a } else { 100 }; 3])
+        })
+    };
+    let at = |m: &image::ImageBuffer<Luma<f32>, Vec<f32>>| m.get_pixel(20, 15).0[0];
+    let (a, b, flat) = (step(40), step(30), step(0));
+    let two = median_gradient(&[&a, &b, &flat]).expect("median");
+    assert_eq!(at(&two), 0.0);
+    let all = median_gradient(&[&a, &b, &step(20)]).expect("median");
+    let weakest = median_gradient(&[&step(20)]).expect("one photo");
+    assert!(
+        (at(&all) - at(&weakest)).abs() < 1e-3,
+        "{} vs {}",
+        at(&all),
+        at(&weakest)
+    );
+}
+
+/// Three photos of one shoot (one scene, two shots lined up as in a burst, the third moved a
+/// little) with the fixed set's mark blended at 0.14 at one place: the layer is the mark.
+#[test]
+fn three_photos_of_one_shoot_give_the_mark() {
+    let set = common::synth_dir().join("fixed");
+    let open = |p: &str| image::open(set.join(p)).expect("open").to_rgb8();
+    let (clean0, marked0, scene) = (
+        open("clean/00.png"),
+        open("marked/00.png"),
+        open("clean/03.png"),
+    );
+    let gt: Mask = image::open(set.join("mask/00.png")).expect("gt").to_luma8();
+    let (w, h) = scene.dimensions();
+    let imgs: Vec<RgbImage> = [(0i64, 0i64), (1, 1), (24, -16)]
         .iter()
-        .zip(&want)
-        .map(|(a, b)| (a - b).abs())
-        .fold(0f32, f32::max);
-    assert!(max < 1e-3, "max abs diff {max}");
+        .map(|&(sx, sy)| {
+            RgbImage::from_fn(w, h, |x, y| {
+                let px = (x as i64 + sx).clamp(0, w as i64 - 1) as u32;
+                let py = (y as i64 + sy).clamp(0, h as i64 - 1) as u32;
+                let mut p = *scene.get_pixel(px, py);
+                if gt.get_pixel(x, y).0[0] != 0 {
+                    let (c, m) = (clean0.get_pixel(x, y), marked0.get_pixel(x, y));
+                    for ch in 0..3 {
+                        let mark = c.0[ch] as f32 + (m.0[ch] as f32 - c.0[ch] as f32) / 0.25;
+                        let b = p.0[ch] as f32;
+                        p.0[ch] = (b + 0.14 * (mark - b)).round().clamp(0.0, 255.0) as u8;
+                    }
+                }
+                p
+            })
+        })
+        .collect();
+    let refs: Vec<&RgbImage> = imgs.iter().collect();
+    let mag = median_gradient(&refs).expect("median");
+    let layer = filter_layer(&batch_lines(&mag, BATCH_LOW, BATCH_HIGH).expect("a layer"));
+    let near = mask::dilate(&gt, mask::grow_for(w, h, 0.004));
+    let (recall, inside) = (covered(&layer, &gt), covered(&near, &layer));
+    eprintln!("one shoot of 3: recall {recall:.3}, layer near the mark {inside:.3}");
+    assert!(recall >= 0.8, "recall {recall}");
+    // The share the position prior asks of a layer that is the mark (`PRIOR_LAYER_INSIDE`). The
+    // median of the three kept the scene: more than 10 % of the photo, so no layer at all.
+    assert!(inside >= 0.9, "layer near the mark {inside}");
 }
 
 #[test]

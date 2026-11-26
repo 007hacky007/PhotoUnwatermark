@@ -233,6 +233,110 @@ fn grown_first_guess_still_matches_fixed_set() {
     }
 }
 
+/// Three photos of one shoot: the scene of fixed photo `scene` moved by each of `shifts`
+/// (pixels, edges repeated), with the fixed set's watermark blended at `alpha` at the same
+/// place on all three. Two shots nearly line up, as in a burst, so most scene edges are shared
+/// by two of the three photos. Written as PNGs into `dir`.
+fn one_shoot(scene: u32, shifts: &[(i64, i64)], alpha: f32, dir: &Path) -> Vec<PathBuf> {
+    let clean0 = image::open(fixed().join("clean/00.png")).unwrap().to_rgb8();
+    let marked0 = image::open(fixed().join("marked/00.png"))
+        .unwrap()
+        .to_rgb8();
+    let mask = image::open(fixed().join("mask/00.png")).unwrap().to_luma8();
+    let src = image::open(fixed().join(format!("clean/0{scene}.png")))
+        .unwrap()
+        .to_rgb8();
+    let (w, h) = src.dimensions();
+    shifts
+        .iter()
+        .enumerate()
+        .map(|(i, &(sx, sy))| {
+            let img = RgbImage::from_fn(w, h, |x, y| {
+                let px = (x as i64 + sx).clamp(0, w as i64 - 1) as u32;
+                let py = (y as i64 + sy).clamp(0, h as i64 - 1) as u32;
+                let mut p = *src.get_pixel(px, py);
+                if mask.get_pixel(x, y).0[0] != 0 {
+                    // The mark's own colour, from photo 0 where it is blended at 0.25.
+                    let (c, m) = (clean0.get_pixel(x, y), marked0.get_pixel(x, y));
+                    for ch in 0..3 {
+                        let mark = c.0[ch] as f32 + (m.0[ch] as f32 - c.0[ch] as f32) / 0.25;
+                        let b = p.0[ch] as f32;
+                        p.0[ch] = (b + alpha * (mark - b)).round().clamp(0.0, 255.0) as u8;
+                    }
+                }
+                p
+            });
+            let path = dir.join(format!("shoot-{i}.png"));
+            img.save(&path).unwrap();
+            path
+        })
+        .collect()
+}
+
+/// A set of three photos of one shoot with a faint watermark at the same place (the owner's
+/// case): the strip places the first guess at the same place on the other two photos, as it
+/// is and with its specks removed, and matching finds every photo there.
+#[test]
+fn three_photos_of_one_shoot_keep_the_set_position() {
+    let Some(models) = common::models_dir() else {
+        eprintln!("skipped: PUW_MODELS_DIR not set");
+        return;
+    };
+    let dir = tempfile::tempdir().unwrap();
+    let paths = one_shoot(3, &[(0, 0), (1, 1), (24, -16)], 0.14, dir.path());
+    for cleaned in [false, true] {
+        let f = fixture(Some(models.clone()));
+        f.core.add_paths(&paths).unwrap();
+        let out = f.core.detect(&noop).unwrap();
+        let rep = out.representative;
+        let (w, h) = f.core.edit_size(rep).unwrap();
+        let guess = GrayImage::from_raw(w, h, f.core.start_area(rep).unwrap()).unwrap();
+        let truth = ground_truth("00.png");
+        assert!(
+            covered(&truth, guess.as_raw()) >= 0.8,
+            "premise: the guess holds the watermark"
+        );
+        let drawing = if cleaned {
+            // The part of the guess around the watermark, a little erased at its top.
+            let mut d = GrayImage::new(w, h);
+            let near = puw_core::mask::dilate(&truth, 40);
+            for (x, y, p) in guess.enumerate_pixels() {
+                if p.0[0] != 0 && near.get_pixel(x, y).0[0] != 0 && y > 768 + 4 {
+                    d.put_pixel(x, y, *p);
+                }
+            }
+            f.core.put_draft(rep, w, h, d.as_raw().clone()).unwrap();
+            d
+        } else {
+            guess
+        };
+        for &id in out.sample.iter().filter(|&&id| id != rep) {
+            let p = f.core.place_on(rep, id).unwrap();
+            eprintln!("cleaned {cleaned}, strip photo {id}: {p:?}");
+            assert_ne!(p.status, puw_app::Placed::NotFound, "photo {id}");
+            assert!(
+                (p.scale_x - 1.0).abs() < 0.01
+                    && (p.scale_y - 1.0).abs() < 0.01
+                    && p.dx.abs() < 0.01 * w as f32
+                    && p.dy.abs() < 0.01 * w as f32,
+                "photo {id} placed elsewhere: {p:?}"
+            );
+        }
+        f.core.confirm_set_area(rep).unwrap();
+        let sum = f.core.match_all(&noop).unwrap();
+        eprintln!("cleaned {cleaned}: {sum:?}");
+        assert_eq!(sum.not_found, 0, "{sum:?}");
+        for p in f.core.photo_states() {
+            assert_eq!(
+                f.core.area(p.id).unwrap(),
+                *drawing.as_raw(),
+                "photo {} is not at the set position",
+                p.id
+            );
+        }
+    }
+}
+
 /// Model files that are gone are missing app data (download again), not a photo problem.
 #[test]
 fn missing_models_are_missing_data() {

@@ -527,31 +527,42 @@ fn prior_unsure_on_weak_evidence() {
     assert!(iou(&m.mask, &gts[5]) >= 0.8);
 }
 
-#[test]
-fn prior_ignored_without_support() {
-    let dir = tempfile::tempdir().expect("tempdir");
-    let (photos, gts, _) = faint_fixed(0.12, dir.path());
-    // Another set whose strong mark sits 400 px higher than the template's.
+/// Photos `which` of the fixed set with their (stored, alpha 0.25) mark moved 400 px up, on
+/// their clean scene, written as PNGs into `dir`; with the moved ground truth.
+fn moved_up(which: std::ops::Range<u32>, dir: &Path) -> (Vec<PathBuf>, Vec<Mask>) {
     let set = common::synth_dir().join("fixed");
-    let moved_dir = tempfile::tempdir().expect("tempdir");
-    let mut moved = Vec::new();
-    for i in 0..4 {
+    let (mut paths, mut truths) = (Vec::new(), Vec::new());
+    for i in which {
         let clean = open_rgb(&set.join("clean").join(format!("0{i}.png")));
         let marked = open_rgb(&set.join("marked").join(format!("0{i}.png")));
+        let gt = open_mask(&set.join("mask").join(format!("0{i}.png")));
         let mut out = clean.clone();
         let (w, h) = clean.dimensions();
+        let mut truth = Mask::new(w, h);
         for y in 400..h {
             for x in 0..w {
                 let (m, c) = (marked.get_pixel(x, y), clean.get_pixel(x, y));
                 if m != c {
                     out.put_pixel(x, y - 400, *m);
                 }
+                truth.put_pixel(x, y - 400, *gt.get_pixel(x, y));
             }
         }
-        let path = moved_dir.path().join(format!("m{i}.png"));
+        let path = dir.join(format!("m{i}.png"));
         out.save(&path).expect("save");
-        moved.push(path);
+        paths.push(path);
+        truths.push(truth);
     }
+    (paths, truths)
+}
+
+#[test]
+fn prior_ignored_without_support() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let (photos, gts, _) = faint_fixed(0.12, dir.path());
+    // Another set whose strong mark sits 400 px higher than the template's.
+    let moved_dir = tempfile::tempdir().expect("tempdir");
+    let (moved, _) = moved_up(0..4, moved_dir.path());
     let elsewhere = no_progress_layers(&moved);
     assert!(
         elsewhere.get(1536, 1024).is_some(),
@@ -647,13 +658,30 @@ fn prior_matches_a_drawing_grown_beyond_the_mark() {
     }
 }
 
-/// On the random and styles sets the batch layer holds static scene edges and the marks move.
-/// Whatever the drawing (the true area, or grown by 48 px), the set position never places the
-/// template on a photo whose own mark is elsewhere.
+/// Share of the pixels set in `truth` that are also set in `m`.
+fn covers(m: &Mask, truth: &Mask) -> f64 {
+    let (all, hit) = truth
+        .as_raw()
+        .iter()
+        .zip(m.as_raw())
+        .filter(|(t, _)| **t != 0)
+        .fold((0u64, 0u64), |(a, h), (_, v)| (a + 1, h + (*v != 0) as u64));
+    hit as f64 / all.max(1) as f64
+}
+
+/// Marks that move are never placed at the set position, and a mark the search finds where it
+/// moved to stays found there.
+///
+/// 1. The random and styles sets: the batch layer holds static scene edges and the marks move.
+///    Whatever the drawing (the true area, or grown by 48 px), a set-position result must cover
+///    at least half of the photo's own mark.
+/// 2. A set position the layer does support (the fixed set's eight photos, the drawing the true
+///    area of photo 0, as it is and grown by 48 px) on photos whose mark moved 400 px up: no
+///    set-position result, and every photo the search alone finds where its mark is (IoU at
+///    least 0.5 with the moved mark) is found there by [`match_with`] too, with the same score.
 #[test]
 fn prior_never_places_a_moving_mark() {
     let synth = common::synth_dir();
-    let mut priors = 0;
     for set in ["random", "styles"] {
         let mut names: Vec<String> = fs::read_dir(synth.join(set).join("marked"))
             .expect("read dir")
@@ -681,20 +709,58 @@ fn prior_never_places_a_moving_mark() {
                 let Some(prior) = PositionPrior::new(&tmpl, &layers) else {
                     continue;
                 };
-                priors += 1;
                 for (j, p) in photos.iter().enumerate() {
                     if j == i || p.dimensions() != img.dimensions() {
                         continue;
                     }
                     let m = match_with(&tmpl, Some(&prior), p, &AtomicBool::new(false));
                     if m.basis == MatchBasis::SetPosition {
-                        let q = iou(&m.mask, &truths[j]);
-                        assert!(q > 0.0, "{set} {i} grow {grow} on {j}: {:?}", m.status);
+                        let c = covers(&m.mask, &truths[j]);
+                        assert!(
+                            c >= 0.5,
+                            "{set} {i} grow {grow} on {j}: {:?} covers {c:.2}",
+                            m.status
+                        );
                     }
                 }
             }
         }
     }
-    // Some drawings do pass a support rule (a tiny layer near the mark): the scores decide.
-    assert!(priors > 0, "premise: no prior was ever made");
+
+    let set = synth.join("fixed");
+    let fixed: Vec<PathBuf> = (0..8)
+        .map(|i| set.join("marked").join(format!("0{i}.png")))
+        .collect();
+    let layers = no_progress_layers(&fixed);
+    let reference = open_rgb(&fixed[0]);
+    let dir = tempfile::tempdir().expect("tempdir");
+    // Photo 0's own scene is the template's, so its moved copy is left out (see
+    // `negatives_stay_not_found`).
+    let (moved, truths) = moved_up(1..8, dir.path());
+    let mut kept = 0;
+    for grow in [0, 48] {
+        let drawing = mask::dilate(&open_mask(&set.join("mask/00.png")), grow);
+        let tmpl = build_template(&reference, &drawing);
+        let prior = PositionPrior::new(&tmpl, &layers).expect("premise: the layer supports it");
+        for (path, truth) in moved.iter().zip(&truths) {
+            let p = open_rgb(path);
+            let m = match_with(&tmpl, Some(&prior), &p, &AtomicBool::new(false));
+            assert_ne!(
+                m.basis,
+                MatchBasis::SetPosition,
+                "{path:?} grow {grow}: {:?}",
+                m.status
+            );
+            let free = find(&tmpl, &p);
+            let moved_by =
+                |r: &puw_core::MatchResult| r.transform.map(|t| ((t.dx).round(), (t.dy).round()));
+            if free.status == MatchStatus::Found && covers(&free.mask, truth) >= 0.5 {
+                kept += 1;
+                assert_eq!(m.status, MatchStatus::Found, "{path:?} grow {grow}");
+                assert_eq!(m.confidence, free.confidence, "{path:?} grow {grow}");
+                assert_eq!(moved_by(&m), moved_by(&free), "{path:?} grow {grow}");
+            }
+        }
+    }
+    assert!(kept > 0, "premise: the search finds some moved marks");
 }

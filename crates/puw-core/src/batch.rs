@@ -2,7 +2,8 @@
 //!
 //! The per-pixel median of image gradients over the set keeps a fixed watermark and averages
 //! the varying content out (Dekel et al., CVPR 2017). The method and thresholds follow the
-//! research prototype (numpy/scipy/skimage), so the numbers keep their meaning.
+//! research prototype (numpy/scipy/skimage), so the numbers keep their meaning. One change: with
+//! only 3 or 4 photos an edge must show on 3 of them, not on half (see [`AGREE`]).
 
 use crate::mask::{self, Mask};
 use crate::{Error, Result};
@@ -13,6 +14,14 @@ pub const BATCH_LOW: f32 = 40.0;
 /// High hysteresis threshold on the median gradient magnitude.
 pub const BATCH_HIGH: f32 = 80.0;
 
+/// How many photos must show an edge (the same sign of the derivative) for it to stay in the
+/// batch layer when the set has 3 or 4 photos (see `agreed`); from 5 photos on, the median
+/// already asks for 3. The median of 3 photos keeps every edge that 2 of them share, and photos
+/// of one shoot share most of the scene: on the real set's triples it kept 1.0-1.6 % of the
+/// photo above [`BATCH_HIGH`], so the layer covered more than [`MAX_COVERAGE`] (no layer) or was
+/// half scene. Asking all 3 keeps 0.2-0.3 %: 55-60 % of the 8-photo layer, and 80-99 % of what
+/// it keeps lies within 10 px of that layer. See `docs/notes/thresholds.md`.
+pub const AGREE: usize = 3;
 /// Border (in pixels) added around the strong pixels to form the region of interest.
 const ROI_PAD: u32 = 60;
 /// Result is discarded when it covers more than this fraction of the image.
@@ -39,9 +48,10 @@ type MagImage = ImageBuffer<Luma<f32>, Vec<f32>>;
 ///
 /// Each image gets its own 2-D Sobel (as `scipy.ndimage.sobel`, 'reflect' boundary) on its
 /// ITU-R 601 luma; gx and gy are then medianed separately across images and combined with
-/// `hypot`. Works row by row, so beyond the images it needs only the output and a few rows per
-/// image. Errors with [`Error::SizeMismatch`] when sizes differ and [`Error::Image`] for an
-/// empty slice.
+/// `hypot`. For 3 or 4 images the median is replaced by the value [`AGREE`] of them reach on
+/// the same side of zero (`agreed`). Works row by row, so beyond the images it needs only the
+/// output and a few rows per image. Errors with [`Error::SizeMismatch`] when sizes differ and
+/// [`Error::Image`] for an empty slice.
 pub fn median_gradient(images: &[&RgbImage]) -> Result<MagImage> {
     let first = images
         .first()
@@ -178,11 +188,11 @@ fn median_core(
             for (k, v) in vals.iter_mut().enumerate() {
                 *v = gx[k * wu + x];
             }
-            let mx = median(&mut vals);
+            let mx = agreed(&mut vals);
             for (k, v) in vals.iter_mut().enumerate() {
                 *v = gy[k * wu + x];
             }
-            let my = median(&mut vals);
+            let my = agreed(&mut vals);
             *o = mx.hypot(my);
         }
     }
@@ -224,6 +234,26 @@ pub(crate) fn sobel_magnitude(luma: &[f32], w: usize, h: usize) -> Vec<f32> {
         }
     }
     out
+}
+
+/// The value at least [`AGREE`] of `v` reach on the same side of zero (the [`AGREE`]-th largest
+/// when it is positive, else the [`AGREE`]-th smallest when that is negative, else 0) for 3 or
+/// 4 values; the [`median`] for any other count (from 5 values on, the median of an odd count
+/// is that value already). Reorders `v`.
+fn agreed(v: &mut [f32]) -> f32 {
+    let n = v.len();
+    if !(AGREE..2 * AGREE - 1).contains(&n) {
+        return median(v);
+    }
+    v.sort_unstable_by(f32::total_cmp);
+    let (hi, lo) = (v[n - AGREE], v[AGREE - 1]);
+    if hi > 0.0 {
+        hi
+    } else if lo < 0.0 {
+        lo
+    } else {
+        0.0
+    }
 }
 
 /// numpy-style median (mean of the two middle values for an even count). Reorders `v`.
