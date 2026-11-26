@@ -98,6 +98,52 @@ export interface PhotoState {
   included: boolean;
   reviewed: boolean;
   hasArea: boolean;
+  /** The group its result or own area came from. */
+  group: number | null;
+  /** In group `group`: ticked, readable, with a non-empty area, and not an unsure photo nobody opened. */
+  member: boolean;
+}
+
+/** How sure a strip placement is. */
+export type Placed = 'found' | 'unsure' | 'notFound';
+
+/**
+ * Where the shared drawing lands on a strip photo: the reference photo's edit-image pixel
+ * (x, y) goes to (x * scaleX + dx, y * scaleY + dy) on this photo's edit image. All 0 for
+ * 'notFound'.
+ */
+export interface StripPlacement {
+  status: Placed;
+  scaleX: number;
+  scaleY: number;
+  dx: number;
+  dy: number;
+}
+
+/** A watermark group as step 3 and Done show it. */
+export interface GroupInfo {
+  number: number;
+  /** Its members. */
+  photos: number;
+  /** The saved watermark it was started from. */
+  savedName: string | null;
+  /** That saved watermark's area was changed in step 2. */
+  edited: boolean;
+  /** It can be saved as a watermark for next time. */
+  canSave: boolean;
+}
+
+/** Every group, and where the photos in none stand. */
+export interface GroupsState {
+  groups: GroupInfo[];
+  /** The current group (the last one made). */
+  current: number | null;
+  /** The current group's matching has finished. */
+  matched: boolean;
+  /** Readable photos in no group. */
+  leftovers: number;
+  /** Photos that cannot be read. */
+  unreadable: number;
 }
 
 export interface OutputCheck {
@@ -118,9 +164,17 @@ export interface Failed {
   reason: string;
 }
 
+/** A photo in no group, which a removal leaves alone. */
+export interface LeftOut {
+  id: PhotoId;
+  name: string;
+}
+
 export interface RemoveReport {
   done: Done[];
   failed: Failed[];
+  /** The photos with no group when the run started, in list order. */
+  leftOut: LeftOut[];
   cancelled: boolean;
 }
 

@@ -86,7 +86,7 @@ function stepFour(platform = 'windows'): Wizard {
   return wizard;
 }
 
-const report = (r: Partial<RemoveReport> = {}): RemoveReport => ({ done: [], failed: [], cancelled: false, ...r });
+const report = (r: Partial<RemoveReport> = {}): RemoveReport => ({ done: [], failed: [], leftOut: [], cancelled: false, ...r });
 const done = (id: number, output = `/photos/Without watermark/p${id}.jpg`) => ({ id, output });
 
 function wizardWith(r: RemoveReport): Wizard {
@@ -590,7 +590,7 @@ describe('Done', () => {
     expect(m.saveWatermark).toHaveBeenCalledTimes(1);
     await fireEvent.click(screen.getByRole('button', { name: copy.done.startNewSet }));
     await waitFor(() => expect(wizard.screen).toBe('add'));
-    expect(wizard.watermarkSaved).toBe(false);
+    expect(wizard.savedGroups).toEqual([]);
     expect(wizard.resultIndex).toBe(0);
   });
 
@@ -599,9 +599,20 @@ describe('Done', () => {
     const field = (await screen.findByDisplayValue('Watermark from 2026-11-25')) as HTMLInputElement;
     expect(screen.getByLabelText(copy.done.name)).toBe(field);
     await fireEvent.click(screen.getByRole('button', { name: 'Save this watermark for next time' }));
-    expect(m.saveWatermark).toHaveBeenCalledWith('Watermark from 2026-11-25');
+    expect(m.saveWatermark).toHaveBeenCalledWith(1, 'Watermark from 2026-11-25');
     expect(await screen.findByText('Saved')).toBeTruthy();
     expect(screen.queryByRole('button', { name: 'Save this watermark for next time' })).toBeNull();
+  });
+
+  it('saveWatermarkSavesTheCurrentGroup', async () => {
+    const wizard = wizardWith(report({ done: [done(1)] }));
+    wizard.useGroup(2);
+    render(Done, { wizard });
+    await screen.findByDisplayValue('Watermark from 2026-11-25');
+    await fireEvent.click(screen.getByRole('button', { name: copy.done.saveWatermark }));
+    expect(await screen.findByText(copy.done.savedWatermark)).toBeTruthy();
+    expect(m.saveWatermark).toHaveBeenCalledWith(2, 'Watermark from 2026-11-25');
+    expect(wizard.savedGroups).toEqual([2]);
   });
 
   it('saveWatermarkTakesTheTypedNameAndNeedsOne', async () => {
@@ -616,18 +627,20 @@ describe('Done', () => {
     await fireEvent.click(screen.getByRole('button', { name: copy.done.saveWatermark }));
     expect(await screen.findByText(copy.done.saveFailed)).toBeTruthy();
     await fireEvent.click(screen.getByRole('button', { name: copy.done.saveWatermark }));
-    expect(m.saveWatermark).toHaveBeenLastCalledWith('Studio');
+    expect(m.saveWatermark).toHaveBeenLastCalledWith(1, 'Studio');
     expect(await screen.findByText(copy.done.savedWatermark)).toBeTruthy();
   });
 
   it('newSetClearsAndGoesToAdd', async () => {
     const wizard = stepFive(report({ done: [done(1)] }));
-    wizard.outcome = { sample: [1], representative: 1 };
+    wizard.startDraft({ sample: [1], representative: 1 }, [1]);
+    wizard.confirmDraft();
     await fireEvent.click(screen.getByRole('button', { name: 'Start a new set' }));
     await waitFor(() => expect(wizard.screen).toBe('add'));
     expect(m.clearPhotos).toHaveBeenCalledTimes(1);
     expect(wizard.report).toBeNull();
-    expect(wizard.outcome).toBeNull();
+    expect(wizard.drawing).toBeNull();
+    expect(wizard.groups).toBe(0);
     expect(wizard.canGoBack).toBe(false);
   });
 

@@ -17,7 +17,9 @@
   let { wizard }: { wizard: Wizard } = $props();
 
   const c = copy.done;
-  const EMPTY: RemoveReport = { done: [], failed: [], cancelled: false };
+  const EMPTY: RemoveReport = { done: [], failed: [], leftOut: [], cancelled: false };
+  // svelte-ignore state_referenced_locally
+  const group = wizard.current?.group ?? 1;
 
   // svelte-ignore state_referenced_locally
   const report = wizard.report ?? EMPTY;
@@ -96,8 +98,8 @@
     }
     saving = true;
     try {
-      await saveWatermark(chosen);
-      wizard.watermarkSaved = true;
+      await saveWatermark(group, chosen);
+      if (!wizard.savedGroups.includes(group)) wizard.savedGroups = [...wizard.savedGroups, group];
     } catch (err) {
       saveError = message(err, c.saveFailed);
     } finally {
@@ -167,7 +169,7 @@
   {/if}
 
   <div class="keep">
-    {#if wizard.watermarkSaved}
+    {#if wizard.savedGroups.includes(group)}
       <p class="saved" role="status">{c.savedWatermark}</p>
     {:else}
       <form onsubmit={save}>

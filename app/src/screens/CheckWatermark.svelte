@@ -34,6 +34,7 @@
     dropDraft,
     editSize,
     getArea,
+    getStartArea,
     imageUrl,
     openPhoto,
     preview,
@@ -67,7 +68,7 @@
   // svelte-ignore state_referenced_locally
   const single = mode === 'photo';
   // svelte-ignore state_referenced_locally
-  const outcome = single ? null : wizard.outcome;
+  const outcome = single ? null : (wizard.drawing?.outcome ?? null);
   const sample: PhotoId[] = outcome
     ? outcome.sample.includes(outcome.representative)
       ? [...outcome.sample]
@@ -128,7 +129,8 @@
   }
 
   async function loadArea(id: PhotoId): Promise<Area> {
-    const [size, bytes] = await Promise.all([editSize(id), getArea(id)]);
+    // Step 2 starts from the step-2 guess; a single photo shows the area step 3 has for it.
+    const [size, bytes] = await Promise.all([editSize(id), single ? getArea(id) : getStartArea(id)]);
     if (bytes.length !== size.width * size.height) {
       throw { message: c.areaFailed, details: `${bytes.length} bytes for ${size.width}x${size.height}` };
     }

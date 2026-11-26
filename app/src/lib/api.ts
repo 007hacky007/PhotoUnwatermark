@@ -17,6 +17,7 @@ import type {
   DeviceStatus,
   DownloadProgress,
   EditSize,
+  GroupsState,
   ImageRoute,
   MatchSummary,
   OutputCheck,
@@ -27,6 +28,7 @@ import type {
   RemoveReport,
   SavedInfo,
   Settings,
+  StripPlacement,
   Suggestion,
 } from './types';
 
@@ -119,8 +121,8 @@ export const suggestSaved = () => job((t) => invoke<Suggestion | null>('suggest_
 export const detect = (onEvent: (e: ProgressEvent) => void) =>
   job((t) => invoke<DetectOutcome>('detect', { onEvent: channel(onEvent), job: t }));
 
-export const useSaved = (id: string, onEvent: (e: ProgressEvent) => void) =>
-  job((t) => invoke<DetectOutcome>('use_saved', { id, onEvent: channel(onEvent), job: t }));
+/** Starts the next group from saved watermark `id`, reading no photo; resolves with its number. */
+export const useSaved = (id: string) => job((t) => invoke<number>('use_saved', { id, job: t }));
 
 // Step 2: the watermark area
 
@@ -130,6 +132,18 @@ export const editSize = (id: PhotoId) => invoke<EditSize>('edit_size', { id });
 export async function getArea(id: PhotoId): Promise<Uint8Array> {
   return new Uint8Array(await invoke<ArrayBuffer>('get_area', { id }));
 }
+
+/** The area step 2 starts from, at edit size like `getArea`: the step-2 guess for a photo in no group. */
+export async function getStartArea(id: PhotoId): Promise<Uint8Array> {
+  return new Uint8Array(await invoke<ArrayBuffer>('start_area', { id }));
+}
+
+/** Where the shared drawing on photo `reference` lands on photo `id`. */
+export const placeOn = (reference: PhotoId, id: PhotoId) =>
+  job((t) => invoke<StripPlacement>('place_on', { reference, id, job: t }));
+
+/** The photos step 2 shows for the current group, and the one it opens first. */
+export const groupSample = () => invoke<DetectOutcome>('group_sample');
 
 /** Hands the area the editor shows to the app (edit size; non-zero bytes are the area). */
 export const putDraft = (id: PhotoId, width: number, height: number, area: Uint8Array) =>
@@ -142,6 +156,9 @@ export const dropDraft = (id: PhotoId) => invoke<void>('drop_draft', { id });
 
 export const confirmSetArea = (id: PhotoId) => job((t) => invoke<void>('confirm_set_area', { id, job: t }));
 
+/** Makes the area of photo `id` the next group's watermark area; that group becomes the current one. */
+export const confirmNewGroup = (id: PhotoId) => job((t) => invoke<void>('confirm_new_group', { id, job: t }));
+
 export const preview = (id: PhotoId, onEvent: (e: ProgressEvent) => void) =>
   job((t) => invoke<void>('preview', { id, onEvent: channel(onEvent), job: t }));
 
@@ -151,6 +168,12 @@ export const matchAll = (onEvent: (e: ProgressEvent) => void) =>
   job((t) => invoke<MatchSummary>('match_all', { onEvent: channel(onEvent), job: t }));
 
 export const photoStates = () => invoke<PhotoState[]>('photo_states');
+
+/** Every group, and where the photos in none stand. */
+export const groupsState = () => invoke<GroupsState>('groups');
+
+/** Removes every group and every photo's result. */
+export const clearGroups = () => job((t) => invoke<void>('clear_groups', { job: t }));
 
 export const openPhoto = (id: PhotoId) => invoke<void>('open_photo', { id });
 
@@ -206,8 +229,8 @@ export const closeWindow = () => getCurrentWindow().destroy();
 
 // Saved watermarks
 
-/** Saves the set's watermark under `name` and returns its id. */
-export const saveWatermark = (name: string) => invoke<string>('save_watermark', { name });
+/** Saves group `group`'s watermark under `name` and returns its id. */
+export const saveWatermark = (group: number, name: string) => invoke<string>('save_watermark', { group, name });
 
 export const defaultWatermarkName = () => invoke<string>('default_watermark_name');
 

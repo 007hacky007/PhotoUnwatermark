@@ -9,6 +9,7 @@ vi.mock('../lib/api', () => ({
   cancelJob: vi.fn(),
   editSize: vi.fn(),
   getArea: vi.fn(),
+  getStartArea: vi.fn(),
   putDraft: vi.fn(),
   dropDraft: vi.fn(),
   preview: vi.fn(),
@@ -26,6 +27,7 @@ import { assertPlainText } from './plainText';
 
 const editSize = vi.mocked(api.editSize);
 const getArea = vi.mocked(api.getArea);
+const getStartArea = vi.mocked(api.getStartArea);
 const putDraft = vi.mocked(api.putDraft);
 const preview = vi.mocked(api.preview);
 const confirmSetArea = vi.mocked(api.confirmSetArea);
@@ -46,10 +48,10 @@ const gpu: DeviceStatus = { state: 'gpu', reason: null, details: null, fixes: []
 
 /** Step 2 for a set whose sample is `outcome`, with `areas` as each photo's stored area. */
 async function openSet(areas: Record<number, Uint8Array>, outcome: DetectOutcome = { sample: [1, 2], representative: 1 }) {
-  getArea.mockImplementation(async (id) => (areas[id] ?? empty()).slice());
+  getStartArea.mockImplementation(async (id) => (areas[id] ?? empty()).slice());
   const wizard = createWizard();
   wizard.go('add');
-  wizard.outcome = outcome;
+  wizard.startDraft(outcome);
   wizard.go('check');
   const view = render(CheckWatermark, { wizard });
   await ready();
@@ -200,11 +202,13 @@ describe('Check the watermark', () => {
     await paint();
     await fireEvent.click(second);
     expect(second.getAttribute('aria-pressed')).toBe('true');
-    await waitFor(() => expect(getArea).toHaveBeenCalledWith(2));
+    await waitFor(() => expect(getStartArea).toHaveBeenCalledWith(2));
     await ready();
     await fireEvent.click(first);
     await ready();
-    expect(getArea).toHaveBeenCalledTimes(2);
+    expect(getStartArea).toHaveBeenCalledTimes(2);
+    // Step 2 starts from the step-2 guess, never from step 3's areas.
+    expect(getArea).not.toHaveBeenCalled();
     await fireEvent.click(screen.getByRole('button', { name: copy.checkWatermark.looksRight }));
     await waitFor(() => expect(confirmSetArea).toHaveBeenCalledWith(1));
     expect(putDraft).toHaveBeenCalledWith(1, W, H, new Uint8Array(W * H).fill(255));
@@ -264,6 +268,7 @@ describe('Check the watermark', () => {
     await ready(copy.checkWatermark.savePhoto);
     expect(openPhoto).toHaveBeenCalledWith(7);
     expect(getArea).toHaveBeenCalledWith(7);
+    expect(getStartArea).not.toHaveBeenCalled();
     expect(screen.getByText(copy.checkWatermark.photoHelp)).toBeTruthy();
     expect(screen.queryByText(copy.checkWatermark.help)).toBeNull();
     expect(screen.queryByRole('group', { name: copy.checkWatermark.strip })).toBeNull();
@@ -389,7 +394,7 @@ describe('Check the watermark', () => {
   it('noStrokesWhileTheNextPhotoLoads', async () => {
     await openSet({ 1: empty() });
     let resolve: (a: Uint8Array) => void = () => {};
-    getArea.mockImplementationOnce(() => new Promise((r) => (resolve = r)));
+    getStartArea.mockImplementationOnce(() => new Promise((r) => (resolve = r)));
     await fireEvent.click(screen.getByRole('button', { name: copy.checkWatermark.stripPhoto(2, 2) }));
     // The first photo's red layer is not shown over the second photo, and painting does nothing.
     expect(redLayer().style.visibility).toBe('hidden');
@@ -421,11 +426,11 @@ describe('Check the watermark', () => {
 
   it('failedStripLoadOffersTryAgain', async () => {
     await openSet({ 1: someArea() });
-    getArea.mockRejectedValueOnce({ message: '', details: 'gone' });
+    getStartArea.mockRejectedValueOnce({ message: '', details: 'gone' });
     await fireEvent.click(screen.getByRole('button', { name: copy.checkWatermark.stripPhoto(2, 2) }));
     await fireEvent.click(await screen.findByRole('button', { name: copy.checkWatermark.tryAgain }));
     await ready();
-    expect(getArea).toHaveBeenLastCalledWith(2);
+    expect(getStartArea).toHaveBeenLastCalledWith(2);
   });
 
   it('shortcutLabelsComeFromCopy', async () => {

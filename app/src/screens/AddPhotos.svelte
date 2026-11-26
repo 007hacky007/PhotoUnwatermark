@@ -33,7 +33,7 @@
   let check: Promise<unknown> | null = null;
   /** The running job, or null while this screen is the one showing. */
   type Run = (onEvent: (e: ProgressEvent) => void) => Promise<DetectOutcome>;
-  let job: { run: Run; first?: string } | null = $state(null);
+  let job: { run: Run } | null = $state(null);
   /** Counts offers asked for, so an answer that arrives after a newer question is dropped. */
   let asked = 0;
 
@@ -156,7 +156,7 @@
     if (photos.length > 0) refreshOffer();
   }
 
-  async function begin(run: Run, first?: string) {
+  async function begin(run: Run) {
     if (adding || job !== null) return;
     adding = true;
     try {
@@ -165,7 +165,7 @@
       adding = false;
     }
     wizard.busy = true;
-    job = { run, first };
+    job = { run };
   }
 
   /** Step 2 again as it was when the photos did not change, else a new search. */
@@ -184,10 +184,25 @@
     wizard.go('welcome');
   }
 
-  function useSuggested() {
-    if (suggestion === null) return;
+  /** Group 1 from the saved watermark, straight to step 3: nothing is looked for first. */
+  async function useSuggested() {
+    if (suggestion === null || adding || job !== null) return;
     const id = suggestion.id;
-    void begin((onEvent) => useSaved(id, onEvent), copy.finding.neutral);
+    const ids = photos.map((p) => p.id);
+    adding = true;
+    error = null;
+    wizard.busy = true;
+    try {
+      await stopCheck();
+      wizard.useGroup(await useSaved(id), ids);
+    } catch (e) {
+      error = (e as Partial<UserError> | null)?.message || copy.saved.useFailed;
+      return;
+    } finally {
+      adding = false;
+      wizard.busy = false;
+    }
+    wizard.go('checkAll');
   }
 
   function leave() {
@@ -196,8 +211,7 @@
   }
 
   function done(outcome: DetectOutcome) {
-    wizard.outcome = outcome;
-    wizard.outcomePhotos = photos.map((p) => p.id);
+    wizard.startDraft(outcome, photos.map((p) => p.id));
     wizard.busy = false;
     job = null;
     wizard.go('check');
@@ -205,7 +219,7 @@
 </script>
 
 {#if job !== null}
-  <Finding run={job.run} first={job.first} onDone={done} onBack={leave} onDownload={downloadAgain} />
+  <Finding run={job.run} onDone={done} onBack={leave} onDownload={downloadAgain} />
 {:else}
   <section class="add">
     <div class="drop" class:hovering role="group" aria-label={copy.addPhotos.drop}>

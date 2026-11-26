@@ -2,9 +2,21 @@ import { describe, expect, it } from 'vitest';
 import { copy } from '../lib/copy';
 import { assertPlainText, plainTextProblems } from './plainText';
 
+/** Sample arguments for the functions that do not take numbers or names. */
+const SAMPLES: Record<string, unknown[][]> = {
+  'copy.groups.line': [
+    [[], 1],
+    [[{ number: 1, photos: 1 }], 0],
+    [[{ number: 1, photos: 140 }, { number: 2, photos: 52 }], 38],
+  ],
+};
+
 /** Every string in `copy`, with each function called for a few sample values. */
 function allTexts(value: unknown, path = 'copy'): [string, string][] {
   if (typeof value === 'string') return [[path, value]];
+  if (typeof value === 'function' && SAMPLES[path]) {
+    return SAMPLES[path].map((args) => [`${path}(${JSON.stringify(args)})`, String(value(...args))] as [string, string]);
+  }
   if (typeof value === 'function') {
     const samples = [0, 1, 2, 37, 118, 1024];
     return samples.map((n) => {
@@ -51,6 +63,55 @@ describe('copy', () => {
     expect(copy.device.fixes.downloadHelper(120)).toBe('Download GPU helper (120 MB)');
     expect(copy.device.fixes.tryAgain).toBe('Try again');
     expect(copy.device.fixes.useProcessor).toBe('Use processor anyway');
+
+    const g = copy.groups;
+    expect(g.checkHeading(2)).toBe('Group 2: check the watermark');
+    expect(g.checkAllHeading(2)).toBe('Group 2: check all photos');
+    expect(g.label(3)).toBe('Group 3');
+    expect(g.noGroup).toBe('No group yet');
+    expect(g.notInGroup).toBe('Not in a group yet');
+    expect(
+      g.line(
+        [
+          { number: 1, photos: 140 },
+          { number: 2, photos: 52 },
+        ],
+        38,
+      ),
+    ).toBe('Group 1: 140 photos. Group 2: 52 photos. 38 photos have no group yet.');
+    expect(g.line([{ number: 1, photos: 1 }], 1)).toBe('Group 1: 1 photo. 1 photo has no group yet.');
+    expect(g.line([{ number: 1, photos: 140 }], 0)).toBe('Group 1: 140 photos.');
+    expect(g.findNext(38)).toBe('Find the next watermark in these 38');
+    expect(g.findNext(1)).toBe('Find the next watermark in this photo');
+    expect(g.useSaved).toBe('Use a saved watermark...');
+    expect(g.leaveOut).toBe('Leave them out');
+    expect(g.confirmLeftovers(38, 192)).toBe(
+      '38 photos have no group yet. Remove from the 192 photos in groups and leave the 38 out?',
+    );
+    expect(g.confirmLeftovers(1, 192)).toBe(
+      '1 photo has no group yet. Remove from the 192 photos in groups and leave it out?',
+    );
+    expect(g.confirmLeftovers(2, 1)).toBe(
+      '2 photos have no group yet. Remove from the 1 photo in groups and leave the 2 out?',
+    );
+    expect(g.confirmRemove).toBe('Remove');
+    expect(g.nextFailed).toBe('The next watermark could not be looked for.');
+
+    const w = copy.checkWatermark;
+    expect(w.notFoundHere).toBe('The watermark was not found on this photo.');
+    expect(w.unsureHere).toBe('Not sure the watermark is here on this photo.');
+    expect(w.placing).toBe('Finding the watermark on this photo...');
+    expect(w.placeFailed).toBe('The watermark area could not be shown on this photo.');
+
+    expect(copy.saved.useForThese).toBe('Use for these photos');
+    expect(copy.saved.useOne('Studio')).toBe('Use Studio for these photos');
+    expect(copy.saved.useFailed).toBe('The saved watermark could not be used.');
+
+    expect(copy.done.leftOut(38)).toBe('Left out: 38 photos');
+    expect(copy.done.leftOut(1)).toBe('Left out: 1 photo');
+    expect(copy.done.groupName(2)).toBe('Name for the saved watermark of group 2');
+    expect(copy.done.groupDefault('Watermark from 2026-11-26', 2)).toBe('Watermark from 2026-11-26 (group 2)');
+    expect(copy.done.editedName('Studio')).toBe('Studio (edited)');
   });
 
   it('countsReadNaturally', () => {

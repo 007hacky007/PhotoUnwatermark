@@ -12,9 +12,10 @@ vi.mock('../lib/api', () => ({
   suggestSaved: vi.fn(),
   detect: vi.fn(),
   useSaved: vi.fn(),
+  photoStates: vi.fn(),
+  listSaved: vi.fn(),
   imageUrl: vi.fn((route: string, id: number) => `puw://${route}/${id}`),
   onDragDrop: vi.fn(),
-  listSaved: vi.fn(),
   choosePhotos: vi.fn(),
   chooseFolder: vi.fn(),
 }));
@@ -170,17 +171,34 @@ describe('Add photos', () => {
     return view;
   }
 
-  it('yesUsesSaved', async () => {
-    const job = openJob();
-    useSaved.mockImplementation(job.impl);
+  it('yesUsesSavedAndGoesToStepThree', async () => {
+    let answer: (n: number) => void = () => {};
+    useSaved.mockImplementation(() => new Promise<number>((r) => (answer = r)));
+    // Step 3 stays on its first read.
+    vi.mocked(api.photoStates).mockReturnValue(new Promise(() => {}));
     const { wizard } = await offered();
     await fireEvent.click(screen.getByRole('button', { name: copy.addPhotos.yes }));
-    expect(useSaved).toHaveBeenCalledWith('s1', expect.any(Function));
+    await waitFor(() => expect(useSaved).toHaveBeenCalledWith('s1'));
+    // No wait screen: nothing is looked for before step 3.
+    expect(screen.queryByText(copy.finding.neutral)).toBeNull();
+    expect(screen.queryByRole('progressbar')).toBeNull();
+    answer(1);
+    await waitFor(() => expect(wizard.screen).toBe('checkAll'));
+    expect(wizard.current).toEqual({ group: 1, outcome: null });
+    expect(wizard.groups).toBe(1);
+    expect(wizard.draft).toBeNull();
+    expect(wizard.outcomePhotos).toEqual([1, 2]);
     expect(detect).not.toHaveBeenCalled();
-    expect(wizard.busy).toBe(true);
-    job.finish();
-    await waitFor(() => expect(wizard.screen).toBe('check'));
-    expect(wizard.outcome).toEqual(outcome);
+  });
+
+  it('failedUseOfSavedStaysAndSaysSo', async () => {
+    useSaved.mockRejectedValueOnce({ message: '', details: 'gone' });
+    const { wizard, container } = await offered();
+    await fireEvent.click(screen.getByRole('button', { name: copy.addPhotos.yes }));
+    expect(await screen.findByText(copy.saved.useFailed)).toBeTruthy();
+    assertPlainText(container);
+    expect(wizard.screen).toBe('add');
+    expect(wizard.current).toBeNull();
     expect(wizard.busy).toBe(false);
   });
 
@@ -217,14 +235,6 @@ describe('Add photos', () => {
     expect(await screen.findByText(copy.addPhotos.removeFailed)).toBeTruthy();
   });
 
-  it('savedPathStartsNeutral', async () => {
-    useSaved.mockImplementation(openJob().impl);
-    await offered();
-    await fireEvent.click(screen.getByRole('button', { name: copy.addPhotos.yes }));
-    expect(await screen.findByText(copy.finding.neutral)).toBeTruthy();
-    expect(screen.queryByText(copy.loading.finder)).toBeNull();
-  });
-
   it('findingSentencesFollowEvents', async () => {
     const job = openJob();
     detect.mockImplementation(job.impl);
@@ -247,7 +257,8 @@ describe('Add photos', () => {
 
     job.finish();
     await waitFor(() => expect(wizard.screen).toBe('check'));
-    expect(wizard.outcome).toEqual(outcome);
+    expect(wizard.draft).toEqual({ group: 1, outcome });
+    expect(wizard.outcomePhotos).toEqual([1, 2, 3]);
   });
 
   it('backCancels', async () => {
@@ -384,7 +395,7 @@ describe('Add photos', () => {
   it('noBannedWordsRendered', async () => {
     const { container } = await start([photo(1)]);
     assertPlainText(container);
-    for (const text of Object.values(copy.addPhotos)) {
+    for (const text of [...Object.values(copy.addPhotos), copy.saved.useFailed]) {
       if (typeof text === 'string') assertPlainText(Object.assign(document.createElement('p'), { textContent: text }));
     }
   });

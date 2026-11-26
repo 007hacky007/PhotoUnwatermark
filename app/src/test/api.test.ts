@@ -20,7 +20,21 @@ vi.mock('@tauri-apps/api/core', () => ({
   invoke: (...args: unknown[]) => invoke(...args),
 }));
 
-import { cancelJob, detect, matchAll, onCloseRequested, suggestSaved } from '../lib/api';
+import {
+  cancelJob,
+  clearGroups,
+  confirmNewGroup,
+  detect,
+  getStartArea,
+  groupSample,
+  groupsState,
+  matchAll,
+  onCloseRequested,
+  placeOn,
+  saveWatermark,
+  suggestSaved,
+  useSaved,
+} from '../lib/api';
 import { firstTicket, ticketOf } from '../lib/tickets';
 
 function close(): boolean {
@@ -52,6 +66,35 @@ describe('api', () => {
     await cancelJob(ticketOf(suggest));
     expect(invoke.mock.calls.at(-1)).toEqual(['cancel_job', { job: ticketOf(suggest) }]);
     await later;
+  });
+
+  it('groupCallsHaveTheirOwnTickets', async () => {
+    invoke.mockClear();
+    const calls = [placeOn(1, 2), confirmNewGroup(3), clearGroups(), useSaved('s1')];
+    await Promise.all(calls);
+    const tickets = calls.map((c) => ticketOf(c));
+    expect(new Set(tickets).size).toBe(4);
+    for (const t of tickets) expect(typeof t).toBe('number');
+    expect(invoke.mock.calls).toEqual([
+      ['place_on', { reference: 1, id: 2, job: tickets[0] }],
+      ['confirm_new_group', { id: 3, job: tickets[1] }],
+      ['clear_groups', { job: tickets[2] }],
+      ['use_saved', { id: 's1', job: tickets[3] }],
+    ]);
+  });
+
+  it('groupReadsArePlainCalls', async () => {
+    invoke.mockClear();
+    const groups = groupsState();
+    const sample = groupSample();
+    const save = saveWatermark(2, 'Studio');
+    await Promise.all([groups, sample, save]);
+    expect(ticketOf(groups)).toBeUndefined();
+    expect(ticketOf(sample)).toBeUndefined();
+    expect(invoke.mock.calls).toEqual([['groups'], ['group_sample'], ['save_watermark', { group: 2, name: 'Studio' }]]);
+    invoke.mockResolvedValueOnce(new Uint8Array([0, 255]).buffer as never);
+    expect(await getStartArea(4)).toEqual(new Uint8Array([0, 255]));
+    expect(invoke.mock.calls.at(-1)).toEqual(['start_area', { id: 4 }]);
   });
 
   it('ticketsOfANewPageNeverRepeatOldOnes', () => {

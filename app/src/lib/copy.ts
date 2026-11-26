@@ -5,6 +5,8 @@
 export const DOWNLOAD_MEGABYTES = 690;
 
 const photos = (n: number) => `${n} ${n === 1 ? 'photo' : 'photos'}`;
+/** "38 photos have no group yet." */
+const noGroupYet = (n: number) => `${photos(n)} ${n === 1 ? 'has' : 'have'} no group yet.`;
 
 export const copy = {
   appName: 'PhotoUnwatermark',
@@ -76,6 +78,10 @@ export const copy = {
     loadFailed: 'The saved watermarks could not be read.',
     renameFailed: 'The saved watermark could not be renamed.',
     deleteFailed: 'The saved watermark could not be deleted.',
+    /** Starts the next group from a saved watermark. */
+    useForThese: 'Use for these photos',
+    useOne: (name: string) => `Use ${name} for these photos`,
+    useFailed: 'The saved watermark could not be used.',
   },
   about: {
     title: 'About PhotoUnwatermark',
@@ -162,6 +168,33 @@ export const copy = {
     previewFailed: 'The preview did not work.',
     confirmFailed: 'The watermark area could not be used.',
     saveFailed: 'The photo could not be saved.',
+    /** Notes over a strip photo the shared drawing was placed on. */
+    notFoundHere: 'The watermark was not found on this photo.',
+    unsureHere: 'Not sure the watermark is here on this photo.',
+    placing: 'Finding the watermark on this photo...',
+    placeFailed: 'The watermark area could not be shown on this photo.',
+  },
+  /** Watermark groups: each group is one watermark and the photos it was found on. */
+  groups: {
+    checkHeading: (n: number) => `Group ${n}: check the watermark`,
+    checkAllHeading: (n: number) => `Group ${n}: check all photos`,
+    label: (n: number) => `Group ${n}`,
+    noGroup: 'No group yet',
+    notInGroup: 'Not in a group yet',
+    /** "Group 1: 140 photos. Group 2: 52 photos. 38 photos have no group yet." */
+    line: (list: readonly { number: number; photos: number }[], leftovers: number) => {
+      const parts = list.map((g) => `Group ${g.number}: ${photos(g.photos)}.`);
+      if (leftovers > 0) parts.push(noGroupYet(leftovers));
+      return parts.join(' ');
+    },
+    findNext: (n: number) => (n === 1 ? 'Find the next watermark in this photo' : `Find the next watermark in these ${n}`),
+    useSaved: 'Use a saved watermark...',
+    leaveOut: 'Leave them out',
+    /** Before a removal that leaves photos with no group out. */
+    confirmLeftovers: (left: number, grouped: number) =>
+      `${noGroupYet(left)} Remove from the ${photos(grouped)} in groups and leave ${left === 1 ? 'it' : `the ${left}`} out?`,
+    confirmRemove: 'Remove',
+    nextFailed: 'The next watermark could not be looked for.',
   },
   tools: {
     brush: 'Brush',
@@ -295,6 +328,10 @@ export const copy = {
     previousGlyph: '←',
     nextGlyph: '→',
     name: 'Name for the saved watermark',
+    leftOut: (n: number) => `Left out: ${photos(n)}`,
+    groupName: (n: number) => `Name for the saved watermark of group ${n}`,
+    groupDefault: (base: string, n: number) => `${base} (group ${n})`,
+    editedName: (name: string) => `${name} (edited)`,
     savedWatermark: 'Saved',
     saveFailed: 'The watermark could not be saved.',
     openFailed: 'The folder could not be opened.',

@@ -36,6 +36,8 @@ const st = (id: number, status: PhotoState['status'], extra: Partial<PhotoState>
   included: status === 'found' || status === 'unsure' || status === 'edited',
   reviewed: false,
   hasArea: status !== 'notFound',
+  group: null,
+  member: false,
   ...extra,
 });
 
