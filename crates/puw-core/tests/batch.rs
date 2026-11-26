@@ -171,10 +171,17 @@ fn three_photos_keep_only_edges_all_show() {
     );
 }
 
-/// Three photos of one shoot (one scene, two shots lined up as in a burst, the third moved a
-/// little) with the fixed set's mark blended at 0.14 at one place: the layer is the mark.
+/// Shots of one shoot: the scene moved by each of these, the first ones lined up as in a burst.
+const SHOOTS: [&[(i64, i64)]; 2] = [
+    &[(0, 0), (1, 1), (24, -16)],
+    &[(0, 0), (1, 1), (0, 1), (24, -16), (-18, 12), (30, 20)],
+];
+
+/// Photos of one shoot (one scene, several shots lined up as in a burst, the others moved a
+/// little; see [`SHOOTS`]) with the fixed set's mark blended at 0.14 at one place: the layer is
+/// the mark, for 3 photos and for 6 (3 of them lined up).
 #[test]
-fn three_photos_of_one_shoot_give_the_mark() {
+fn photos_of_one_shoot_give_the_mark() {
     let set = common::synth_dir().join("fixed");
     let open = |p: &str| image::open(set.join(p)).expect("open").to_rgb8();
     let (clean0, marked0, scene) = (
@@ -184,35 +191,38 @@ fn three_photos_of_one_shoot_give_the_mark() {
     );
     let gt: Mask = image::open(set.join("mask/00.png")).expect("gt").to_luma8();
     let (w, h) = scene.dimensions();
-    let imgs: Vec<RgbImage> = [(0i64, 0i64), (1, 1), (24, -16)]
-        .iter()
-        .map(|&(sx, sy)| {
-            RgbImage::from_fn(w, h, |x, y| {
-                let px = (x as i64 + sx).clamp(0, w as i64 - 1) as u32;
-                let py = (y as i64 + sy).clamp(0, h as i64 - 1) as u32;
-                let mut p = *scene.get_pixel(px, py);
-                if gt.get_pixel(x, y).0[0] != 0 {
-                    let (c, m) = (clean0.get_pixel(x, y), marked0.get_pixel(x, y));
-                    for ch in 0..3 {
-                        let mark = c.0[ch] as f32 + (m.0[ch] as f32 - c.0[ch] as f32) / 0.25;
-                        let b = p.0[ch] as f32;
-                        p.0[ch] = (b + 0.14 * (mark - b)).round().clamp(0.0, 255.0) as u8;
+    for shots in SHOOTS {
+        let imgs: Vec<RgbImage> = shots
+            .iter()
+            .map(|&(sx, sy)| {
+                RgbImage::from_fn(w, h, |x, y| {
+                    let px = (x as i64 + sx).clamp(0, w as i64 - 1) as u32;
+                    let py = (y as i64 + sy).clamp(0, h as i64 - 1) as u32;
+                    let mut p = *scene.get_pixel(px, py);
+                    if gt.get_pixel(x, y).0[0] != 0 {
+                        let (c, m) = (clean0.get_pixel(x, y), marked0.get_pixel(x, y));
+                        for ch in 0..3 {
+                            let mark = c.0[ch] as f32 + (m.0[ch] as f32 - c.0[ch] as f32) / 0.25;
+                            let b = p.0[ch] as f32;
+                            p.0[ch] = (b + 0.14 * (mark - b)).round().clamp(0.0, 255.0) as u8;
+                        }
                     }
-                }
-                p
+                    p
+                })
             })
-        })
-        .collect();
-    let refs: Vec<&RgbImage> = imgs.iter().collect();
-    let mag = median_gradient(&refs).expect("median");
-    let layer = filter_layer(&batch_lines(&mag, BATCH_LOW, BATCH_HIGH).expect("a layer"));
-    let near = mask::dilate(&gt, mask::grow_for(w, h, 0.004));
-    let (recall, inside) = (covered(&layer, &gt), covered(&near, &layer));
-    eprintln!("one shoot of 3: recall {recall:.3}, layer near the mark {inside:.3}");
-    assert!(recall >= 0.8, "recall {recall}");
-    // The share the position prior asks of a layer that is the mark (`PRIOR_LAYER_INSIDE`). The
-    // median of the three kept the scene: more than 10 % of the photo, so no layer at all.
-    assert!(inside >= 0.9, "layer near the mark {inside}");
+            .collect();
+        let refs: Vec<&RgbImage> = imgs.iter().collect();
+        let mag = median_gradient(&refs).expect("median");
+        let layer = filter_layer(&batch_lines(&mag, BATCH_LOW, BATCH_HIGH).expect("a layer"));
+        let near = mask::dilate(&gt, mask::grow_for(w, h, 0.004));
+        let (recall, inside) = (covered(&layer, &gt), covered(&near, &layer));
+        let n = shots.len();
+        eprintln!("one shoot of {n}: recall {recall:.3}, layer near the mark {inside:.3}");
+        assert!(recall >= 0.8, "{n} photos: recall {recall}");
+        // The share the position prior asks of a layer that is the mark (`PRIOR_LAYER_INSIDE`).
+        // The median of the three kept the scene: more than 10 % of the photo, so no layer.
+        assert!(inside >= 0.9, "{n} photos: layer near the mark {inside}");
+    }
 }
 
 #[test]

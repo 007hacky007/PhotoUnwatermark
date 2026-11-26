@@ -375,21 +375,34 @@ pub fn main_bbox(t: &WatermarkTemplate) -> Option<[f32; 4]> {
 /// fast path of [`find`] alone (+-2 px, scale 1, minimum over the pieces it searches for). `None` for a damaged
 /// template or a photo of another size.
 pub fn saved_score(t: &WatermarkTemplate, img: &RgbImage) -> Option<f32> {
-    if img.dimensions() != (t.ref_w, t.ref_h) || t.pieces.is_empty() {
+    saved_scores(&[t], img)?.pop()
+}
+
+/// [`saved_score`] of each of `ts` in one photo, which is read into the reference space once.
+/// `None` when any of them is damaged or of another size than `img`.
+pub fn saved_scores(ts: &[&WatermarkTemplate], img: &RgbImage) -> Option<Vec<f32>> {
+    if ts
+        .iter()
+        .any(|t| img.dimensions() != (t.ref_w, t.ref_h) || t.pieces.is_empty())
+    {
         return None;
     }
-    let all = t
-        .pieces
-        .iter()
-        .map(|p| Prepared::new(p, t.ref_w, t.ref_h))
-        .collect::<Option<Vec<_>>>()?;
-    let (pieces, _) = split_carried(all);
-    let singles: Vec<Tmpl> = (0..pieces.len())
-        .map(|i| Tmpl::new(&pieces, &[i]))
-        .collect();
     let never = AtomicBool::new(false);
     let target = Target::new(img, &never);
-    fast_path(t, &pieces, &singles, &target).map(|o| o.score.clamp(0.0, 1.0))
+    ts.iter()
+        .map(|t| {
+            let all = t
+                .pieces
+                .iter()
+                .map(|p| Prepared::new(p, t.ref_w, t.ref_h))
+                .collect::<Option<Vec<_>>>()?;
+            let (pieces, _) = split_carried(all);
+            let singles: Vec<Tmpl> = (0..pieces.len())
+                .map(|i| Tmpl::new(&pieces, &[i]))
+                .collect();
+            fast_path(t, &pieces, &singles, &target).map(|o| o.score.clamp(0.0, 1.0))
+        })
+        .collect()
 }
 
 /// The template's pieces drawn at their saved position and scale 1 into a `t.ref_w` x `t.ref_h`

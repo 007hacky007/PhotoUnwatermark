@@ -40,7 +40,7 @@ use crate::inpaint::{Progress, inpaint};
 use crate::mask::{self, Mask, is_empty};
 use crate::template::{
     self, MatchBasis, MatchResult, MatchStatus, Transform, WatermarkTemplate, find_until,
-    saved_placement, saved_score,
+    saved_placement,
 };
 use crate::{Error, Result};
 use image::RgbImage;
@@ -285,6 +285,34 @@ const PRIOR_LAYER_INSIDE: f64 = 0.9;
 /// the search found the scene). No drawing of the random and styles sets passes
 /// [`PRIOR_LAYER_INSIDE`] on such layers.
 const PRIOR_LAYER_SHARE: f64 = 0.05;
+/// How far, as a share of the long side, the drawing may reach beyond the batch layer: the
+/// distance at which the first guess keeps detector parts near the layer
+/// ([`LAYER_NEAR_FRAC`]) plus its growth ([`PRIOR_GROW`]).
+const PRIOR_REACH: f32 = LAYER_NEAR_FRAC + PRIOR_GROW;
+/// Largest share of the drawing that one connected stretch of it may hold farther than
+/// [`PRIOR_REACH`] from the layer before the set's edges there are asked to show it (see
+/// `explained_by_set`). The first guess always holds the layer (it is added before the guess
+/// grows), so without this a layer of static scene beside a mark that moves supported the
+/// guess, and the mark was `Found` where it was not on every other photo. Synthetic sets: the
+/// fixed set's own drawing grown by 0-30 px 0.00, by 40 px 0.05; a static scene patch with the
+/// mark moving, or with the mark missing from the layer, 0.24-0.44 in all. Real set-a, the
+/// first guess: 0.09-0.25 in all on triples (the layer of 3 photos misses stretches of the
+/// faint mark), and on all 8 photos 0.107 in three blobs of scene of 0.04 each.
+const PRIOR_UNEXPLAINED: f64 = 0.1;
+/// How much the set's edges over the far part of the drawing must stand out from the edges of
+/// the whole photo, as a share of how much they stand out over the layer. Real set-a triples
+/// whose far part is above [`PRIOR_UNEXPLAINED`]: 0.13-0.47 (the mark is there, too faint for
+/// the layer); the synthetic static-patch sets: -0.09 to -0.03 (nothing is stamped there).
+const PRIOR_FAR_EDGES: f64 = 0.05;
+/// Parts of a rule-1 layer are its components grouped closer than this share of the long side.
+/// 1 % keeps a text mark in 2-5 parts on the real set, and splits off a static object 8 px
+/// from the mark (the synthetic adjacent case).
+const PRIOR_PART_NEAR: f32 = 0.01;
+/// A part needs at least this share of the largest part's pixels; smaller ones are fragments.
+const PRIOR_PART_MIN: f64 = 0.3;
+/// Overlap (intersection over union) at which a search result and the saved placement are the
+/// same place. With a set position, a search `Found` elsewhere is at most `Unsure`.
+const PRIOR_AGREE: f64 = 0.8;
 /// Score at the saved position (masked NCC, +-2 px, scale 1) for `Found` on set support.
 /// Calibrated on the synthetic fixed set with its own layer and the template of photo 0:
 /// photos without the mark (the clean/ originals other than the reference's scene, and the
@@ -301,13 +329,17 @@ pub const PRIOR_UNSURE: f32 = 0.16;
 ///
 /// It exists when `layers` has a layer for the template's reference size and the layer shows a
 /// mark stamped where the template was learned. With `g` = [`mask::grow_for`] (0.004) and
-/// "placement" = the template's pieces at their saved position:
-/// 1. at least 90 % of the layer lies in the placement grown by `g`, and the layer inside the
-///    placement is at least 10 % of it (see [`PRIOR_LAYER_INSIDE`], [`PRIOR_LAYER_SHARE`]): the
-///    layer is the mark, and the position is scored with the template cut down to the raw layer
-///    ([`template::within`]), its edges taken from the set's own edges of the mark
-///    ([`SetLayers::edges`], [`template::with_edges`]) rather than from the reference photo,
-///    whose scene the other photos do not share. A drawing grown well beyond the mark (the
+/// "placement" = the template's pieces at their saved position, first of all at most
+/// [`PRIOR_UNEXPLAINED`] of the placement may lie farther than [`PRIOR_REACH`] from the layer
+/// (the drawing holds no mark the set does not show fixed); then
+/// 1. of the layer's components that reach into the placement grown by `g` (a component the
+///    person erased whole is a piece of scene, not the mark), at least 90 % lies in it, and
+///    the layer inside the placement is at least [`PRIOR_LAYER_SHARE`] of it (see
+///    [`PRIOR_LAYER_INSIDE`]): the layer is the mark, and the position is scored with the
+///    template cut down to the raw layer ([`template::within`]), its edges taken from the set's
+///    own edges of the mark ([`SetLayers::edges`], [`template::with_edges`]) rather than from
+///    the reference photo, whose scene the other photos do not share; and with each part of the
+///    layer on its own (see [`PRIOR_PART_NEAR`]). A drawing grown well beyond the mark (the
 ///    first guess is grown, and people draw generously) is then judged on the mark's own
 ///    edges, not on the scene around it;
 /// 2. else, at least half of the placement lies in the layer grown by `g` (the drawing follows
@@ -322,6 +354,135 @@ pub struct PositionPrior {
     /// What is scored at the saved position: the template within the layer (rule 1) or the
     /// template itself (rule 2).
     scored: WatermarkTemplate,
+    /// Rule 1 with a layer of several parts: `scored` cut to each part (see
+    /// [`PRIOR_PART_NEAR`]). A photo that does not show one of them is not `Found`.
+    parts: Vec<WatermarkTemplate>,
+    /// False when the drawing holds part of the layer but the set does not support its
+    /// position: nothing is scored at the saved position, and the search is only held back.
+    supports: bool,
+}
+
+/// Mean of `edges` (the set's edges, reference space `rw` x `rh`) over the pixels of `m`
+/// (native size), or `None` for an empty mask.
+fn mean_edges(edges: &[f32], (rw, rh): (usize, usize), m: &Mask) -> Option<f64> {
+    let small = mask::resize_any(m, rw as u32, rh as u32);
+    let (mut sum, mut n) = (0f64, 0u64);
+    for (e, p) in edges.iter().zip(small.as_raw()) {
+        if *p != 0 {
+            sum += f64::from(*e);
+            n += 1;
+        }
+    }
+    (n > 0).then(|| sum / n as f64)
+}
+
+/// Whether the set shows the drawing `placed` as stamped at its place: no connected stretch of
+/// it farther than [`PRIOR_REACH`] from the layer holds more than [`PRIOR_UNEXPLAINED`] of it,
+/// or the set's own `edges` over the whole far part stand out from the photo's edges as a
+/// whole by at least [`PRIOR_FAR_EDGES`] of how much they stand out over the layer (a faint
+/// stretch of the mark the layer missed, not a mark that is not there on the other photos).
+fn explained_by_set(placed: &Mask, layer: &Mask, edges: Option<&[f32]>) -> bool {
+    let (w, h) = placed.dimensions();
+    let reach = (PRIOR_REACH * w.max(h) as f32).round() as u32;
+    let near = mask::dilate(layer, reach);
+    let mut far = Mask::new(w, h);
+    let (mut all, mut out) = (0u64, 0u64);
+    for ((f, p), n) in far
+        .as_mut()
+        .iter_mut()
+        .zip(placed.as_raw())
+        .zip(near.as_raw())
+    {
+        if *p != 0 {
+            all += 1;
+            if *n == 0 {
+                out += 1;
+                *f = 255;
+            }
+        }
+    }
+    if all == 0 {
+        return false;
+    }
+    let largest = mask::components(&far)
+        .iter()
+        .map(|c| u64::from(c.pixels))
+        .max()
+        .unwrap_or(0);
+    if out == 0 || largest as f64 <= PRIOR_UNEXPLAINED * all as f64 {
+        return true;
+    }
+    let Some(edges) = edges else {
+        return false;
+    };
+    let dims = template::ref_dims(w, h);
+    let mut whole = Mask::new(w, h);
+    whole.as_mut().fill(255);
+    let (Some(e_far), Some(e_layer), Some(e_all)) = (
+        mean_edges(edges, dims, &far),
+        mean_edges(edges, dims, layer),
+        mean_edges(edges, dims, &whole),
+    ) else {
+        return false;
+    };
+    e_layer > e_all && e_far - e_all >= PRIOR_FAR_EDGES * (e_layer - e_all)
+}
+
+/// The components of `layer` with at least one pixel in `area`.
+fn touched(layer: &Mask, area: &Mask) -> Mask {
+    let (w, h) = layer.dimensions();
+    let mut out = Mask::new(w, h);
+    for c in mask::components(layer) {
+        let (ox, oy) = (c.bbox.left() as u32, c.bbox.top() as u32);
+        let px = || c.mask.enumerate_pixels().filter(|(_, _, p)| p.0[0] != 0);
+        if px().any(|(x, y, _)| area.get_pixel(ox + x, oy + y).0[0] != 0) {
+            for (x, y, p) in px() {
+                out.put_pixel(ox + x, oy + y, *p);
+            }
+        }
+    }
+    out
+}
+
+/// The layer pixels in `mask` grouped as parts of the mark: components whose boxes are closer
+/// than [`PRIOR_PART_NEAR`] of the long side, each with at least [`PRIOR_PART_MIN`] of the
+/// largest part's pixels. Empty when there is only one such part.
+fn layer_parts(layer: &Mask, mask: &Mask) -> Vec<Mask> {
+    let (w, h) = layer.dimensions();
+    let mut inside = Mask::new(w, h);
+    for ((o, l), m) in inside
+        .as_mut()
+        .iter_mut()
+        .zip(layer.as_raw())
+        .zip(mask.as_raw())
+    {
+        *o = if *l != 0 && *m != 0 { 255 } else { 0 };
+    }
+    let comps = mask::components(&inside);
+    let groups = mask::group_near(&comps, PRIOR_PART_NEAR * w.max(h) as f32);
+    let size = |g: &Vec<usize>| g.iter().map(|&i| u64::from(comps[i].pixels)).sum::<u64>();
+    let most = groups.iter().map(size).max().unwrap_or(0);
+    let big: Vec<&Vec<usize>> = groups
+        .iter()
+        .filter(|g| size(g) as f64 >= PRIOR_PART_MIN * most as f64)
+        .collect();
+    if big.len() < 2 {
+        return Vec::new();
+    }
+    big.into_iter()
+        .map(|g| {
+            let mut m = Mask::new(w, h);
+            for c in g.iter().map(|&i| &comps[i]) {
+                let (ox, oy) = (c.bbox.left() as u32, c.bbox.top() as u32);
+                for (x, y, p) in c.mask.enumerate_pixels() {
+                    if p.0[0] != 0 {
+                        m.put_pixel(ox + x, oy + y, *p);
+                    }
+                }
+            }
+            m
+        })
+        .collect()
 }
 
 /// Pixels set in `a`, and how many of them are also set in `b`.
@@ -343,27 +504,63 @@ impl PositionPrior {
         let layer = layers.get(w, h)?;
         let placed = mask::binarize(&saved_placement(t)?);
         let g = mask::grow_for(w, h, PRIOR_GROW);
-        let (layer_px, layer_in) = count_in(layer, &mask::dilate(&placed, g));
+        // Rule 1 looks at the parts of the layer the drawing holds: a part the person erased
+        // whole (a piece of scene the set happened to share) says nothing about the mark.
+        let grown = mask::dilate(&placed, g);
+        let held = touched(layer, &grown);
         let (placed_px, on_layer) = count_in(&placed, layer);
-        let layer_is_mark = layer_px > 0
-            && layer_in as f64 >= PRIOR_LAYER_INSIDE * layer_px as f64
-            && on_layer as f64 >= PRIOR_LAYER_SHARE * placed_px as f64;
+        // A drawing that holds no more than a few pixels of the layer: the set says nothing
+        // about it, and the search decides alone.
+        if is_empty(&held) || (on_layer as f64) < PRIOR_LAYER_SHARE * placed_px as f64 {
+            return None;
+        }
+        let cautious = |placed: Mask| PositionPrior {
+            placed,
+            scored: t.clone(),
+            parts: Vec::new(),
+            supports: false,
+        };
+        // Whatever the rule, the drawing may not hold much that the set does not show fixed.
+        if !explained_by_set(&placed, layer, layers.edges(w, h)) {
+            return Some(cautious(placed));
+        }
+        let (layer_px, layer_in) = count_in(&held, &grown);
+        let layer_is_mark = layer_px > 0 && layer_in as f64 >= PRIOR_LAYER_INSIDE * layer_px as f64;
         if layer_is_mark && let Some(cut) = template::within(t, layer) {
             // Scored on the set's own edges of the mark where the set has them.
-            let scored = layers
-                .edges(w, h)
-                .and_then(|e| template::with_edges(&cut, e))
-                .unwrap_or(cut);
-            return Some(PositionPrior { placed, scored });
+            let edges = layers.edges(w, h);
+            let on_edges = |c: WatermarkTemplate| match edges {
+                Some(e) => template::with_edges(&c, e).unwrap_or(c),
+                None => c,
+            };
+            let parts = layer_parts(layer, &placed)
+                .iter()
+                .filter_map(|m| template::within(t, m))
+                .map(on_edges)
+                .collect();
+            return Some(PositionPrior {
+                placed,
+                scored: on_edges(cut),
+                parts,
+                supports: true,
+            });
         }
         let (total, inside) = count_in(&placed, &mask::dilate(layer, g));
         if total == 0 || (inside as f64) < PRIOR_SUPPORT * total as f64 {
-            return None;
+            return Some(cautious(placed));
         }
         Some(PositionPrior {
             placed,
             scored: t.clone(),
+            parts: Vec::new(),
+            supports: true,
         })
+    }
+
+    /// Whether the set supports the saved position (rule 1 or 2). Without support the prior only
+    /// keeps a search `Found` that lands elsewhere at `Unsure` (see [`match_with`]).
+    pub fn supports(&self) -> bool {
+        self.supports
     }
 
     /// The template the saved position is scored with.
@@ -394,16 +591,21 @@ pub fn match_photo(t: &WatermarkTemplate, img: &RgbImage, layers: &SetLayers) ->
 ///
 /// Without a prior, or for a photo of another size than the template's reference, this is
 /// [`find_until`]. Otherwise the photo itself must show the mark at the saved position: the
-/// score there ([`saved_score`] of the cut template, +-2 px, scale 1) decides first, with no
+/// score there ([`template::saved_score`] of the cut template, +-2 px, scale 1) decides first, with no
 /// search.
-/// - At least [`PRIOR_FOUND`]: `Found` at the saved position.
+/// - At least [`PRIOR_FOUND`], and every part of the layer at least [`PRIOR_UNSURE`]: `Found`
+///   at the saved position. A photo that shows only some parts (a static object beside the
+///   mark, on a photo without the mark) stays `Unsure`.
 /// - At least [`PRIOR_UNSURE`]: `Unsure` at the saved position; the person opens the photo. A
 ///   search `Found` somewhere else is not trusted on a set that shows the mark here: on the real
 ///   set the drawing is mostly scene, and the search finds the scene where it moved between
 ///   shots (0.52-0.68, against 0.13 for the drawing at the saved position). Nor is the search
 ///   needed for a `Found` at the same place: it never turned one of these photos `Found` (see
 ///   `docs/notes/thresholds.md`), and it costs 2-9 s on a 24 MP photo.
-/// - Below: the search's result, as it is.
+/// - Below: the search's result, but a `Found` that does not overlap the saved placement by at
+///   least [`PRIOR_AGREE`] is `Unsure` (the set shows the mark at one place; on real burst sets
+///   the search found the moved scene at 0.68, and a mark that really moved is rare and is
+///   opened by the person).
 ///
 /// A set-position result has basis [`MatchBasis::SetPosition`], the score as its confidence,
 /// the saved placement of the whole template as its mask and [`Transform::IDENTITY`].
@@ -416,16 +618,45 @@ pub fn match_with(
     stop: &AtomicBool,
 ) -> MatchResult {
     let prior = prior.filter(|p| p.placed.dimensions() == img.dimensions());
-    let Some((p, score)) = prior.and_then(|p| saved_score(&p.scored, img).map(|s| (p, s))) else {
+    if let Some(p) = prior.filter(|p| !p.supports) {
+        return held_back(find_until(t, img, stop), &p.placed);
+    }
+    let scored = prior.and_then(|p| {
+        let all: Vec<&WatermarkTemplate> = std::iter::once(&p.scored).chain(&p.parts).collect();
+        template::saved_scores(&all, img).map(|s| (p, s))
+    });
+    let Some((p, scores)) = scored else {
         return find_until(t, img, stop);
     };
-    if score >= PRIOR_FOUND {
+    let score = scores[0];
+    let weakest = scores.iter().copied().fold(score, f32::min);
+    if score >= PRIOR_FOUND && weakest >= PRIOR_UNSURE {
         return p.result(MatchStatus::Found, score);
     }
     if score >= PRIOR_UNSURE {
         return p.result(MatchStatus::Unsure, score);
     }
-    find_until(t, img, stop)
+    held_back(find_until(t, img, stop), &p.placed)
+}
+
+/// `found` (a search result), `Unsure` instead of `Found` when it does not overlap the saved
+/// placement `placed` by at least [`PRIOR_AGREE`].
+fn held_back(mut found: MatchResult, placed: &Mask) -> MatchResult {
+    if found.status == MatchStatus::Found && overlap(&found.mask, placed) < PRIOR_AGREE {
+        found.status = MatchStatus::Unsure;
+    }
+    found
+}
+
+/// Share of the pixels set in both masks among those set in either.
+fn overlap(a: &Mask, b: &Mask) -> f64 {
+    let (mut inter, mut uni) = (0u64, 0u64);
+    for (p, q) in a.as_raw().iter().zip(b.as_raw()) {
+        let (x, y) = (*p != 0, *q != 0);
+        inter += (x && y) as u64;
+        uni += (x || y) as u64;
+    }
+    inter as f64 / uni.max(1) as f64
 }
 
 /// How near, as a share of the photo's long side, the detector must come to a pixel of the

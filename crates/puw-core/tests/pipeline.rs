@@ -617,7 +617,9 @@ fn negatives_stay_not_found() {
         ));
     }
     assert_eq!(negatives.len(), 13);
-    let prior = PositionPrior::new(&tmpl, &layers).expect("the set supports the position");
+    let prior = PositionPrior::new(&tmpl, &layers)
+        .filter(PositionPrior::supports)
+        .expect("the set supports the position");
     for (i, img) in negatives.iter().enumerate() {
         let m = match_photo(&tmpl, img, &layers);
         assert_ne!(m.status, MatchStatus::Found, "negative {i}");
@@ -632,9 +634,195 @@ fn negatives_stay_not_found() {
     }
 }
 
-/// A photo without the mark inside the set the layer is built from (its scene is in the set's
-/// edges too): the set position does not find it. Measured 0.01-0.07 for each of the 7 clean
-/// scenes in place of its marked photo, in sets of 5 and 8.
+/// A mark of thin lines (a 1 px rectangle outline, 600 x 400, white at alpha 0.5) on the
+/// fixed set's 8 clean scenes enlarged to 3072 x 2048, and a drawing 70 px around it (as far as
+/// the drawing may reach beyond the layer at this size): the layer holds the lines only,
+/// a small share of such a generous drawing, yet the set supports its position. The share sits
+/// between `PRIOR_LAYER_SHARE` (0.05) and the old bar of 0.1, which refused it.
+#[test]
+fn thin_mark_in_a_generous_drawing_keeps_the_set_position() {
+    let set = common::synth_dir().join("fixed");
+    let dir = tempfile::tempdir().expect("tempdir");
+    let (x0, y0, x1, y1) = (1200u32, 600u32, 1800u32, 1000u32);
+    let mut truth = Mask::new(3072, 2048);
+    let (mut photos, mut paths) = (Vec::new(), Vec::new());
+    for i in 0..8 {
+        let small = open_rgb(&set.join(format!("clean/0{i}.png")));
+        let mut img = imageops::resize(&small, 3072, 2048, imageops::FilterType::Triangle);
+        for y in y0..=y1 {
+            for x in x0..=x1 {
+                if x == x0 || x == x1 || y == y0 || y == y1 {
+                    for v in img.get_pixel_mut(x, y).0.iter_mut() {
+                        *v = (*v as f32 * 0.5 + 255.0 * 0.5).round() as u8;
+                    }
+                    truth.put_pixel(x, y, image::Luma([255]));
+                }
+            }
+        }
+        let path = dir.path().join(format!("t{i}.png"));
+        img.save(&path).expect("save");
+        photos.push(img);
+        paths.push(path);
+    }
+    let layers = no_progress_layers(&paths);
+    let layer = layers.get(3072, 2048).expect("the set has a layer");
+    let drawing = mask::dilate(&truth, 70);
+    let (all, on) = drawing
+        .as_raw()
+        .iter()
+        .zip(layer.as_raw())
+        .filter(|(d, _)| **d != 0)
+        .fold((0u64, 0u64), |(a, o), (_, l)| (a + 1, o + (*l != 0) as u64));
+    let share = on as f64 / all as f64;
+    assert!(
+        (0.05..0.1).contains(&share),
+        "premise: layer share {share:.3}"
+    );
+    let tmpl = build_template(&photos[0], &drawing);
+    let prior = PositionPrior::new(&tmpl, &layers)
+        .filter(PositionPrior::supports)
+        .expect("the set supports the position");
+    for (i, p) in photos.iter().enumerate().skip(1) {
+        let m = match_with(&tmpl, Some(&prior), p, &AtomicBool::new(false));
+        assert_eq!(m.basis, MatchBasis::SetPosition, "photo {i}");
+        assert_eq!(
+            m.status,
+            MatchStatus::Found,
+            "photo {i}: {:.3}",
+            m.confidence
+        );
+    }
+}
+
+/// Where the mark sits on photo `i` of [`patch_set`] when it moves.
+const MOVES: [(i64, i64); 8] = [
+    (0, 0),
+    (-500, -600),
+    (300, -650),
+    (-550, 100),
+    (350, -250),
+    (-200, -400),
+    (150, -350),
+    (-600, -150),
+];
+
+/// How the mark and a static patch of scene sit in [`patch_set`].
+#[derive(Clone, Copy, Debug)]
+enum Patch {
+    /// The mark moves ([`MOVES`]); the patch is far from it.
+    MovingFar,
+    /// The mark moves; on photo 0 the patch ends 8 px above it.
+    MovingNext,
+    /// The mark stays, on every photo but the last (which is clean); the patch is far from it.
+    CleanLastFar,
+    /// As `CleanLastFar`, the patch ending 8 px above the mark.
+    CleanLastNext,
+    /// The mark stays, on every photo; a smaller patch (300 x 120) sits 25 px to its right,
+    /// close enough to be grouped with it.
+    FixedNear,
+}
+
+/// `n` photos of different scenes (the fixed set's clean photos) sharing one static patch of
+/// scene (340 x 250 unless said otherwise, from a negative photo) at the same place, with the
+/// fixed set's mark blended at `alpha` as `kind` says. The photos, their true marks (empty
+/// where there is none) and their paths in `dir`.
+fn patch_set(
+    kind: Patch,
+    n: usize,
+    alpha: f32,
+    dir: &Path,
+) -> (Vec<RgbImage>, Vec<Mask>, Vec<PathBuf>) {
+    let set = common::synth_dir().join("fixed");
+    let clean0 = open_rgb(&set.join("clean/00.png"));
+    let marked0 = open_rgb(&set.join("marked/00.png"));
+    let gt = open_mask(&set.join("mask/00.png"));
+    let src = open_rgb(&common::synth_dir().join("negative/clean/00.png"));
+    let (px, py, pw, ph) = match kind {
+        Patch::MovingNext | Patch::CleanLastNext => (680, 510, 340, 250),
+        Patch::FixedNear => (1098, 760, 300, 120),
+        _ => (1150, 700, 340, 250),
+    };
+    let (mut photos, mut truths, mut paths) = (Vec::new(), Vec::new(), Vec::new());
+    for (i, &shift) in MOVES.iter().enumerate().take(n) {
+        let mut img = open_rgb(&set.join(format!("clean/0{}.png", i % 8)));
+        let (w, h) = img.dimensions();
+        for y in 0..ph {
+            for x in 0..pw {
+                img.put_pixel(px + x, py + y, *src.get_pixel(300 + x, 200 + y));
+            }
+        }
+        let moving = matches!(kind, Patch::MovingFar | Patch::MovingNext);
+        let (dx, dy) = if moving { shift } else { (0, 0) };
+        let mut truth = Mask::new(w, h);
+        if moving || i + 1 < n || matches!(kind, Patch::FixedNear) {
+            for (x, y, v) in gt.enumerate_pixels() {
+                if v.0[0] == 0 {
+                    continue;
+                }
+                let (tx, ty) = ((x as i64 + dx) as u32, (y as i64 + dy) as u32);
+                let (c, m) = (clean0.get_pixel(x, y), marked0.get_pixel(x, y));
+                let p = img.get_pixel_mut(tx, ty);
+                for ch in 0..3 {
+                    // The mark's own colour, from photo 0 where it is blended at 0.25.
+                    let mark = c.0[ch] as f32 + (m.0[ch] as f32 - c.0[ch] as f32) / FIXED_ALPHA;
+                    let b = p.0[ch] as f32;
+                    p.0[ch] = (b + alpha * (mark - b)).round().clamp(0.0, 255.0) as u8;
+                }
+                truth.put_pixel(tx, ty, image::Luma([255]));
+            }
+        }
+        let path = dir.join(format!("{kind:?}-{i}.png"));
+        img.save(&path).expect("save");
+        photos.push(img);
+        truths.push(truth);
+        paths.push(path);
+    }
+    (photos, truths, paths)
+}
+
+/// The first guess as `guess_photo` makes it when the detector finds the mark `truth`: the mark
+/// and the set's layer, grown by `grow_for(0.004)`.
+fn first_guess(truth: &Mask, layers: &SetLayers) -> Mask {
+    let (w, h) = truth.dimensions();
+    let both = match layers.get(w, h) {
+        Some(l) => mask::union(truth, l),
+        None => truth.clone(),
+    };
+    mask::dilate(&both, mask::grow_for(w, h, 0.004))
+}
+
+/// Matches the first guess of photo 0 of `photos` on every other photo, and checks that no
+/// photo is `Found` where its own mark is not (at least half of the mark covered; a photo
+/// without the mark is never `Found`). Returns how many photos were placed (`Found` or
+/// `Unsure`) at their mark.
+fn no_false_found(label: &str, photos: &[RgbImage], truths: &[Mask], layers: &SetLayers) -> usize {
+    let tmpl = build_template(&photos[0], &first_guess(&truths[0], layers));
+    let prior = PositionPrior::new(&tmpl, layers);
+    let mut right = 0;
+    for (j, (p, truth)) in photos.iter().zip(truths).enumerate().skip(1) {
+        let m = match_with(&tmpl, prior.as_ref(), p, &AtomicBool::new(false));
+        let c = covers(&m.mask, truth);
+        if m.status == MatchStatus::Found {
+            assert!(
+                c >= 0.5,
+                "{label} photo {j}: Found ({:?}, {:.2}) covering {c:.2} of its mark",
+                m.basis,
+                m.confidence
+            );
+        }
+        right += (m.status != MatchStatus::NotFound && c >= 0.5) as usize;
+    }
+    right
+}
+
+/// A photo without the mark is not `Found` at the set position, whatever else the set holds:
+/// - the faint fixed set with one photo replaced by a clean scene, the true area as drawing;
+/// - a static patch of scene far from the mark, or ending 8 px above it (so that mark and patch
+///   can share one piece of the drawing), with the last photo clean, in sets of 3, 4, 5 and 8,
+///   the first guess as drawing.
+///
+/// Before the parts of the layer were scored one by one and the drawing had to stay near the
+/// layer, the clean photo next to the patch was `Found` at 0.45-0.80.
 #[test]
 fn clean_photo_of_the_set_is_not_found() {
     let dir = tempfile::tempdir().expect("tempdir");
@@ -643,18 +831,95 @@ fn clean_photo_of_the_set_is_not_found() {
     paths[7] = clean.clone();
     let layers = no_progress_layers(&paths);
     let tmpl = build_template(&photos[0], &gts[0]);
-    let prior = PositionPrior::new(&tmpl, &layers).expect("the set supports the position");
     let img = open_rgb(&clean);
-    let score = puw_core::template::saved_score(prior.scored(), &img).expect("same size");
-    assert!(score < PRIOR_UNSURE, "{score:.3}");
     assert_ne!(match_photo(&tmpl, &img, &layers).status, MatchStatus::Found);
+    if let Some(prior) = PositionPrior::new(&tmpl, &layers).filter(PositionPrior::supports) {
+        let score = puw_core::template::saved_score(prior.scored(), &img).expect("same size");
+        assert!(score < PRIOR_UNSURE, "{score:.3}");
+    }
+
+    for kind in [Patch::CleanLastFar, Patch::CleanLastNext] {
+        for n in [3, 4, 5, 8] {
+            let dir = tempfile::tempdir().expect("tempdir");
+            let (photos, truths, paths) = patch_set(kind, n, FIXED_ALPHA, dir.path());
+            let layers = no_progress_layers(&paths);
+            assert!(
+                layers.get(1536, 1024).is_some(),
+                "premise: {kind:?} {n} has a layer"
+            );
+            no_false_found(&format!("{kind:?} {n}"), &photos, &truths, &layers);
+        }
+    }
 }
 
-/// A drawing grown far beyond the mark (60 px around it, about five times the mark's area,
-/// like the grown first guess on a real set) on the fixed set: the search alone finds
-/// it on none of the other photos, and at least half of the drawing lies off the layer, yet the
-/// layer lies inside the drawing, so the position is scored on the layer and every photo is
-/// `Found` at the saved position, with the whole drawing as its area.
+/// A faint fixed mark (alpha 0.12) and a small static patch of scene just beside it, so that
+/// the layer holds both in one group: the first guess holds both too, and a person who erases
+/// the patch from it (it is not the watermark) keeps the set position; every other photo is
+/// `Found` there, in sets of 3, 5 and 8 photos. Before, rule 1 asked 90 % of the whole layer
+/// to lie in the drawing, so erasing the patch left only rule 2, which scores the reference's
+/// own edges, and the faint mark was not `Found` (the owner's failing sets: the search then
+/// found the scene).
+#[test]
+fn erased_scene_part_keeps_the_set_position() {
+    for n in [3, 5, 8] {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let (photos, truths, paths) = patch_set(Patch::FixedNear, n, 0.12, dir.path());
+        let layers = no_progress_layers(&paths);
+        let guess = first_guess(&truths[0], &layers);
+        let erased = mask::dilate(&truths[0], mask::grow_for(1536, 1024, 0.004));
+        for (name, drawing) in [("as guessed", guess), ("patch erased", erased)] {
+            let tmpl = build_template(&photos[0], &drawing);
+            let prior = PositionPrior::new(&tmpl, &layers);
+            assert!(
+                prior.as_ref().is_some_and(PositionPrior::supports),
+                "{n} photos, {name}: no set position"
+            );
+            for (j, p) in photos.iter().enumerate().skip(1) {
+                let m = match_with(&tmpl, prior.as_ref(), p, &AtomicBool::new(false));
+                assert_eq!(
+                    m.basis,
+                    MatchBasis::SetPosition,
+                    "{n} photos, {name}, photo {j}"
+                );
+                assert_eq!(
+                    m.status,
+                    MatchStatus::Found,
+                    "{n} photos, {name}, photo {j}"
+                );
+            }
+        }
+    }
+}
+
+/// A static patch of scene on every photo and a mark that moves: the first guess holds the
+/// patch's layer (it is added to every guess), yet the mark is never `Found` at the reference's
+/// place, and the search still places moved marks where they are (as `Unsure`: the drawing
+/// holds part of the layer, so a search `Found` elsewhere is held back). In sets of 3, 5 and 8 photos, with the
+/// patch far from the mark and ending 8 px above it. Before the drawing had to stay near the
+/// layer, every other photo was `Found` at the saved place (0.36-0.94).
+#[test]
+fn static_scene_never_places_a_moving_mark() {
+    for kind in [Patch::MovingFar, Patch::MovingNext] {
+        let mut right = 0;
+        for n in [3, 5, 8] {
+            let dir = tempfile::tempdir().expect("tempdir");
+            let (photos, truths, paths) = patch_set(kind, n, FIXED_ALPHA, dir.path());
+            let layers = no_progress_layers(&paths);
+            assert!(
+                layers.get(1536, 1024).is_some(),
+                "premise: {kind:?} {n} has a layer"
+            );
+            right += no_false_found(&format!("{kind:?} {n}"), &photos, &truths, &layers);
+        }
+        assert!(right > 0, "{kind:?}: the search finds no moved mark");
+    }
+}
+
+/// A drawing grown well beyond the mark (36 px around it, about three times the mark's area,
+/// as far as the drawing may reach beyond the layer at this size, see `PRIOR_REACH`) on the
+/// fixed set: the search alone finds it on none of the other photos, yet the layer lies inside
+/// the drawing, so the position is scored on the layer and every photo is `Found` at the saved
+/// position, with the whole drawing as its area.
 #[test]
 fn prior_matches_a_drawing_grown_beyond_the_mark() {
     let set = common::synth_dir().join("fixed");
@@ -663,9 +928,11 @@ fn prior_matches_a_drawing_grown_beyond_the_mark() {
         .collect();
     let photos: Vec<RgbImage> = paths.iter().map(|p| open_rgb(p)).collect();
     let layers = no_progress_layers(&paths);
-    let drawing = mask::dilate(&open_mask(&set.join("mask/00.png")), 60);
+    let drawing = mask::dilate(&open_mask(&set.join("mask/00.png")), 36);
     let tmpl = build_template(&photos[0], &drawing);
-    let prior = PositionPrior::new(&tmpl, &layers).expect("the set supports the position");
+    let prior = PositionPrior::new(&tmpl, &layers)
+        .filter(PositionPrior::supports)
+        .expect("the set supports the position");
     assert!(
         prior.scored() != &tmpl,
         "scored on the layer, not on the drawing"
@@ -698,16 +965,16 @@ fn covers(m: &Mask, truth: &Mask) -> f64 {
 }
 
 /// Marks that move are never placed at the set position, and a mark the search finds where it
-/// moved to stays found there.
+/// moved to keeps its place.
 ///
-/// 1. The random and styles sets: the batch layer holds static scene edges and the marks move.
-///    Whatever the drawing (the true area, or grown by up to 96 px), a set-position result must
-///    cover at least half of the photo's own mark (on layers from `agree_count`, none of these
-///    drawings gets a set position at all).
+/// 1. The random and styles sets: the batch layer, where there is one, holds static scene
+///    edges and the marks move. With the first guess as drawing (the mark and the layer, grown),
+///    no photo is `Found` where its own mark is not.
 /// 2. A set position the layer does support (the fixed set's eight photos, the drawing the true
-///    area of photo 0, as it is and grown by 48 px) on photos whose mark moved 400 px up: no
+///    area of photo 0, as it is and grown by 24 px) on photos whose mark moved 400 px up: no
 ///    set-position result, and every photo the search alone finds where its mark is (IoU at
-///    least 0.5 with the moved mark) is found there by [`match_with`] too, with the same score.
+///    least 0.5 with the moved mark) keeps that place and score, as `Unsure`: a set that shows
+///    the mark at one place does not trust a `Found` somewhere else.
 #[test]
 fn prior_never_places_a_moving_mark() {
     let synth = common::synth_dir();
@@ -727,34 +994,24 @@ fn prior_never_places_a_moving_mark() {
             .iter()
             .map(|n| open_mask(&synth.join(set).join("mask").join(n)))
             .collect();
+        let mut with_layer = 0;
         for (i, img) in photos.iter().enumerate() {
-            for grow in [0, 24, 48, 96] {
-                let drawing = if grow == 0 {
-                    truths[i].clone()
-                } else {
-                    mask::dilate(&truths[i], grow)
-                };
-                let tmpl = build_template(img, &drawing);
-                let Some(prior) = PositionPrior::new(&tmpl, &layers) else {
+            let (w, h) = img.dimensions();
+            with_layer += layers.get(w, h).is_some() as usize;
+            let tmpl = build_template(img, &first_guess(&truths[i], &layers));
+            let prior = PositionPrior::new(&tmpl, &layers);
+            for (j, p) in photos.iter().enumerate() {
+                if j == i || p.dimensions() != img.dimensions() {
                     continue;
-                };
-                eprintln!("{set} photo {i} grow {grow}: a set position");
-                for (j, p) in photos.iter().enumerate() {
-                    if j == i || p.dimensions() != img.dimensions() {
-                        continue;
-                    }
-                    let m = match_with(&tmpl, Some(&prior), p, &AtomicBool::new(false));
-                    if m.basis == MatchBasis::SetPosition {
-                        let c = covers(&m.mask, &truths[j]);
-                        assert!(
-                            c >= 0.5,
-                            "{set} {i} grow {grow} on {j}: {:?} covers {c:.2}",
-                            m.status
-                        );
-                    }
+                }
+                let m = match_with(&tmpl, prior.as_ref(), p, &AtomicBool::new(false));
+                if m.status == MatchStatus::Found {
+                    let c = covers(&m.mask, &truths[j]);
+                    assert!(c >= 0.5, "{set} {i} on {j}: {:?} covers {c:.2}", m.basis);
                 }
             }
         }
+        assert!(with_layer > 0, "premise: {set} has a layer for some size");
     }
 
     let set = synth.join("fixed");
@@ -768,10 +1025,12 @@ fn prior_never_places_a_moving_mark() {
     // `negatives_stay_not_found`).
     let (moved, truths) = moved_up(1..8, dir.path());
     let mut kept = 0;
-    for grow in [0, 48] {
+    for grow in [0, 24] {
         let drawing = mask::dilate(&open_mask(&set.join("mask/00.png")), grow);
         let tmpl = build_template(&reference, &drawing);
-        let prior = PositionPrior::new(&tmpl, &layers).expect("premise: the layer supports it");
+        let prior = PositionPrior::new(&tmpl, &layers)
+            .filter(PositionPrior::supports)
+            .expect("premise: the layer supports it");
         for (path, truth) in moved.iter().zip(&truths) {
             let p = open_rgb(path);
             let m = match_with(&tmpl, Some(&prior), &p, &AtomicBool::new(false));
@@ -786,7 +1045,7 @@ fn prior_never_places_a_moving_mark() {
                 |r: &puw_core::MatchResult| r.transform.map(|t| ((t.dx).round(), (t.dy).round()));
             if free.status == MatchStatus::Found && covers(&free.mask, truth) >= 0.5 {
                 kept += 1;
-                assert_eq!(m.status, MatchStatus::Found, "{path:?} grow {grow}");
+                assert_eq!(m.status, MatchStatus::Unsure, "{path:?} grow {grow}");
                 assert_eq!(m.confidence, free.confidence, "{path:?} grow {grow}");
                 assert_eq!(moved_by(&m), moved_by(&free), "{path:?} grow {grow}");
             }
