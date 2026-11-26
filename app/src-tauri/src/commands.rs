@@ -10,9 +10,9 @@ use std::time::{Duration, Instant};
 use puw_app::download::{self, DownloadProgress};
 use puw_app::photos::{AddResult, PhotoId, PhotoInfo};
 use puw_app::{
-    AppCore, AppError, DataDirs, DetectOutcome, DeviceFix, DeviceStatus, MatchSummary, OutputCheck,
-    PhotoState, ProgressEvent, RemoveReport, SavedInfo, Settings, Suggestion, UserError,
-    with_ticket,
+    AppCore, AppError, DataDirs, DetectOutcome, DeviceFix, DeviceStatus, GroupsState, MatchSummary,
+    OutputCheck, PhotoState, ProgressEvent, RemoveReport, SavedInfo, Settings, StripPlacement,
+    Suggestion, UserError, with_ticket,
 };
 use serde::Serialize;
 use tauri::ipc::{Channel, InvokeBody, Request, Response};
@@ -324,6 +324,28 @@ pub async fn get_area(shell: State<'_, Shell>, id: PhotoId) -> Res<Response> {
     blocking(move || core.area(id)).await.map(Response::new)
 }
 
+/// The area step 2 starts from, at edit size like `get_area`: the step-2 guess for a photo in
+/// no group, else its area.
+#[tauri::command]
+pub async fn start_area(shell: State<'_, Shell>, id: PhotoId) -> Res<Response> {
+    let core = shell.core.clone();
+    blocking(move || core.start_area(id))
+        .await
+        .map(Response::new)
+}
+
+/// Where the shared drawing on photo `reference` lands on photo `id`.
+#[tauri::command]
+pub async fn place_on(
+    shell: State<'_, Shell>,
+    reference: PhotoId,
+    id: PhotoId,
+    job: Option<u64>,
+) -> Res<StripPlacement> {
+    let core = shell.core.clone();
+    self::job(job, move || core.place_on(reference, id)).await
+}
+
 /// What a `put_draft` request carries in its headers.
 #[derive(Debug, PartialEq, Eq)]
 struct DraftHeaders {
@@ -383,6 +405,32 @@ pub async fn drop_draft(shell: State<'_, Shell>, id: PhotoId) -> Res<()> {
 pub async fn confirm_set_area(shell: State<'_, Shell>, id: PhotoId, job: Option<u64>) -> Res<()> {
     let core = shell.core.clone();
     self::job(job, move || core.confirm_set_area(id)).await
+}
+
+/// Makes the draft of photo `id` the area of the next group, which becomes the current one.
+#[tauri::command]
+pub async fn confirm_new_group(shell: State<'_, Shell>, id: PhotoId, job: Option<u64>) -> Res<()> {
+    let core = shell.core.clone();
+    self::job(job, move || core.confirm_new_group(id)).await
+}
+
+/// Removes every group and every photo's result.
+#[tauri::command]
+pub async fn clear_groups(shell: State<'_, Shell>, job: Option<u64>) -> Res<()> {
+    let core = shell.core.clone();
+    self::job(job, move || core.clear_groups()).await
+}
+
+/// Every group, and where the photos in none stand.
+#[tauri::command]
+pub async fn groups(shell: State<'_, Shell>) -> Res<GroupsState> {
+    Ok(shell.core.groups())
+}
+
+/// The photos step 2 shows for the current group, and the one it opens first.
+#[tauri::command]
+pub async fn group_sample(shell: State<'_, Shell>) -> Res<DetectOutcome> {
+    Ok(shell.core.group_sample()?)
 }
 
 #[tauri::command]
