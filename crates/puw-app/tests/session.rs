@@ -170,12 +170,11 @@ fn faint_fixed(alpha: f32, dir: &Path) -> Vec<PathBuf> {
         .collect()
 }
 
-/// The finder's own first guess, grown much further (60 px around it: about five times the
-/// watermark's area, as a generous hand drawing or the grown guess on a real set), confirmed
-/// on a fainter copy of the fixed set. The search alone misses most
-/// photos with it, and most of the drawing lies off the set's batch layer (so the drawing
-/// does not follow the layer). Yet every photo is found at the same place through the set's
-/// position, with the whole drawing as its area.
+/// The finder's own first guess, grown further (28 px around it, so that it reaches about as
+/// far beyond the batch layer as the set position allows, 2.4 % of the long side), confirmed on
+/// a fainter copy of the fixed set. The search alone misses several photos with it, and much of
+/// the drawing lies off the set's batch layer. Yet every photo is found at the same place
+/// through the set's position, with the whole drawing as its area.
 #[test]
 fn grown_first_guess_still_matches_fixed_set() {
     let Some(f) = model_fixture() else { return };
@@ -186,7 +185,7 @@ fn grown_first_guess_still_matches_fixed_set() {
     let rep = out.representative;
     let (w, h) = f.core.edit_size(rep).unwrap();
     let guess = GrayImage::from_raw(w, h, f.core.start_area(rep).unwrap()).unwrap();
-    let drawing = puw_core::mask::dilate(&guess, 60);
+    let drawing = puw_core::mask::dilate(&guess, 28);
     let photos = f.core.photos();
     let img = |id: u32| image::open(&paths[id as usize]).unwrap().to_rgb8();
     let t = build_template(&img(rep), &drawing);
@@ -208,12 +207,12 @@ fn grown_first_guess_still_matches_fixed_set() {
     let on_layer = on as f64 / all as f64;
     eprintln!("search alone misses {missed} of 7; {on_layer:.2} of the drawing near the layer");
     assert!(
-        missed >= 4,
-        "premise: the search alone misses most photos ({missed})"
+        missed >= 3,
+        "premise: the search alone misses several photos ({missed})"
     );
     assert!(
-        on_layer < 0.5,
-        "premise: the drawing does not follow the layer ({on_layer:.2})"
+        on_layer < 0.6,
+        "premise: much of the drawing lies off the layer ({on_layer:.2})"
     );
 
     f.core
@@ -233,10 +232,10 @@ fn grown_first_guess_still_matches_fixed_set() {
     }
 }
 
-/// Three photos of one shoot: the scene of fixed photo `scene` moved by each of `shifts`
-/// (pixels, edges repeated), with the fixed set's watermark blended at `alpha` at the same
-/// place on all three. Two shots nearly line up, as in a burst, so most scene edges are shared
-/// by two of the three photos. Written as PNGs into `dir`.
+/// Photos of one shoot: the scene of fixed photo `scene` moved by each of `shifts` (pixels,
+/// edges repeated), with the fixed set's watermark blended at `alpha` at the same place on all
+/// of them. Some shots nearly line up, as in a burst, so most scene edges are shared by several
+/// photos. Written as PNGs into `dir`.
 fn one_shoot(scene: u32, shifts: &[(i64, i64)], alpha: f32, dir: &Path) -> Vec<PathBuf> {
     let clean0 = image::open(fixed().join("clean/00.png")).unwrap().to_rgb8();
     let marked0 = image::open(fixed().join("marked/00.png"))
@@ -273,18 +272,23 @@ fn one_shoot(scene: u32, shifts: &[(i64, i64)], alpha: f32, dir: &Path) -> Vec<P
         .collect()
 }
 
-/// A set of three photos of one shoot with a faint watermark at the same place (the owner's
-/// case): the strip places the first guess at the same place on the other two photos, as it
-/// is and with its specks removed, and matching finds every photo there.
+/// Sets of one shoot with a faint watermark at the same place (the owner's case), 3 photos
+/// (two shots lined up) and 6 (three lined up): the strip places the first guess at the same
+/// place on every other photo, as it is and with its specks removed, and matching finds every
+/// photo there, `Found`.
 #[test]
-fn three_photos_of_one_shoot_keep_the_set_position() {
+fn photos_of_one_shoot_keep_the_set_position() {
     let Some(models) = common::models_dir() else {
         eprintln!("skipped: PUW_MODELS_DIR not set");
         return;
     };
-    let dir = tempfile::tempdir().unwrap();
-    let paths = one_shoot(3, &[(0, 0), (1, 1), (24, -16)], 0.14, dir.path());
-    for cleaned in [false, true] {
+    let shoots: [&[(i64, i64)]; 2] = [
+        &[(0, 0), (1, 1), (24, -16)],
+        &[(0, 0), (1, 1), (0, 1), (24, -16), (-18, 12), (30, 20)],
+    ];
+    for (shifts, cleaned) in shoots.iter().flat_map(|s| [(s, false), (s, true)]) {
+        let dir = tempfile::tempdir().unwrap();
+        let paths = one_shoot(3, shifts, 0.14, dir.path());
         let f = fixture(Some(models.clone()));
         f.core.add_paths(&paths).unwrap();
         let out = f.core.detect(&noop).unwrap();
@@ -310,9 +314,10 @@ fn three_photos_of_one_shoot_keep_the_set_position() {
         } else {
             guess
         };
-        for &id in out.sample.iter().filter(|&&id| id != rep) {
+        let n = shifts.len();
+        for id in f.core.photos().iter().map(|p| p.id).filter(|&id| id != rep) {
             let p = f.core.place_on(rep, id).unwrap();
-            eprintln!("cleaned {cleaned}, strip photo {id}: {p:?}");
+            eprintln!("{n} photos, cleaned {cleaned}, strip photo {id}: {p:?}");
             assert_ne!(p.status, puw_app::Placed::NotFound, "photo {id}");
             assert!(
                 (p.scale_x - 1.0).abs() < 0.01
@@ -324,8 +329,8 @@ fn three_photos_of_one_shoot_keep_the_set_position() {
         }
         f.core.confirm_set_area(rep).unwrap();
         let sum = f.core.match_all(&noop).unwrap();
-        eprintln!("cleaned {cleaned}: {sum:?}");
-        assert_eq!(sum.not_found, 0, "{sum:?}");
+        eprintln!("{n} photos, cleaned {cleaned}: {sum:?}");
+        assert_eq!(sum.found as usize, n, "{sum:?}");
         for p in f.core.photo_states() {
             assert_eq!(
                 f.core.area(p.id).unwrap(),

@@ -597,7 +597,11 @@ fn real_group_from_the_first_guess() {
         ious.iter().cloned().fold(f64::MAX, f64::min),
         other.len()
     );
-    assert!(good >= 6, "{good}");
+    assert_eq!(
+        good,
+        set_a.len(),
+        "every photo of the fixed set at the saved place"
+    );
     assert_eq!(wrong_found, 0);
     assert_eq!(other_found, 0);
     assert_eq!(strip_ok, strip_others);
@@ -783,4 +787,180 @@ fn real_small_sets_keep_the_set_position() {
     assert_eq!(strip_ok, strip_all);
     assert_eq!(match_ok, match_all);
     assert_eq!(wrong_found, 0);
+    // Placed at the true place, and at most one set per size left `Unsure` (its other photos,
+    // as is and cleaned). One triple is: one part of its layer scores under the Unsure bar on
+    // the other photos, which keeps them from `Found` (0.51 over the whole layer).
+    for (n, [_, su, _, mu]) in by_size.iter().enumerate() {
+        let one_set = 2 * n.saturating_sub(1);
+        assert!(
+            *su <= one_set && *mu <= one_set,
+            "{n} photos: {su} strip and {mu} step-3 Unsure"
+        );
+    }
+}
+
+/// `m` (edit-size bytes, `ew` x `eh`) with every pixel within `r` px of an unset one cleared.
+fn shrunk(m: &[u8], ew: u32, eh: u32, r: u32) -> Vec<u8> {
+    let inv: Vec<u8> = m.iter().map(|v| if *v == 0 { 255 } else { 0 }).collect();
+    let grown = puw_core::mask::dilate(&puw_core::Mask::from_raw(ew, eh, inv).unwrap(), r);
+    grown
+        .as_raw()
+        .iter()
+        .map(|v| if *v == 0 { 255 } else { 0 })
+        .collect()
+}
+
+/// The drawings a person may confirm, made from the first guess `g` (edit-size bytes): as it
+/// is; cleaned up ([`cleaned_guess`]); with everything farther than 1 % of the long side from
+/// the watermark `mark` (native size) erased; with a band of 3 % of the height erased across its middle;
+/// with four brush dots (radius 1 % of the long side) on the scene away from it; grown and
+/// shrunk by 8 px.
+fn edited_drawings(
+    g: &[u8],
+    ew: u32,
+    eh: u32,
+    mark: &puw_core::Mask,
+) -> Vec<(&'static str, Vec<u8>)> {
+    let m = puw_core::Mask::from_raw(ew, eh, g.to_vec()).unwrap();
+    // Everything of the guess away from the mark erased, as a careful person erases the parts
+    // of the scene the guess caught.
+    let around = puw_core::mask::dilate(&puw_core::mask::resize(mark, ew, eh), ew.max(eh) / 100);
+    let only_mark: Vec<u8> = g
+        .iter()
+        .zip(around.as_raw())
+        .map(|(v, a)| if *a != 0 { *v } else { 0 })
+        .collect();
+    let bb = puw_core::mask::bbox(&m).unwrap();
+    let mut erased = g.to_vec();
+    let mid = (bb.top() + bb.bottom()) as u32 / 2;
+    for y in mid.saturating_sub(eh * 3 / 200)..(mid + eh * 3 / 200).min(eh) {
+        for x in 0..ew {
+            erased[(y * ew + x) as usize] = 0;
+        }
+    }
+    let mut dots = g.to_vec();
+    let r = (ew.max(eh) / 100) as i64;
+    let near = puw_core::mask::dilate(&m, (4 * r) as u32);
+    for (fx, fy) in [(0.12, 0.2), (0.88, 0.45), (0.15, 0.8), (0.85, 0.12)] {
+        let (cx, cy) = ((fx * ew as f32) as i64, (fy * eh as f32) as i64);
+        if near.get_pixel(cx as u32, cy as u32).0[0] != 0 {
+            continue;
+        }
+        for y in (cy - r).max(0)..(cy + r).min(eh as i64) {
+            for x in (cx - r).max(0)..(cx + r).min(ew as i64) {
+                if (x - cx).pow(2) + (y - cy).pow(2) <= r * r {
+                    dots[(y as u32 * ew + x as u32) as usize] = 255;
+                }
+            }
+        }
+    }
+    vec![
+        ("as is", g.to_vec()),
+        ("cleaned", cleaned_guess(g, ew, eh)),
+        ("scene parts erased", only_mark),
+        ("middle erased", erased),
+        ("brush dots", dots),
+        ("grown 8 px", puw_core::mask::dilate(&m, 8).into_raw()),
+        ("shrunk 8 px", shrunk(g, ew, eh, 8)),
+    ]
+}
+
+/// Every 3-photo set of the real set-a (56), each with the drawings of [`edited_drawings`]
+/// confirmed as the group's area: step 3 places every photo at the reference's place (`Found`
+/// or `Unsure`, never elsewhere or not at all), and counts per drawing where the photos land. `PUW_TRIPLES=0,1,2;3,4,5`
+/// runs only those sets, `PUW_DRAWINGS=as is;cleaned` only those drawings. Aggregates and set indices only. `cargo test -p puw-app --release --test
+/// timings real_triples -- --ignored --nocapture`; needs `PUW_MODELS_DIR` and `PUW_REAL_DIR`.
+#[test]
+#[ignore = "acceptance run, needs models and local photos"]
+fn real_triples_with_edited_drawings() {
+    let Some(models) = common::models_dir() else {
+        eprintln!("skipped: PUW_MODELS_DIR not set");
+        return;
+    };
+    let Some(real) = std::env::var_os("PUW_REAL_DIR").map(PathBuf::from) else {
+        eprintln!("skipped: PUW_REAL_DIR not set");
+        return;
+    };
+    let work = common::synth_dir()
+        .parent()
+        .and_then(Path::parent)
+        .unwrap()
+        .join("local")
+        .join("timing");
+    let a = photos_in(&real.join("set-a"));
+    assert_eq!(a.len(), 8, "set-a has 8 photos");
+    // Where the watermark is: the batch layer of all 8 photos.
+    let all = puw_core::build_set_layers(&a, &puw_core::Progress::none()).unwrap();
+    let (_, mark) = all.iter().next().expect("set-a has a layer");
+    let mark = mark.clone();
+    let triples: Vec<Vec<usize>> = match std::env::var("PUW_TRIPLES") {
+        Ok(v) => v
+            .split(';')
+            .map(|t| t.split(',').map(|n| n.trim().parse().unwrap()).collect())
+            .collect(),
+        Err(_) => (0..8)
+            .flat_map(|i| (i + 1..8).flat_map(move |j| (j + 1..8).map(move |k| vec![i, j, k])))
+            .collect(),
+    };
+    let only: Option<Vec<String>> = std::env::var("PUW_DRAWINGS")
+        .ok()
+        .map(|v| v.split(';').map(str::to_owned).collect());
+    // Per drawing: at the saved place Found, Unsure; not found; Unsure elsewhere; Found elsewhere.
+    let mut counts: Vec<(&str, [usize; 5])> = Vec::new();
+    for (n, triple) in triples.iter().enumerate() {
+        let data = work.join("data-triples");
+        let _ = fs::remove_dir_all(&data);
+        let c = core(&models, &work.join("coreml-cache"), &data, Detail::Best);
+        let paths: Vec<PathBuf> = triple.iter().map(|&i| a[i].clone()).collect();
+        let ids = add(&c, &paths);
+        let out = c.detect(&|_| {}).unwrap();
+        let rep = out.representative;
+        let (ew, eh) = c.edit_size(rep).unwrap();
+        let guess = c.start_area(rep).unwrap();
+        let mut line = Vec::new();
+        for (name, drawing) in edited_drawings(&guess, ew, eh, &mark) {
+            if only.as_ref().is_some_and(|o| !o.iter().any(|d| d == name)) {
+                continue;
+            }
+            c.clear_groups().unwrap();
+            c.put_draft(rep, ew, eh, drawing).unwrap();
+            c.confirm_set_area(rep).unwrap();
+            c.match_all(&|_| {}).unwrap();
+            let saved = c.area(rep).unwrap();
+            let k = match counts.iter().position(|(d, _)| *d == name) {
+                Some(k) => k,
+                None => {
+                    counts.push((name, [0; 5]));
+                    counts.len() - 1
+                }
+            };
+            let mut got = Vec::new();
+            for &id in ids.iter().filter(|&&id| id != rep) {
+                let st = c.photo_states().into_iter().find(|s| s.id == id).unwrap();
+                let same = area_iou(&c.area(id).unwrap(), &saved) >= 0.99;
+                let slot = match (st.status, same) {
+                    (puw_app::AreaStatus::Found, true) => 0,
+                    (puw_app::AreaStatus::Unsure, true) => 1,
+                    (puw_app::AreaStatus::Found, false) => 4,
+                    (puw_app::AreaStatus::Unsure, false) => 3,
+                    _ => 2,
+                };
+                counts[k].1[slot] += 1;
+                got.push(["F", "U", "N", "U-elsewhere", "F-elsewhere"][slot]);
+            }
+            line.push(format!("{name}: {}", got.join(" ")));
+        }
+        eprintln!("set {} {:?}: {}", n + 1, triple, line.join("; "));
+    }
+    let _ = fs::remove_dir_all(work.join("data-triples"));
+    for (name, [f, u, nf, ue, fe]) in &counts {
+        eprintln!(
+            "{name}: at the saved place Found {f} Unsure {u}; not found {nf}; Unsure elsewhere {ue}; Found elsewhere {fe}"
+        );
+    }
+    // Every photo placed at the reference's place, whatever the person did to the drawing;
+    // `Unsure` stays allowed there.
+    for (name, [_, _, nf, ue, fe]) in &counts {
+        assert_eq!((nf, ue, fe), (&0, &0, &0), "{name}");
+    }
 }
