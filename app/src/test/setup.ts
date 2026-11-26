@@ -14,13 +14,15 @@ afterEach(() => {
 });
 
 // jsdom has no canvas. The editor's components draw through this 2D context, which accepts
-// their calls and draws nothing; the pixel logic is tested on its own (src/lib/editor).
+// their calls and draws nothing; the pixel logic is tested on its own (src/lib/editor). It keeps
+// the last picture put into it as `image`, so a test can read what the red layer shows.
 const contexts = new WeakMap<HTMLCanvasElement, object>();
 const noop = () => {};
 
 function context2d(canvas: HTMLCanvasElement): object {
-  return {
+  const ctx = {
     canvas,
+    image: null as unknown,
     lineWidth: 1,
     strokeStyle: '',
     fillStyle: '',
@@ -38,9 +40,12 @@ function context2d(canvas: HTMLCanvasElement): object {
     rect: noop,
     stroke: noop,
     drawImage: noop,
-    putImageData: noop,
+    putImageData: (image: unknown) => {
+      ctx.image = image;
+    },
     createImageData: (w: number, h: number) => ({ data: new Uint8ClampedArray(w * h * 4), width: w, height: h }),
   };
+  return ctx;
 }
 
 HTMLCanvasElement.prototype.getContext = function (this: HTMLCanvasElement, kind: string) {

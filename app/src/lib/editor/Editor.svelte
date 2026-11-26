@@ -14,6 +14,7 @@
   import { outlineBox, outlineCircle } from './outline';
   import { fillRect, stampLine, unionRect, type Area, type Rect } from './paint';
   import { RedLayer } from './redLayer';
+  import type { OuterHistory } from './shared';
   import Toolbar from './Toolbar.svelte';
   import { DEFAULT_SIZE, stepSize, type Tool } from './tools';
   import { fit, nextZoomStep, prevZoomStep, toImage, toScreen, wheelZoom, zoomAt, type View } from './view';
@@ -24,9 +25,15 @@
     onChange?: () => void;
     /** False while the editor is covered or busy: its shortcuts and pointer input then do nothing. */
     active?: boolean;
+    /** When given, the undo and redo buttons and keys act on this history instead of the editor's own. */
+    outer?: OuterHistory;
+    /** Called after each stroke or rectangle with the part of the shown area it changed. */
+    onCommit?: (dirty: Rect) => void;
+    /** False: brush, eraser and rectangle do nothing; zoom, pan, Space and the magnifier still work. */
+    paintable?: boolean;
   };
 
-  let { photoId, onChange, active = true }: Props = $props();
+  let { photoId, onChange, active = true, outer, onCommit, paintable = true }: Props = $props();
 
   const isMac = /Mac|iPhone|iPad/.test(navigator.userAgent);
 
@@ -48,8 +55,8 @@
   let shownFor: PhotoId | null = $state(null);
   const stale = $derived(shownFor !== photoId);
   const hideRed = $derived(space && !panning && !stroking);
-  const canUndo = $derived.by(() => (void steps, red?.history.canUndo ?? false));
-  const canRedo = $derived.by(() => (void steps, red?.history.canRedo ?? false));
+  const canUndo = $derived.by(() => (void steps, outer ? outer.canUndo() : (red?.history.canUndo ?? false)));
+  const canRedo = $derived.by(() => (void steps, outer ? outer.canRedo() : (red?.history.canRedo ?? false)));
 
   // Not reactive: these change on every pointer move.
   let red: RedLayer | null = null;
@@ -88,6 +95,17 @@
     steps++;
     dims = { w: a.w, h: a.h };
     fitView();
+  }
+
+  /** Like setArea, but keeps the zoom and pan (the same photo shows a changed area). */
+  export function showArea(a: Area): void {
+    if (!dims || dims.w !== a.w || dims.h !== a.h || stale) return setArea(a);
+    stroke = null;
+    panning = false;
+    stroking = false;
+    red?.set(a);
+    steps++;
+    redraw();
   }
 
   // The photo, drawn into its canvas once loaded.
@@ -146,7 +164,7 @@
 
   // Anything that changes what the outline or the magnifier shows.
   $effect(() => {
-    void [view, tool, size, loupeOn, loupeMag, hideRed, panning, stale];
+    void [view, tool, size, loupeOn, loupeMag, hideRed, panning, stale, paintable];
     untrack(redraw);
   });
 
@@ -201,6 +219,7 @@
       stroke = { kind: 'pan', sx: px, sy: py, from: { ...view } };
       panning = true;
     } else if (e.button === 0) {
+      if (!paintable) return;
       const [ix, iy] = toImage(view, px, py);
       if (tool === 'rect') {
         stroke = { kind: 'rect', start: [ix, iy], end: [ix, iy] };
@@ -247,20 +266,25 @@
     if (s.kind === 'pan') {
       panning = false;
     } else if (s.kind === 'paint') {
-      if (s.dirty) {
-        red?.commit(s.dirty);
-        changed();
-      }
+      if (s.dirty) committed(s.dirty);
     } else if (red?.area && !cancelled) {
       const [x0, y0] = s.start;
       const [x1, y1] = toImage(view, ...local(e));
       red.begin();
       const r = fillRect(red.area, { x: x0, y: y0, w: x1 - x0, h: y1 - y0 }, 255);
       red.queue(r);
-      red.commit(r);
-      changed();
+      committed(r);
     }
     redraw();
+  }
+
+  /** A stroke or rectangle that changed rectangle `r` ended. */
+  function committed(r: Rect) {
+    // With an outer history, the owner of that history records the change (through onCommit).
+    if (outer) red?.flush();
+    else red?.commit(r);
+    if (r.w > 0 && r.h > 0) onCommit?.(r);
+    changed();
   }
 
   function leave() {
@@ -270,11 +294,21 @@
   }
 
   function undo() {
-    if (!stroke && !stale && red?.undo()) changed();
+    if (stroke || stale) return;
+    if (outer) {
+      if (!outer.canUndo()) return;
+      outer.undo();
+      changed();
+    } else if (red?.undo()) changed();
   }
 
   function redo() {
-    if (!stroke && !stale && red?.redo()) changed();
+    if (stroke || stale) return;
+    if (outer) {
+      if (!outer.canRedo()) return;
+      outer.redo();
+      changed();
+    } else if (red?.redo()) changed();
   }
 
   function redraw() {
@@ -287,7 +321,7 @@
     if (!ctx) return;
     if (drawn) ctx.clearRect(drawn.x, drawn.y, drawn.w, drawn.h);
     drawn = null;
-    if (!pointer || !red?.area || stale || panning || (space && !stroke)) return;
+    if (!pointer || !red?.area || stale || panning || !paintable || (space && !stroke)) return;
     if (stroke?.kind === 'rect') {
       const [ax, ay] = toScreen(view, ...stroke.start);
       const [bx, by] = toScreen(view, ...stroke.end);
