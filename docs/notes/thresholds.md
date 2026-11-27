@@ -741,6 +741,81 @@ only 3 % on the layer, was `Found` elsewhere at 0.50 by the search. Any drawing 
 into the layer now holds the search back. The test asserts no `Found` elsewhere for every
 drawing, and the right place for all but the shrunk ones.
 
+### The search decides without the set's support; a separate piece is not explained (fix round 3)
+
+The second re-review found two regressions of fix round 2.
+- A: a cautious prior put `Unsure` at the saved place without running the search, even where
+  the spread test had just shown the layer to be static scene. Correct moved placements were
+  lost.
+- B: the 4 % reach let a second, moving mark drawn 2-3 % of the long side from the fixed one
+  be `Found` at the saved place, with the moving mark uncovered.
+
+Changes (`pipeline::match_with`, `explained_by_set`):
+- Without the set's support the search always runs, and its result is held back (never
+  `Found`, `Unsure` where it found the mark).
+  - The saved place stands instead (`Unsure`) only where the set speaks for it: the layer
+    varies like a mark, no piece of the drawing lies off the layer, and at least
+    `PRIOR_SPEAKS` 0.01 of the drawing is on the layer.
+  - Even then the search wins when it finds a `Found` that scores higher.
+  - The styles set's huge tiled drawings around a 210 px layer of scene keep 0.0003 of
+    themselves on the layer, so the search decides there.
+  - A drawing grown by 3 % around the real mark keeps more than 0.01.
+- `explained_by_set` now returns two answers, worked out at long side 1536 (less work than at
+  full size):
+  - the reach test as before;
+  - a piece test: no connected piece of the drawing that does not reach the layer (within the
+    0.4 % growth) may hold more than `PRIOR_UNEXPLAINED` 0.1 of the drawing, unless the set's
+    edges show something stamped over it.
+  - A drawing grown past the layer stays one piece with the layer (the generous case); a
+    second mark drawn beside the fixed one is a piece of its own.
+
+Synthetic counts, the first guess as drawing (`static_scene_never_places_a_moving_mark`,
+`a_second_mark_beside_the_fixed_one_is_not_found`, `prior_never_places_a_moving_mark`). "At
+the mark" means `Found` or `Unsure` covering half of the photo's own mark:
+
+| set | 21bee47 | c2315be | now |
+|---|---|---|---|
+| random (24 photos) | 19 at the mark, 5 not found | 12 at the mark, 12 `Unsure` astray | 19 at the mark, 5 not found |
+| styles (20) | 20 not found | 17 `Unsure` astray, 3 not found | 20 not found |
+| static patch far (13 over 3/5/8 photos) | 10 at the mark | 0 (13 `Unsure` at the saved place) | 10 at the mark |
+| static patch next | 5 at the mark, 1 astray | 0 (13 astray) | 5 at the mark, 1 astray |
+| static patch next, thin mark | 2 at the mark, 5 `Found` astray | 0 (13 astray) | 3 at the mark, 0 `Found` astray |
+| faint patch next, thin mark | 2 at the mark, 11 not found | 0 (13 astray) | 2 at the mark, 11 not found |
+| two marks, 30 or 45 px apart (13 each) | 9 `Unsure`, 4 not found | 13 `Found` with the moving mark uncovered | 9 `Unsure`, 4 not found |
+
+The tests pin:
+- the 21bee47 counts at the mark as floors (random 19; static 10/5/2/2);
+- no `Unsure` astray on random and styles;
+- no `Found` covering less than half of its own mark anywhere.
+
+`a_second_mark_beside_the_fixed_one_is_not_found` also paints both marks over with a big brush
+(30 px more), so that they make one piece. The reach rule is then what holds the set position
+back (the moving mark lies past 4 % of the long side from the layer). Without it, the test
+fails: `Found` at 0.90 on the saved place, the moving mark covered 0.00.
+
+The saved place stands only where the set speaks for it. "No piece off the layer" is relaxed
+there to "no piece off the layer holds the main part of the drawing" (`PRIOR_LOOSE_MAIN` 0.5).
+The specks of a real first guess grown by 3 % become separate pieces of a few tenths of it. In
+a drawing of a moving mark that only touches a speck of a layer of scene, the moving mark is
+the main piece. With the strict rule, grown 3 % lost 14 photos to NotFound on 7 triples.
+
+Generous drawings stay `Unsure` from about 2 % of the long side on. A drawing grown by 3 % on
+the real triples is 5 `Found` and 107 `Unsure` of 112, all at the right place.
+- The engine cannot tell a uniform margin of scene around the mark from a second mark painted
+  into the same stroke: both lie past the reach with nothing stamped on them.
+- Letting the far part through makes the brushed-over-both test `Found` at the wrong place.
+- So the fix for the extra clicks belongs in the app: for example, accept every `Unsure`
+  photo of a group at once after a look at the strip, since they all sit at the set position.
+
+Real acceptance (Core ML):
+- `real_small_sets_keep_the_set_position` and `real_triples_with_edited_drawings` (56 x 13)
+  give the same counts as fix round 2. Grown 3 % is 5 `Found` and 107 `Unsure` at the right
+  place, none not found and none elsewhere. 0 `Found` elsewhere on every drawing.
+- Speed, `real_group_from_the_first_guess` on a quiet machine (load average 3.95 / 11.4 / 17.4
+  at the start, 3.58 at the end): strip first look 1.96 s at most, match_all 2.5 s, 8 of 8
+  `Found`. The small-set run, under a load average of 25-48 from other work: strip 0.93 s
+  median, 2.31 s max.
+
 ## Detector specks in the first guess (Plan 2 fix wave, C1)
 
 The first guess used to keep every component the detector found, union it with the batch layer
