@@ -5,7 +5,7 @@ use puw_core::mask::Mask;
 use puw_core::ncc::masked_ncc;
 use puw_core::template::{
     MatchResult, MatchStatus, Transform, WatermarkTemplate, build_template, find, find_until,
-    main_bbox, saved_score, within,
+    main_bbox, saved_score, scores_at, within,
 };
 use std::path::Path;
 use std::time::Instant;
@@ -665,6 +665,34 @@ fn scaled_mark_found() {
         bad.is_empty(),
         "not Found with iou >= 0.6 at scales {bad:?}"
     );
+}
+
+/// `scores_at` scores a template where `find` placed it: at the found transform it gives the
+/// search's own score (the same placement, +-2 px), for a mark moved and scaled and for a mark
+/// of two pieces moved together; at the identity it gives `saved_score`.
+#[test]
+fn scores_at_the_found_place() {
+    let fixed = common::synth_dir().join("fixed");
+    let text = text_template(&fixed);
+    let (pair, layer) = two_piece_template(&fixed);
+    let cases = (0..SCALED.len())
+        .map(|i| (&text, scaled_case(&fixed, i).0))
+        .chain((0..TOGETHER.len()).map(|i| (&pair, together_case(&fixed, &layer, i).0)));
+    for (n, (t, img)) in cases.enumerate() {
+        let r = find(t, &img);
+        assert_eq!(r.status, MatchStatus::Found, "case {n}: premise");
+        let at = scores_at(&[t], &img, r.transform.expect("found")).expect("same size")[0];
+        assert!(
+            (at - r.confidence).abs() <= 1e-4,
+            "case {n}: {at:.4} at the found place, the search {:.4}",
+            r.confidence
+        );
+        assert_eq!(
+            scores_at(&[t], &img, Transform::IDENTITY),
+            saved_score(t, &img).map(|s| vec![s]),
+            "case {n}"
+        );
+    }
 }
 
 /// Prints score distributions and timings used to choose `FOUND`/`UNSURE`:

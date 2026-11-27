@@ -332,6 +332,25 @@ const PRIOR_REACH: f32 = 0.04;
 /// first guess: 0.09-0.25 in all on triples (the layer of 3 photos misses stretches of the
 /// faint mark), and on all 8 photos 0.107 in three blobs of scene of 0.04 each.
 const PRIOR_UNEXPLAINED: f64 = 0.1;
+/// How much farther from the layer than the drawing's edge typically lies (the median over the
+/// edge of the pieces that reach the layer) a stretch of the drawing may reach, as a share of
+/// the long side (see `explained_by_set`): a brush or a box keeps about the same margin all
+/// round the mark, and its edge wanders by less than this.
+const PRIOR_EVEN: f32 = 0.01;
+/// Largest size of one connected stretch reaching out farther than [`PRIOR_EVEN`], as a share
+/// of the mark's own area in the drawing (its pixels on the layer or within the 0.4 % growth of
+/// it), for a photo to be `Found` at the saved place. A second mark drawn beside the fixed one
+/// sticks out of an even margin by its own height and gap; the engine cannot tell it from a
+/// stretch of scene there, as the moving mark is elsewhere on the other photos, so beyond this
+/// the result is `Unsure` at most. Synthetic sets (3, 5 and 8 photos; grown or boxed by 0-61
+/// px, 0-4 % of the long side): the fixed set 0.000; a fixed mark and a second, thin mark that
+/// moves, 10-45 px above it, 0.200-0.525. Real set-a, all 56 triples: the first guess as it
+/// is, cleaned, with brush dots, with its middle erased or shrunk by 8 px up to 0.064 (a blob
+/// of scene the guess caught beside the mark); grown by 8 px up to 0.138 (2 triples over
+/// 0.12), by 1-3 % of the long side up to 0.21-0.65 (38-45 triples over 0.12, those are
+/// `Unsure`: the guess's specks merge with the mark when it grows and stick out like a second
+/// mark).
+const PRIOR_UNEVEN: f64 = 0.12;
 /// How much the set's edges over the far part of the drawing must stand out from the edges of
 /// the whole photo, as a share of how much they stand out over the layer. Real set-a triples
 /// whose far part is above [`PRIOR_UNEXPLAINED`]: 0.13-0.47 (the mark is there, too faint for
@@ -369,26 +388,33 @@ pub const PRIOR_UNSURE: f32 = 0.16;
 /// the template's size ([`match_with`]).
 ///
 /// It exists when `layers` has a layer for the template's reference size and the placement
-/// holds at least [`PRIOR_LAYER_SHARE`] of layer pixels. With `g` = [`mask::grow_for`] (0.004)
+/// holds at least `PRIOR_LAYER_SHARE` of layer pixels. With `g` = [`mask::grow_for`] (0.004)
 /// and "placement" = the template's pieces at their saved position:
 /// 1. of the layer's components that reach into the placement grown by `g` (a component the
 ///    person erased whole is a piece of scene, not the mark), at least 90 % lies in it (see
-///    [`PRIOR_LAYER_INSIDE`]): the position is scored with the template cut down to the raw
+///    `PRIOR_LAYER_INSIDE`): the position is scored with the template cut down to the raw
 ///    layer ([`template::within`]), its edges taken from the set's own edges of the mark
 ///    ([`SetLayers::edges`], [`template::with_edges`]) rather than from the reference photo,
 ///    whose scene the other photos do not share; and with each part of the layer on its own
-///    (see [`PRIOR_PART_NEAR`]). A drawing grown well beyond the mark (the first guess is
+///    (see `PRIOR_PART_NEAR`). A drawing grown well beyond the mark (the first guess is
 ///    grown, and people draw generously) is then judged on the mark's own edges, not on the
 ///    scene around it;
 /// 2. else the position is scored with the template itself.
 ///
-/// The set supports the position ([`PositionPrior::supports`]) when rule 1 holds or at least
-/// half of the placement lies in the layer grown by `g` (the drawing follows the layer); the
-/// photos' lumas under the layer change with the scene behind it ([`PRIOR_VARIES`]); and the
-/// set explains the drawing (no stretch of [`PRIOR_UNEXPLAINED`] of it farther than
-/// [`PRIOR_REACH`] from the layer, and no piece of it of that size that does not reach the
-/// layer at all, unless the set's edges show something stamped there). Else
-/// the prior is cautious: no photo is `Found` through it (see [`match_with`]).
+/// The set backs the position when rule 1 holds or at least half of the placement lies in the
+/// layer grown by `g` (the drawing follows the layer); the photos' lumas under the layer change
+/// with the scene behind it (`PRIOR_VARIES`); and the set explains the drawing's reach (no
+/// stretch of `PRIOR_UNEXPLAINED` of it farther than `PRIOR_REACH` from the layer, and no
+/// piece of it of that size that does not reach the layer at all, unless the set's edges show
+/// something stamped there). Else the prior is cautious: no photo is `Found` through it, and
+/// the search decides (see [`match_with`]).
+///
+/// A backed position is `Found` only when the set also accounts for the whole drawing: the
+/// pieces that reach the layer keep an even margin around it (see `PRIOR_EVEN` and
+/// `PRIOR_UNEVEN`). A drawing that reaches out much farther on one side than around the rest
+/// of the mark may hold something the set does not show at that place, such as a second mark
+/// that moves; the engine cannot tell it from more scene, so such a drawing is `Unsure` at the
+/// saved position at most ([`PositionPrior::supports`] is false).
 ///
 /// Either way a set-position result places the whole template, so removal covers all of the
 /// drawing.
@@ -402,11 +428,14 @@ pub struct PositionPrior {
     /// Rule 1 with a layer of several parts: `scored` cut to each part (see
     /// [`PRIOR_PART_NEAR`]). A photo that does not show one of them is not `Found`.
     parts: Vec<WatermarkTemplate>,
-    /// False when the drawing holds part of the layer but the set does not support its
-    /// position: the result is at most `Unsure`.
-    supports: bool,
-    /// Without support: whether the score at the saved position may still place the photo
-    /// there as `Unsure` when the search finds no higher `Found` (see [`PRIOR_SPEAKS`]); else
+    /// False when the drawing holds part of the layer but the set does not back its position:
+    /// the result is at most `Unsure`, and the search decides.
+    backed: bool,
+    /// The set accounts for the whole drawing: its pieces that reach the layer keep an even
+    /// margin around it (see [`PRIOR_UNEVEN`]).
+    whole: bool,
+    /// Without `backed`: whether the score at the saved position may still place the photo
+    /// there as `Unsure` when the search finds no better place (see [`PRIOR_SPEAKS`]); else
     /// the search alone decides, held back.
     speaks: bool,
 }
@@ -451,21 +480,81 @@ fn stamped(edges: &[f32], part: &Mask, layer: &Mask) -> bool {
     }
 }
 
-/// How the set explains the drawing `placed`, worked out at long side 1536: `(near, joined,
-/// loose)`.
-/// - `near`: no connected stretch of the drawing farther than [`PRIOR_REACH`] from the layer
-///   holds more than [`PRIOR_UNEXPLAINED`] of it, or the set's edges show something stamped
-///   over that far part (see `stamped`). A drawing grown well past the layer fails it.
-/// - `joined`: no piece of the drawing (a connected part of it) that does not reach the layer
-///   holds more than [`PRIOR_UNEXPLAINED`] of it, or the set's edges show something stamped
-///   over those pieces. A second mark drawn beside the fixed one fails it, however close.
-/// - `loose`: the share of the drawing that its largest such piece holds.
-fn explained_by_set(
-    placed: &Mask,
-    layer: &Mask,
-    g: u32,
-    edges: Option<&[f32]>,
-) -> (bool, bool, f64) {
+/// Chebyshev distance, in pixels, from every pixel of `m` to its nearest set pixel (the radius
+/// of the square [`mask::dilate`] that first reaches it), row-major; `u32::MAX / 2` everywhere
+/// when `m` is empty. Two chamfer passes over the 8 neighbours, exact for this metric.
+fn distance_to(m: &Mask) -> Vec<u32> {
+    let (w, h) = (m.width() as usize, m.height() as usize);
+    let far = u32::MAX / 2;
+    let mut d: Vec<u32> = m
+        .as_raw()
+        .iter()
+        .map(|v| if *v != 0 { 0 } else { far })
+        .collect();
+    for y in 0..h {
+        for x in 0..w {
+            let i = y * w + x;
+            let mut v = d[i];
+            if x > 0 {
+                v = v.min(d[i - 1] + 1);
+            }
+            if y > 0 {
+                v = v.min(d[i - w] + 1);
+                if x > 0 {
+                    v = v.min(d[i - w - 1] + 1);
+                }
+                if x + 1 < w {
+                    v = v.min(d[i - w + 1] + 1);
+                }
+            }
+            d[i] = v;
+        }
+    }
+    for y in (0..h).rev() {
+        for x in (0..w).rev() {
+            let i = y * w + x;
+            let mut v = d[i];
+            if x + 1 < w {
+                v = v.min(d[i + 1] + 1);
+            }
+            if y + 1 < h {
+                v = v.min(d[i + w] + 1);
+                if x > 0 {
+                    v = v.min(d[i + w - 1] + 1);
+                }
+                if x + 1 < w {
+                    v = v.min(d[i + w + 1] + 1);
+                }
+            }
+            d[i] = v;
+        }
+    }
+    d
+}
+
+/// How the set explains a drawing (see `explained_by_set`).
+#[derive(Debug, Clone)]
+struct Explained {
+    /// No connected stretch of the drawing farther than [`PRIOR_REACH`] from the layer holds
+    /// more than [`PRIOR_UNEXPLAINED`] of it, or the set's edges show something stamped over
+    /// that far part (see `stamped`). A drawing grown well past the layer fails it.
+    near: bool,
+    /// No piece of the drawing (a connected part of it) that does not reach the layer holds
+    /// more than [`PRIOR_UNEXPLAINED`] of it, or the set's edges show something stamped over
+    /// those pieces. A second mark drawn beside the fixed one fails it, however close.
+    joined: bool,
+    /// The pieces that reach the layer keep an even margin around it: no connected stretch of
+    /// them reaches more than [`PRIOR_EVEN`] farther from the layer than the drawing's edge
+    /// typically lies and holds more than [`PRIOR_UNEVEN`] of the mark's area in the drawing.
+    /// Unlike `near` and `joined`, the set's edges cannot excuse such a stretch: on photos of
+    /// one shoot they also show the scene the photos share.
+    even: bool,
+    /// The share of the drawing that its largest piece not reaching the layer holds.
+    loose: f64,
+}
+
+/// How the set explains the drawing `placed`, worked out at long side 1536 (see [`Explained`]).
+fn explained_by_set(placed: &Mask, layer: &Mask, g: u32, edges: Option<&[f32]>) -> Explained {
     let (w, h) = placed.dimensions();
     let (rw, rh) = template::ref_dims(w, h);
     let (rw, rh) = (rw as u32, rh as u32);
@@ -474,7 +563,12 @@ fn explained_by_set(
     let layer = mask::resize_any(layer, rw, rh);
     let (all, _) = count_in(&placed, &placed);
     if all == 0 {
-        return (false, false, 1.0);
+        return Explained {
+            near: false,
+            joined: false,
+            even: false,
+            loose: 1.0,
+        };
     }
     let largest = |m: &Mask| {
         mask::components(m)
@@ -508,7 +602,56 @@ fn explained_by_set(
             }
         }
     }
-    (explains(&far), explains(&loose), largest(&loose))
+    // The drawing's edge where it reaches the layer, and how far it typically lies from it.
+    let dist = distance_to(&layer);
+    let (wu, hu) = (rw as usize, rh as usize);
+    let attached: Vec<bool> = placed
+        .as_raw()
+        .iter()
+        .zip(loose.as_raw())
+        .map(|(p, l)| *p != 0 && *l == 0)
+        .collect();
+    let set = |x: usize, y: usize| placed.as_raw()[y * wu + x] != 0;
+    let mut edge: Vec<u32> = Vec::new();
+    for y in 0..hu {
+        for x in 0..wu {
+            let i = y * wu + x;
+            if attached[i]
+                && (x == 0
+                    || y == 0
+                    || x + 1 == wu
+                    || y + 1 == hu
+                    || !set(x - 1, y)
+                    || !set(x + 1, y)
+                    || !set(x, y - 1)
+                    || !set(x, y + 1))
+            {
+                edge.push(dist[i]);
+            }
+        }
+    }
+    let typical = if edge.is_empty() {
+        0
+    } else {
+        let mid = edge.len() / 2;
+        *edge.select_nth_unstable(mid).1
+    };
+    let beyond = typical + (PRIOR_EVEN * rw.max(rh) as f32).round() as u32;
+    let mut uneven = Mask::new(rw, rh);
+    for ((u, a), d) in uneven.as_mut().iter_mut().zip(&attached).zip(&dist) {
+        *u = if *a && *d > beyond { 255 } else { 0 };
+    }
+    // Measured against the mark's own area in the drawing (what lies on the layer or next to
+    // it), so that a big brush or box does not make a stretch look small.
+    let (_, at_mark) = count_in(&placed, &touching);
+    let uneven_share = largest(&uneven) * all as f64 / at_mark.max(1) as f64;
+    let even = uneven_share <= PRIOR_UNEVEN;
+    Explained {
+        near: explains(&far),
+        joined: explains(&loose),
+        even,
+        loose: largest(&loose),
+    }
 }
 
 /// The components of `layer` with at least one pixel in `area`.
@@ -621,8 +764,9 @@ impl PositionPrior {
         // support the position still says how well the photo shows the mark there.
         let cut = template::within(t, layer);
         // Whatever the rule, the drawing may not hold much that the set does not show fixed.
-        let (near, joined, loose) = explained_by_set(&placed, layer, g, layers.edges(w, h));
-        let supports = (rule_1 || follows) && varies && near && joined;
+        let set = explained_by_set(&placed, layer, g, layers.edges(w, h));
+        let backed = (rule_1 || follows) && varies && set.near && set.joined;
+        let (whole, loose) = (set.even, set.loose);
         // Without support, the saved position may still stand against the search: what the
         // set shows there is a mark (it varies), no piece of the drawing that the set does not
         // reach is its main part (as the moving mark is in a drawing of it that only touches a
@@ -636,7 +780,8 @@ impl PositionPrior {
                 placed,
                 scored: t.clone(),
                 parts: Vec::new(),
-                supports,
+                backed,
+                whole,
                 speaks,
             });
         };
@@ -655,16 +800,17 @@ impl PositionPrior {
             placed,
             scored: on_edges(cut),
             parts,
-            supports,
+            backed,
+            whole,
             speaks,
         })
     }
 
-    /// Whether the set supports the saved position (see [`PositionPrior`]). Without support no
-    /// photo is `Found` through this prior, at the saved position or by the search (see
-    /// [`match_with`]).
+    /// Whether a photo may be `Found` through this prior: the set backs the saved position and
+    /// accounts for the whole drawing (see [`PositionPrior`]). Otherwise no photo is `Found`
+    /// through it, at the saved position or by the search (see [`match_with`]).
     pub fn supports(&self) -> bool {
-        self.supports
+        self.backed && self.whole
     }
 
     /// The template the saved position is scored with.
@@ -683,7 +829,7 @@ impl PositionPrior {
     }
 }
 
-/// [`find`] with a position prior for marks stamped at the same place on every photo:
+/// [`template::find`] with a position prior for marks stamped at the same place on every photo:
 /// [`match_with`] with the [`PositionPrior`] of `t` over `layers`, worked out for this call.
 /// Matching many photos, work the prior out once and call [`match_with`].
 pub fn match_photo(t: &WatermarkTemplate, img: &RgbImage, layers: &SetLayers) -> MatchResult {
@@ -697,22 +843,26 @@ pub fn match_photo(t: &WatermarkTemplate, img: &RgbImage, layers: &SetLayers) ->
 /// [`find_until`]. Otherwise the score at the saved position ([`template::saved_score`] of the
 /// cut template, +-2 px, scale 1) and the set's support decide.
 ///
-/// With support ([`PositionPrior::supports`]), no search unless the score is low:
-/// - At least [`PRIOR_FOUND`], and every part of the layer at least [`PRIOR_UNSURE`]: `Found`
-///   at the saved position. A photo that shows only some parts (a static object beside the
-///   mark, on a photo without the mark) stays `Unsure`.
+/// When the set backs the position (see [`PositionPrior`]), no search unless the score is low:
+/// - At least [`PRIOR_FOUND`], every part of the layer at least [`PRIOR_UNSURE`], and the set
+///   accounts for the whole drawing: `Found` at the saved position. A photo that shows only
+///   some parts (a static object beside the mark, on a photo without the mark) stays `Unsure`,
+///   and so does every photo of a drawing that reaches out unevenly.
 /// - At least [`PRIOR_UNSURE`]: `Unsure` at the saved position; the person opens the photo. A
 ///   search `Found` somewhere else is not trusted on a set that shows the mark here: on the real
 ///   set the drawing is mostly scene, and the search finds the scene where it moved between
 ///   shots (0.52-0.68, against 0.13 for the drawing at the saved position).
 /// - Below: the search's result, but a `Found` that does not overlap the saved placement by at
-///   least [`PRIOR_AGREE`] is `Unsure`.
+///   least `PRIOR_AGREE`, or of an uneven drawing, is `Unsure`.
 ///
-/// Without support the search always runs, and its result is held back: never `Found`, but
-/// `Unsure` where it found the mark. The saved position stands instead (`Unsure`, from
-/// [`PRIOR_UNSURE`] up) only where the set speaks for it (its layer varies like a mark, no
-/// piece of the drawing lies off it, and at least [`PRIOR_SPEAKS`] of the drawing is on it) and
-/// the search finds no `Found` that scores higher.
+/// When the set does not back the position the search always runs, and its result is held
+/// back: never `Found`, but `Unsure` where it found the mark. The saved position stands instead
+/// (`Unsure`, from [`PRIOR_UNSURE`] up) only where the set speaks for it (its layer varies like
+/// a mark, no piece of the drawing that does not reach the layer holds more than
+/// `PRIOR_LOOSE_MAIN` of it, and at least `PRIOR_SPEAKS` of the drawing is on the layer)
+/// and the search finds no better place: a search result (`Found` or `Unsure`) elsewhere wins
+/// only when the scored template scores higher there than at the saved position
+/// ([`template::scores_at`]), like for like.
 ///
 /// A set-position result has basis [`MatchBasis::SetPosition`], the score as its confidence,
 /// the saved placement of the whole template as its mask and [`Transform::IDENTITY`].
@@ -734,8 +884,8 @@ pub fn match_with(
     };
     let score = scores[0];
     let weakest = scores.iter().copied().fold(score, f32::min);
-    if p.supports {
-        if score >= PRIOR_FOUND && weakest >= PRIOR_UNSURE {
+    if p.backed {
+        if p.whole && score >= PRIOR_FOUND && weakest >= PRIOR_UNSURE {
             return p.result(MatchStatus::Found, score);
         }
         if score >= PRIOR_UNSURE {
@@ -745,21 +895,29 @@ pub fn match_with(
     }
     // The set does not back the saved position: the search decides, held back to `Unsure`.
     // The saved position stands only where the set speaks for it and the search finds no
-    // `Found` that scores higher.
+    // better place: like for like, what the set shows of the mark (the scored template) is
+    // scored where the search put the drawing and compared with its score here. The search's
+    // own score is not compared: it scores the whole drawing, mostly scene, and on photos of
+    // one shoot it follows the scene where it moved between shots.
     let found = find_until(t, img, stop);
-    let search_wins = found.status == MatchStatus::Found && found.confidence > score || !p.speaks;
-    if score >= PRIOR_UNSURE && !search_wins {
+    let elsewhere = found.status != MatchStatus::NotFound
+        && overlap(&found.mask, &p.placed) < PRIOR_AGREE
+        && found
+            .transform
+            .and_then(|at| template::scores_at(&[&p.scored], img, at))
+            .is_some_and(|s| s[0] > score);
+    if score >= PRIOR_UNSURE && p.speaks && !elsewhere {
         return p.result(MatchStatus::Unsure, score);
     }
     held_back(found, p)
 }
 
-/// `found` (a search result) under the set's `prior`: a `Found` is `Unsure` when the set does
-/// not support its position, or when it does not overlap the saved placement by at least
-/// [`PRIOR_AGREE`].
+/// `found` (a search result) under the set's `prior`: a `Found` is `Unsure` when no photo may be
+/// `Found` through the prior ([`PositionPrior::supports`]), or when it does not overlap the
+/// saved placement by at least [`PRIOR_AGREE`].
 fn held_back(mut found: MatchResult, prior: &PositionPrior) -> MatchResult {
     if found.status == MatchStatus::Found
-        && (!prior.supports || overlap(&found.mask, &prior.placed) < PRIOR_AGREE)
+        && (!prior.supports() || overlap(&found.mask, &prior.placed) < PRIOR_AGREE)
     {
         found.status = MatchStatus::Unsure;
     }
@@ -800,12 +958,12 @@ const LAYER_SEEN: f64 = 0.9;
 const SPECK_FRAC: f64 = 0.1;
 
 /// The parts of the detector's `guess` that are the mark, without the specks it also finds on
-/// fur, foliage and stars. See [`LAYER_NEAR_FRAC`], [`LAYER_SEEN`] and [`SPECK_FRAC`]:
+/// fur, foliage and stars. See `LAYER_NEAR_FRAC`, `LAYER_SEEN` and `SPECK_FRAC`:
 /// - with a non-empty batch `layer` (same size) that the detector sees almost all of, and that
 ///   is no speck beside the detector's largest group, only the components near the layer are
 ///   kept;
 /// - otherwise the components near the layer (if any) and every group of at least
-///   [`SPECK_FRAC`] of the largest group are kept.
+///   `SPECK_FRAC` of the largest group are kept.
 pub fn keep_mark_parts(guess: &Mask, layer: Option<&Mask>) -> Mask {
     let (w, h) = guess.dimensions();
     let comps = mask::components(guess);

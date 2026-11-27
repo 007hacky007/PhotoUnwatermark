@@ -726,11 +726,9 @@ enum Patch {
     /// As `MovingNextThin`, the patch only faint (blended at 0.3 over each scene).
     FaintNextThin,
     /// No patch: the fixed mark on every photo, and a second, thin mark (the top 30 rows of
-    /// it) that moves and on photo 0 ends 30 px above the fixed one. The truth is the moving
-    /// mark.
-    TwoMarks30,
-    /// As `TwoMarks30`, 45 px above.
-    TwoMarks45,
+    /// it) that moves and on photo 0 ends this many px above the fixed one. The truth is the
+    /// moving mark.
+    TwoMarks(u32),
 }
 
 /// `n` photos of different scenes (the fixed set's clean photos) sharing one static patch of
@@ -753,7 +751,7 @@ fn patch_set(
             (680, 510, 340, 250)
         }
         Patch::FixedNear => (1098, 760, 300, 120),
-        Patch::TwoMarks30 | Patch::TwoMarks45 => (0, 0, 0, 0),
+        Patch::TwoMarks(_) => (0, 0, 0, 0),
         _ => (1150, 700, 340, 250),
     };
     // Blends the fixed set's mark (its rows below `rows`), moved by `(dx, dy)`, into `img`.
@@ -795,18 +793,13 @@ fn patch_set(
         }
         let thin = matches!(
             kind,
-            Patch::MovingNextThin | Patch::FaintNextThin | Patch::TwoMarks30 | Patch::TwoMarks45
+            Patch::MovingNextThin | Patch::FaintNextThin | Patch::TwoMarks(_)
         );
         let rows = if thin { 30 } else { 1000 };
         let truth = match kind {
-            Patch::TwoMarks30 | Patch::TwoMarks45 => {
-                let gap = if matches!(kind, Patch::TwoMarks30) {
-                    30
-                } else {
-                    45
-                };
+            Patch::TwoMarks(gap) => {
                 blend(&mut img, (0, 0), 1000);
-                blend(&mut img, (shift.0, shift.1 - 30 - gap), rows)
+                blend(&mut img, (shift.0, shift.1 - 30 - i64::from(gap)), rows)
             }
             Patch::MovingFar | Patch::MovingNext | Patch::MovingNextThin | Patch::FaintNextThin => {
                 blend(&mut img, shift, rows)
@@ -990,35 +983,150 @@ fn static_scene_never_places_a_moving_mark() {
     }
 }
 
-/// A fixed mark and a second, thin mark that moves and, on the reference, ends 30 or 45 px
-/// (2.0 or 2.9 % of the long side) above it: the first guess holds both, the layer is the fixed
-/// mark (it varies like a mark) and the moving one is a separate piece of the drawing the set
-/// does not reach. No photo is `Found` while its moving mark is not covered, also when both are
-/// painted over with a big brush so that they make one piece (then the moving mark lies past
-/// `PRIOR_REACH` from the layer). In sets of 3, 5 and 8 photos. With a reach of 4 % and no
-/// piece rule, every other photo was `Found` at the saved place, the moving mark covered 0.00.
+/// `drawing` with the box around `around`, grown by `margin` px on every side, filled in.
+fn with_box(drawing: &Mask, around: &Mask, margin: u32) -> Mask {
+    let (w, h) = drawing.dimensions();
+    let b = mask::bbox(around).expect("something to box");
+    let mut out = drawing.clone();
+    let x0 = (b.left() as u32).saturating_sub(margin);
+    let y0 = (b.top() as u32).saturating_sub(margin);
+    let x1 = (b.right() as u32 + margin).min(w - 1);
+    let y1 = (b.bottom() as u32 + margin).min(h - 1);
+    for y in y0..=y1 {
+        for x in x0..=x1 {
+            out.put_pixel(x, y, image::Luma([255]));
+        }
+    }
+    out
+}
+
+/// Brush and box widths of the drawing sweeps, in px at long side 1536: 0 to 4 % of it in
+/// steps of 0.5 %.
+const SWEEP: [u32; 9] = [0, 8, 15, 23, 31, 38, 46, 54, 61];
+
+/// The drawings a person may make of `found` (what the detector sees on the reference) on a set
+/// with `layers`: the first guess grown by each width of [`SWEEP`] (a big brush), and the first
+/// guess with a box around `found` at each width as its margin.
+fn swept_drawings(found: &Mask, layers: &SetLayers) -> Vec<(String, Mask)> {
+    let guess = first_guess(found, layers);
+    let brushed = SWEEP
+        .iter()
+        .map(|&b| (format!("grown {b} px"), mask::dilate(&guess, b)));
+    let boxed = SWEEP
+        .iter()
+        .map(|&m| (format!("box {m} px"), with_box(&guess, found, m)));
+    brushed.chain(boxed).collect()
+}
+
+/// A fixed mark and a second, thin mark (its top 30 rows) that moves and, on the reference,
+/// ends 10, 15, 20, 30 or 45 px above it (0.65-2.9 % of the long side). The person's drawing
+/// holds both: the first guess grown by 0 to 61 px (0-4 % of the long side), or the first guess
+/// with a box around both marks at a margin of 0 to 61 px ([`swept_drawings`]). On the other
+/// photos the moving mark is elsewhere, so the saved place leaves it uncovered: in sets of 3, 5
+/// and 8 photos no prior lets a photo be `Found` (`match_with` holds every result of such a
+/// prior back, the search's too), and in sets of 3 every photo is also matched and none is
+/// `Found` where its moving mark is not (the larger sets add a search per photo and drawing and
+/// nothing new; run with every photo, the 5- and 8-photo sets give no `Found` either). Before
+/// the drawing had to keep an even margin around the layer, a brush of 10-15 px or a box around
+/// both was `Found` at the saved place whenever the two marks lay within `PRIOR_REACH` of each
+/// other, the moving mark covered 0.00.
 #[test]
 fn a_second_mark_beside_the_fixed_one_is_not_found() {
     let fixed = open_mask(&common::synth_dir().join("fixed/mask/00.png"));
-    for kind in [Patch::TwoMarks30, Patch::TwoMarks45] {
+    let cases: Vec<(u32, usize)> = [10, 15, 20, 30, 45]
+        .into_iter()
+        .flat_map(|gap| [3, 5, 8].map(|n| (gap, n)))
+        .collect();
+    // Per case: Found, Unsure at the saved place, Unsure where the search put it, not found.
+    let counts: Vec<[usize; 4]> = std::thread::scope(|s| {
+        let jobs: Vec<_> = cases
+            .iter()
+            .map(|&(gap, n)| {
+                let fixed = &fixed;
+                s.spawn(move || {
+                    let mut c = [0usize; 4];
+                    let dir = tempfile::tempdir().expect("tempdir");
+                    let (photos, truths, paths) =
+                        patch_set(Patch::TwoMarks(gap), n, FIXED_ALPHA, dir.path());
+                    let layers = no_progress_layers(&paths);
+                    assert!(layers.get(1536, 1024).is_some(), "premise: a layer");
+                    let found = mask::union(fixed, &truths[0]);
+                    for (name, drawing) in swept_drawings(&found, &layers) {
+                        let tmpl = build_template(&photos[0], &drawing);
+                        let prior = PositionPrior::new(&tmpl, &layers);
+                        assert!(
+                            prior.as_ref().is_some_and(|p| !p.supports()),
+                            "gap {gap}, {n} photos, {name}: a photo may be Found at the saved place"
+                        );
+                        let matched = if n == 3 { n } else { 1 };
+                        for (j, (p, truth)) in
+                            photos.iter().zip(&truths).enumerate().take(matched).skip(1)
+                        {
+                            let m = match_with(&tmpl, prior.as_ref(), p, &AtomicBool::new(false));
+                            let cov = covers(&m.mask, truth);
+                            assert!(
+                                m.status != MatchStatus::Found || cov >= 0.5,
+                                "gap {gap}, {n} photos, {name}, photo {j}: Found ({:?}, {:.2}) \
+                                 covering {cov:.2} of its moving mark",
+                                m.basis,
+                                m.confidence
+                            );
+                            c[match (m.status, m.basis) {
+                                (MatchStatus::Found, _) => 0,
+                                (MatchStatus::NotFound, _) => 3,
+                                (_, MatchBasis::SetPosition) => 1,
+                                _ => 2,
+                            }] += 1;
+                        }
+                    }
+                    c
+                })
+            })
+            .collect();
+        jobs.into_iter()
+            .map(|j| j.join().expect("a case failed"))
+            .collect()
+    });
+    let total = counts
+        .iter()
+        .fold([0; 4], |a, c| std::array::from_fn(|i| a[i] + c[i]));
+    eprintln!(
+        "two marks: Found at the moving mark {}, Unsure at the saved place {}, Unsure where the \
+         search put it {}, not found {}",
+        total[0], total[1], total[2], total[3]
+    );
+}
+
+/// The drawings of [`swept_drawings`] (grown, or boxed with a margin, by 0 to 4 % of the long
+/// side) on sets of 3, 5 and 8 photos of the fixed set: every other photo stays at the saved
+/// place, `Found` (a person painting with a big brush or a box overshoots, and a drawing grown
+/// by up to 3 % may never be not found or placed elsewhere).
+#[test]
+fn swept_drawings_stay_at_the_set_position() {
+    let set = common::synth_dir().join("fixed");
+    let truth = open_mask(&set.join("mask/00.png"));
+    std::thread::scope(|s| {
         for n in [3, 5, 8] {
-            let dir = tempfile::tempdir().expect("tempdir");
-            let (photos, truths, paths) = patch_set(kind, n, FIXED_ALPHA, dir.path());
-            let layers = no_progress_layers(&paths);
-            assert!(layers.get(1536, 1024).is_some(), "premise: a layer");
-            let found = mask::union(&fixed, &truths[0]);
-            no_false_found_with(&format!("{kind:?} {n}"), &photos, &truths, &layers, &found);
-            // Painted over both with a big brush (30 px more), so that they make one piece.
-            let brushed = mask::dilate(&found, 30);
-            no_false_found_with(
-                &format!("{kind:?} {n}, brushed over both"),
-                &photos,
-                &truths,
-                &layers,
-                &brushed,
-            );
+            let (set, truth) = (&set, &truth);
+            s.spawn(move || {
+                let paths: Vec<PathBuf> = (0..n)
+                    .map(|i| set.join("marked").join(format!("0{i}.png")))
+                    .collect();
+                let photos: Vec<RgbImage> = paths.iter().map(|p| open_rgb(p)).collect();
+                let layers = no_progress_layers(&paths);
+                for (name, drawing) in swept_drawings(truth, &layers) {
+                    let tmpl = build_template(&photos[0], &drawing);
+                    let prior = PositionPrior::new(&tmpl, &layers);
+                    for (i, p) in photos.iter().enumerate().skip(1) {
+                        let m = match_with(&tmpl, prior.as_ref(), p, &AtomicBool::new(false));
+                        let label = format!("{n} photos, {name}, photo {i}");
+                        assert_eq!(m.basis, MatchBasis::SetPosition, "{label}: {:?}", m.status);
+                        assert_eq!(m.status, MatchStatus::Found, "{label}: {:.3}", m.confidence);
+                    }
+                }
+            });
         }
-    }
+    });
 }
 
 /// Drawings grown by 1, 2, 3 and 3.9 % of the long side (16, 31, 46 and 60 px) around the

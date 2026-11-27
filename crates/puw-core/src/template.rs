@@ -405,6 +405,47 @@ pub fn saved_scores(ts: &[&WatermarkTemplate], img: &RgbImage) -> Option<Vec<f32
         .collect()
 }
 
+/// [`saved_scores`] with each template placed by `at` (the [`MatchResult::transform`] of a
+/// [`find`] in `img`) instead of at its saved position: every piece at `at`'s scale and shift
+/// (+-2 px), the minimum over the pieces searched for. Scores one template at the place another
+/// one was found. `None` when any of them is damaged, of another size than `img`, or placed
+/// outside it.
+pub fn scores_at(ts: &[&WatermarkTemplate], img: &RgbImage, at: Transform) -> Option<Vec<f32>> {
+    if ts
+        .iter()
+        .any(|t| img.dimensions() != (t.ref_w, t.ref_h) || t.pieces.is_empty())
+        || !(at.scale_x > 0.0 && at.scale_y > 0.0 && at.dx.is_finite() && at.dy.is_finite())
+    {
+        return None;
+    }
+    let never = AtomicBool::new(false);
+    let target = Target::new(img, &never);
+    ts.iter()
+        .map(|t| {
+            let all = t
+                .pieces
+                .iter()
+                .map(|p| Prepared::new(p, t.ref_w, t.ref_h))
+                .collect::<Option<Vec<_>>>()?;
+            let (pieces, _) = split_carried(all);
+            let mut score = f32::INFINITY;
+            for (i, p) in pieces.iter().enumerate() {
+                // The inverse of `transform`: k from the scale, the k-space origin from the shift.
+                let k = at.scale_x * target.w as f32 / (p.s_ref * target.nw as f32);
+                let (fx, fy) = (
+                    k * target.nw as f32 / target.w as f32,
+                    k * target.nh as f32 / target.h as f32,
+                );
+                let x = (at.dx / fx).round() as i32 + p.ox;
+                let y = (at.dy / fy).round() as i32 + p.oy;
+                let tm = Tmpl::new(&pieces, &[i]);
+                score = score.min(target.score_window(&tm, k, (x, y), FAST_PX, &[])?.score);
+            }
+            Some(score.clamp(0.0, 1.0))
+        })
+        .collect()
+}
+
 /// The template's pieces drawn at their saved position and scale 1 into a `t.ref_w` x `t.ref_h`
 /// mask. `None` for a damaged template.
 pub(crate) fn saved_placement(t: &WatermarkTemplate) -> Option<Mask> {
@@ -480,7 +521,7 @@ pub fn within(t: &WatermarkTemplate, keep: &Mask) -> Option<WatermarkTemplate> {
 }
 
 /// `t` with each piece's edges taken from `edges`, an edge magnitude of the whole reference
-/// photo in the reference space (row-major, [`ref_dims`] of the reference size), at the piece's
+/// photo in the reference space (row-major, `ref_dims` of the reference size), at the piece's
 /// own crop: the same shapes and boxes, scored against other edges. The set's position prior
 /// uses it with the set's median edges, which hold the mark without the reference's scene.
 /// `None` when `edges` has another size or the template is damaged.
