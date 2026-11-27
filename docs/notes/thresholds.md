@@ -754,8 +754,9 @@ Changes (`pipeline::match_with`, `explained_by_set`):
 - Without the set's support the search always runs, and its result is held back (never
   `Found`, `Unsure` where it found the mark).
   - The saved place stands instead (`Unsure`) only where the set speaks for it: the layer
-    varies like a mark, no piece of the drawing lies off the layer, and at least
-    `PRIOR_SPEAKS` 0.01 of the drawing is on the layer.
+    varies like a mark, no piece of the drawing that does not reach the layer holds more
+    than `PRIOR_LOOSE_MAIN` 0.5 of it, and at least `PRIOR_SPEAKS` 0.01 of the drawing is on
+    the layer.
   - Even then the search wins when it finds a `Found` that scores higher.
   - The styles set's huge tiled drawings around a 210 px layer of scene keep 0.0003 of
     themselves on the layer, so the search decides there.
@@ -779,9 +780,9 @@ the mark" means `Found` or `Unsure` covering half of the photo's own mark:
 | styles (20) | 20 not found | 17 `Unsure` astray, 3 not found | 20 not found |
 | static patch far (13 over 3/5/8 photos) | 10 at the mark | 0 (13 `Unsure` at the saved place) | 10 at the mark |
 | static patch next | 5 at the mark, 1 astray | 0 (13 astray) | 5 at the mark, 1 astray |
-| static patch next, thin mark | 2 at the mark, 5 `Found` astray | 0 (13 astray) | 3 at the mark, 0 `Found` astray |
+| static patch next, thin mark | 2 at the mark, 5 `Found` astray | 0 (13 astray) | 3 at the mark, 9 `Unsure` astray (where the held-back search put them), 1 not found, 0 `Found` astray |
 | faint patch next, thin mark | 2 at the mark, 11 not found | 0 (13 astray) | 2 at the mark, 11 not found |
-| two marks, 30 or 45 px apart (13 each) | 9 `Unsure`, 4 not found | 13 `Found` with the moving mark uncovered | 9 `Unsure`, 4 not found |
+| two marks, 30 or 45 px apart (13 each) | 9 `Unsure`, 4 not found | 13 `Found` with the moving mark uncovered | 13 `Unsure` at the saved place, the moving mark covered 0.00 (corrected in fix round 4: "9 `Unsure`, 4 not found" was the 21bee47 count) |
 
 The tests pin:
 - the 21bee47 counts at the mark as floors (random 19; static 10/5/2/2);
@@ -815,6 +816,123 @@ Real acceptance (Core ML):
   at the start, 3.58 at the end): strip first look 1.96 s at most, match_all 2.5 s, 8 of 8
   `Found`. The small-set run, under a load average of 25-48 from other work: strip 0.93 s
   median, 2.31 s max.
+
+### An even margin around the mark (fix round 4)
+
+The third re-review found that a drawing joining a fixed mark and a second, moving mark into
+one piece was still `Found` at the saved place, the moving mark uncovered, whenever the two lay
+within the 4 % reach: a brush of 10-15 px or a box around both was enough. The piece test of
+fix round 3 only caught a second mark drawn as a separate piece.
+
+The engine cannot tell a margin of scene from a second mark by the drawing's outline alone, and
+the set's edges do not help either: the moving mark is elsewhere on the other photos, and on
+photos of one shoot the set's edges also show the scene they share. What it can tell is whether
+the drawing keeps about the same margin all round the mark. A brush or a box does; a drawing
+that also holds something else sticks out on that side by the other thing's size.
+
+Rule (`explained_by_set`, `even`), worked out at long side 1536 on the pieces of the drawing that
+reach the layer:
+- the typical margin is the median distance from the layer of the drawing's edge pixels
+  (Chebyshev distance, the metric of `mask::dilate`);
+- a stretch is the part of the drawing farther from the layer than that plus `PRIOR_EVEN`
+  (1 % of the long side);
+- the drawing is uneven when one connected stretch holds more than `PRIOR_UNEVEN` (0.12) of the
+  mark's own area in the drawing (its pixels on the layer or within the 0.4 % growth of it).
+
+An uneven drawing is at most `Unsure` (`PositionPrior::supports` is false), at the saved place
+when the score there reaches `PRIOR_UNSURE`, with no search: the set still backs the mark's
+place, it only cannot account for the rest. A search `Found` under such a prior is held back to
+`Unsure` too. The separate-piece and reach tests are unchanged.
+
+Measured shares of the largest stretch (of the mark's area):
+
+| drawings | photos | share |
+|---|---|---|
+| fixed set, grown or boxed by 0-61 px (0-4 % of the long side) | 3, 5, 8 | 0.000 |
+| fixed mark and a thin moving mark 10-45 px above it, grown or boxed by 0-61 px | 3, 5, 8 | 0.200-0.525 |
+| real set-a, 56 triples: the first guess as it is, cleaned, with brush dots, middle erased, shrunk by 8 px | 3 | 0.000-0.064 |
+| the same, grown by 8 px | 3 | 0.003-0.138 (2 triples over 0.12) |
+| the same, grown by 1, 2, 3 % of the long side | 3 | up to 0.210, 0.517, 0.649 (38, 40, 45 triples over 0.12) |
+
+- The largest real values come from triples whose first guess caught a blob of scene beside the
+  mark; erasing the scene parts of the guess brings them to 0.003 at most. Grown by 1 % or more,
+  the guess's specks merge with the mark and stick out like a second mark: those drawings are
+  now mostly `Unsure` at the saved place (grown 1 % was 96 `Found` of 112 before).
+- Measured against the whole drawing instead, the two-mark stretches fell to 0.080 at a 61 px
+  box, against 0.046 for the real first guesses: a big brush makes any stretch look small. The
+  mark's own area does not grow with the brush.
+- The set's edges cannot excuse a stretch here, unlike the far and separate parts: on photos of
+  one shoot they rate shared scene at 0.05-0.15 (synthetic shoot) and up to 0.34 (the real grown
+  drawings) of the layer's edges, above the `PRIOR_FAR_EDGES` bar, so they would let a second
+  mark on such photos through as well.
+
+The reviewer's harness, reproduced (no models, the emulated first guess, a photo counts as
+`Found` astray when `Found` covers less than half of its moving mark):
+
+| drawings over gaps 10-45 px, 3/5/8 photos | f96f498 | now |
+|---|---|---|
+| reviewer's set (as is, grown 5-30 px, box 5-20 px; gaps 10, 20, 30, 45) | 286 `Found` astray | 0 |
+| the same at a gap of 15 px | 117 | 0 |
+| sweep: grown and boxed by 0-61 px in 5 px steps, gaps 10, 15, 20, 30, 45 (1820 photos) | 700 | 0 (1820 `Unsure` at the saved place) |
+
+The other synthetic counts are the same as at f96f498 (random 19 at the mark, 5 not found;
+styles 20 not found; static patch far 10 at, next 5 at and 1 astray, next thin 3 at, 9 astray and
+1 not found, faint 2 at and 11 not found; no `Found` astray anywhere).
+
+Committed: `a_second_mark_beside_the_fixed_one_is_not_found` (the sweep in 0.5 % steps; no
+prior that lets a photo be `Found` on any of the 3, 5 and 8 photo sets, and every photo of the
+3-photo sets matched: 180 `Unsure` at the saved place, none `Found`; 39 s with the next test)
+and
+`swept_drawings_stay_at_the_set_position` (the fixed set with the same drawings, every photo
+`Found` at the saved place).
+
+Not covered:
+- Photos of one shoot (one scene, the camera moving up to 30 px between shots) with a fixed mark
+  and a moving second mark beside it, the same drawings: 176 of 1170 photos `Found` astray
+  (743 at f96f498), all in the 5-photo set, where 3 shots line up and the layer also holds the
+  scene they share. That inflates the mark's area, and the stretch measures 0.058-0.124. With 3
+  and 8 photos: none.
+- A second mark joined to the fixed one whose stretch holds less than 0.12 of the fixed mark's
+  area, or a separate piece holding less than `PRIOR_UNEXPLAINED` 0.1 of the drawing, is not
+  caught.
+
+Tried and dropped, on the lead that a second mark recurs elsewhere in the set while a margin of
+scene does not:
+- The stretch scored on each other photo together with the rest of the drawing, both moved by up
+  to 4 % of the long side: the real triples' scene blob scored 0.07-0.44, the two-mark sets up to
+  0.34. No bar between them.
+- The stretch alone near the saved place, with the photo's layer flattened so the stretch cannot
+  match the fixed mark (the test's second mark is the top of the fixed one and recurs on it at
+  0.96): the real blob 0.55-0.69, where the camera moved. But on a synthetic shoot with a moving
+  second mark the scene around that mark recurs the same way (up to 0.999): 601 of 1456 photos
+  `Found` astray.
+- Recurring anywhere does not tell either: the scene of one shoot recurs too.
+
+Real acceptance (Core ML; other work kept the machine busy, load averages given):
+- `real_group_from_the_first_guess` (8+1), load 4.3-4.4: strip first look 1.93 s at most,
+  match_all 2.5 s, 8 of 8 `Found` at the saved place, 0 elsewhere.
+- `real_small_sets_keep_the_set_position`, load 12.7 -> 4.4: strip 104 of 104 at the same place
+  (1.01 s median, 4.67 s max under load), step 3 136 of 136 (132 `Found`, 4 `Unsure`, the one
+  triple of fix round 1), 0 elsewhere.
+- `real_triples_with_edited_drawings` (56 x 13), load 12.7 -> 9.4: 0 `Found` elsewhere on every
+  drawing, and nothing not found or elsewhere on any drawing but the shrunk ones. `Found` /
+  `Unsure` at the saved place, f96f498 -> now: as is, cleaned, middle erased, brush dots and
+  shrunk 8 px 97 / 15 -> 97 / 15; scene parts erased 112 / 0 -> 112 / 0; grown 8 px 97 / 15 ->
+  91 / 21; grown 1 % 96 / 16 -> 29 / 83; grown 2 % 78 / 34 -> 22 / 90; grown 3 % 5 / 107 -> 2 /
+  110; shrunk 1 % (re-run at f96f498) 21 / 27, 9 not found, 55 `Unsure` elsewhere -> 21 / 33, 9
+  not found, 49 elsewhere. Fix round 2's shrunk 1 % row (40 elsewhere) was out of date after
+  round 3.
+
+`search_wins` (fix round 3, Minor 2) is now like for like: a search result elsewhere, `Found` or
+`Unsure`, beats the saved place when the scored template (the layer cut, on the set's edges)
+scores higher where the search put the drawing than at the saved place (`template::scores_at`).
+The search's own score is not compared: it scores the whole drawing, mostly scene, and on photos
+of one shoot follows the scene where it moved. Logged on the real triples' drawings shrunk by
+1 % (the only real drawings that reach this branch often): on 9 photos the saved place now
+stands where a search `Found` elsewhere (0.50-0.88, the layer cut there 0.05-0.25 against
+0.23-0.41 here) used to win, and on 3 a search `Unsure` now wins (the cut 0.22-0.43 there
+against 0.20-0.24 here). All 12 are `Unsure` either way, and 6 fewer photos sit elsewhere. No
+other count changed.
 
 ## Detector specks in the first guess (Plan 2 fix wave, C1)
 
